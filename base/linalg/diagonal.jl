@@ -8,6 +8,7 @@ Diagonal(A::Matrix) = Diagonal(diag(A))
 convert{T}(::Type{Diagonal{T}}, D::Diagonal{T}) = D
 convert{T}(::Type{Diagonal{T}}, D::Diagonal) = Diagonal{T}(convert(Vector{T}, D.diag))
 convert{T}(::Type{AbstractMatrix{T}}, D::Diagonal) = convert(Diagonal{T}, D)
+convert{T}(::Type{Triangular}, A::Diagonal{T}) = Triangular{T, Diagonal{T}, :U, false}(A)
 
 function similar{T}(D::Diagonal, ::Type{T}, d::(Int,Int))
     d[1] == d[2] || throw(ArgumentError("Diagonal matrix must be square"))
@@ -32,6 +33,9 @@ end
 ishermitian(D::Diagonal) = true
 issym(D::Diagonal) = true
 isposdef(D::Diagonal) = all(D.diag .> 0)
+
+tril!(D::Diagonal,i::Integer) = i == 0 ? D : 0*D
+triu!(D::Diagonal,i::Integer) = i == 0 ? D : 0*D
 
 ==(Da::Diagonal, Db::Diagonal) = Da.diag == Db.diag
 
