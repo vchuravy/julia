@@ -68,6 +68,8 @@ JL_DLLEXPORT jl_value_t *jl_emptytuple=NULL;
 jl_svec_t *jl_emptysvec;
 jl_value_t *jl_nothing;
 
+jl_datatype_t *jl_carnavalue;
+
 // --- type properties and predicates ---
 
 STATIC_INLINE int is_unspec(jl_datatype_t *dt)
@@ -3923,6 +3925,10 @@ void jl_init_types(void)
 
     jl_ANY_flag = (jl_value_t*)tvar("ANY");
 
+    jl_carnavalue =
+        jl_new_abstracttype((jl_value_t*)jl_symbol("Carnavalue"),
+                            jl_any_type, jl_emptysvec);
+
     // complete builtin type metadata
     jl_value_t *pointer_void = jl_apply_type((jl_value_t*)jl_pointer_type,
                                              jl_svec1(jl_void_type));
@@ -4016,6 +4022,7 @@ void jl_init_types(void)
     boundscheck_sym = jl_symbol("boundscheck");
     inbounds_sym = jl_symbol("inbounds");
     fastmath_sym = jl_symbol("fastmath");
+    stknew_sym = jl_symbol("stknew");
     newvar_sym = jl_symbol("newvar");
     copyast_sym = jl_symbol("copyast");
     simdloop_sym = jl_symbol("simdloop");

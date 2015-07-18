@@ -554,6 +554,8 @@ extern JL_DLLEXPORT jl_value_t *jl_true;
 extern JL_DLLEXPORT jl_value_t *jl_false;
 extern JL_DLLEXPORT jl_value_t *jl_nothing;
 
+extern JL_DLLEXPORT jl_datatype_t *jl_carnavalue;
+
 // some important symbols
 extern jl_sym_t *call_sym;    extern jl_sym_t *invoke_sym;
 extern jl_sym_t *empty_sym;
@@ -586,6 +588,7 @@ extern jl_sym_t *pure_sym; extern jl_sym_t *simdloop_sym;
 extern jl_sym_t *meta_sym; extern jl_sym_t *list_sym;
 extern jl_sym_t *inert_sym; extern jl_sym_t *static_parameter_sym;
 extern jl_sym_t *polly_sym; extern jl_sym_t *inline_sym;
+extern jl_sym_t *stknew_sym;
 
 // gc -------------------------------------------------------------------------
 
@@ -661,7 +664,7 @@ JL_DLLEXPORT void jl_gc_queue_root(jl_value_t *root); // root isa jl_value_t*
 STATIC_INLINE void jl_gc_wb(void *parent, void *ptr)
 {
     // parent and ptr isa jl_value_t*
-    if (__unlikely(jl_astaggedvalue(parent)->bits.gc == 3 &&
+    if (__unlikely((jl_astaggedvalue(parent)->bits.gc & 3) == 1 &&
                    (jl_astaggedvalue(ptr)->bits.gc & 1) == 0))
         jl_gc_queue_root((jl_value_t*)parent);
 }
@@ -669,7 +672,7 @@ STATIC_INLINE void jl_gc_wb(void *parent, void *ptr)
 STATIC_INLINE void jl_gc_wb_back(void *ptr) // ptr isa jl_value_t*
 {
     // if ptr is old
-    if (__unlikely(jl_astaggedvalue(ptr)->bits.gc == 3)) {
+    if (__unlikely(jl_astaggedvalue(ptr)->bits.gc & 2)) {
         jl_gc_queue_root((jl_value_t*)ptr);
     }
 }

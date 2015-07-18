@@ -435,8 +435,9 @@ STATIC_INLINE void gc_update_heap_size(int64_t sz_ub, int64_t sz_est)
 }
 
 static inline int gc_setmark_big(jl_ptls_t ptls, jl_taggedvalue_t *o,
-                                 int mark_mode)
+                                 int bits)
 {
+    int mark_mode = GC_MARKED_NOESC;
     if (gc_verifying) {
         o->bits.gc = mark_mode;
         return 0;
@@ -468,15 +469,16 @@ static inline int gc_setmark_big(jl_ptls_t ptls, jl_taggedvalue_t *o,
             scanned_bytes += hdr->sz&~3;
         objprofile_count(jl_typeof(jl_valueof(o)),
                          mark_mode == GC_OLD_MARKED, hdr->sz&~3);
+        o->bits.gc = mark_mode;
     }
-    o->bits.gc = mark_mode;
     verify_val(jl_valueof(o));
     return mark_mode;
 }
 
 static inline int gc_setmark_pool_(jl_ptls_t ptls, jl_taggedvalue_t *o,
-                                   int mark_mode, region_t *r)
+                                   int bits, region_t *r)
 {
+    int mark_mode = GC_MARKED_NOESC;
 #ifdef MEMDEBUG
     return gc_setmark_big(ptls, o, mark_mode);
 #endif
@@ -486,7 +488,6 @@ static inline int gc_setmark_pool_(jl_ptls_t ptls, jl_taggedvalue_t *o,
         return mark_mode;
     }
     jl_gc_pagemeta_t *page = page_metadata_(o, r);
-    int bits = o->bits.gc;
     if (mark_reset_age && !gc_marked(bits)) {
         // Reset the object as if it was just allocated
         bits = GC_CLEAN;
@@ -499,7 +500,6 @@ static inline int gc_setmark_pool_(jl_ptls_t ptls, jl_taggedvalue_t *o,
     }
     else if (gc_old(bits)) {
         mark_mode = GC_OLD_MARKED;
-    }
     if (!gc_marked(bits)) {
         if (mark_mode == GC_OLD_MARKED) {
             perm_scanned_bytes += page->osize;
@@ -510,6 +510,8 @@ static inline int gc_setmark_pool_(jl_ptls_t ptls, jl_taggedvalue_t *o,
         }
         objprofile_count(jl_typeof(jl_valueof(o)),
                          mark_mode == GC_OLD_MARKED, page->osize);
+        _gc_setmark(o, mark_mode);
+        page->gc_bits |= mark_mode;
     }
     assert(gc_marked(mark_mode));
     page->has_marked = 1;
@@ -536,6 +538,7 @@ static inline int gc_setmark(jl_ptls_t ptls, jl_value_t *v, int sz)
 inline void gc_setmark_buf(jl_ptls_t ptls, void *o, int mark_mode, size_t minsz)
 {
     jl_taggedvalue_t *buf = jl_astaggedvalue(o);
+    int bits = gc_bits(buf);
     // If the object is larger than the max pool size it can't be a pool object.
     // This should be accurate most of the time but there might be corner cases
     // where the size estimate is a little off so we do a pool lookup to make
@@ -1341,6 +1344,14 @@ static int push_root(jl_ptls_t ptls, jl_value_t *v, int d, int bits)
         bits = gc_setmark(ptls, v, sz);
         goto ret;
     }
+#define MARK(v, s) do {                         \
+            s;                                  \
+            if (d >= MAX_MARK_DEPTH)            \
+                goto queue_the_root;            \
+            if (should_timeout())               \
+                goto queue_the_root;            \
+    } while (0)
+
     d++;
 
     // some values have special representations
@@ -1434,7 +1445,16 @@ static int push_root(jl_ptls_t ptls, jl_value_t *v, int d, int bits)
     // this check should not be needed but it helps catching corruptions early
     else if (jl_typeof(vt) == (jl_value_t*)jl_datatype_type) {
         jl_datatype_t *dt = (jl_datatype_t*)vt;
-        size_t dtsz = jl_datatype_size(dt);
+        size_t dtsz;
+        if (dt == jl_datatype_type) {
+            size_t fieldsize =
+                jl_fielddesc_size(((jl_datatype_t*)v)->fielddesc_type);
+            dtsz = NWORDS(sizeof(jl_datatype_t) +
+                          jl_datatype_nfields(v) * fieldsize) * sizeof(void*);
+        }
+        else {
+            dtsz = jl_datatype_size(dt);
+        }
         bits = gc_setmark(ptls, v, dtsz);
         if (d >= MAX_MARK_DEPTH)
             goto queue_the_root;
@@ -1654,6 +1674,7 @@ static void _jl_gc_collect(jl_ptls_t ptls, int full, char *stack_hi)
 {
     JL_TIMING(GC);
     uint64_t t0 = jl_hrtime();
+    gc_stack_top = (char*)&t0;
     int64_t last_perm_scanned_bytes = perm_scanned_bytes;
     assert(mark_sp == 0);
 
@@ -1922,6 +1943,8 @@ void jl_gc_init(void)
     if (maxmem > max_collect_interval)
         max_collect_interval = maxmem;
 #endif
+    char _dummy;
+    gc_stack_bot = &_dummy;
 }
 
 JL_DLLEXPORT void *jl_gc_counted_malloc(size_t sz)

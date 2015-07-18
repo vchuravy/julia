@@ -201,7 +201,7 @@ void gc_setmark_buf(jl_ptls_t ptls, void *buf, int, size_t);
 
 STATIC_INLINE void jl_gc_wb_binding(jl_binding_t *bnd, void *val) // val isa jl_value_t*
 {
-    if (__unlikely(jl_astaggedvalue(bnd)->bits.gc == 3 &&
+    if (__unlikely((jl_astaggedvalue(bnd)->bits.gc & 3) == 1 &&
                    (jl_astaggedvalue(val)->bits.gc & 1) == 0))
         gc_queue_binding(bnd);
 }
@@ -209,9 +209,9 @@ STATIC_INLINE void jl_gc_wb_binding(jl_binding_t *bnd, void *val) // val isa jl_
 STATIC_INLINE void jl_gc_wb_buf(void *parent, void *bufptr, size_t minsz) // parent isa jl_value_t*
 {
     // if parent is marked and buf is not
-    if (__unlikely(jl_astaggedvalue(parent)->bits.gc & 1)) {
+    if (__unlikely((jl_astaggedvalue(parent)->bits.gc & 3) == 1)) {
         jl_ptls_t ptls = jl_get_ptls_states();
-        gc_setmark_buf(ptls, bufptr, 3, minsz);
+        gc_setmark_buf(ptls, bufptr, jl_astaggedvalue(parent)->bits.gc, minsz);
     }
 }
 

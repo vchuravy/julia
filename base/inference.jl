@@ -1088,7 +1088,7 @@ function abstract_eval(e::ANY, vtypes::VarTable, sv::InferenceState)
         t = abstract_eval_call(e, vtypes, sv)
     elseif is(e.head,:null)
         t = Void
-    elseif is(e.head,:new)
+    elseif is(e.head,:new) || is(e.head,:stknew)
         t = abstract_eval(e.args[1], vtypes, sv)
         if isType(t)
             t = t.parameters[1]

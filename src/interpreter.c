@@ -192,7 +192,7 @@ static jl_value_t *eval(jl_value_t *e, interpreter_state *s)
     else if (ex->head == invoke_sym) {
         return do_invoke(args, nargs, s);
     }
-    else if (ex->head == new_sym) {
+    else if (ex->head == new_sym || ex->head == stknew_sym) {
         jl_value_t *thetype = eval(args[0], s);
         jl_value_t *v=NULL;
         JL_GC_PUSH2(&thetype, &v);

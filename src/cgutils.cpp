@@ -685,6 +685,8 @@ static void emit_typecheck(const jl_cgval_t &x, jl_value_t *type, const std::str
                            jl_codectx_t *ctx)
 {
     Value *istype;
+    if (jl_subtype(x.typ, type, 0))
+        return;
     // if (jl_subtype(x.typ, type, 0)) {
     //     // This case should already be handled by the caller
     //     return;
@@ -1564,7 +1566,7 @@ static void emit_write_barrier(jl_codectx_t *ctx, Value *parent, Value *ptr)
 {
     Value *parenttag = emit_bitcast(emit_typeptr_addr(parent), T_psize);
     Value *parent_type = tbaa_decorate(tbaa_tag, builder.CreateLoad(parenttag));
-    Value *parent_bits = builder.CreateAnd(parent_type, 3);
+(??)    Value *parent_mark_bits = builder.CreateAnd(parent_type, 1);
 
     // the branch hint does not seem to make it to the generated code
     Value *parent_old_marked = builder.CreateICmpEQ(parent_bits,
@@ -1634,7 +1636,7 @@ static bool might_need_root(jl_value_t *ex)
             !jl_is_globalref(ex));
 }
 
-static jl_cgval_t emit_new_struct(jl_value_t *ty, size_t nargs, jl_value_t **args, jl_codectx_t *ctx)
+static jl_cgval_t emit_new_struct(jl_value_t *ty, size_t nargs, jl_value_t **args, jl_codectx_t *ctx, bool on_stack = false)
 {
     assert(jl_is_datatype(ty));
     assert(jl_is_leaf_type(ty));
@@ -1704,9 +1706,10 @@ static jl_cgval_t emit_new_struct(jl_value_t *ty, size_t nargs, jl_value_t **arg
             f1 = boxed(fval_info, ctx);
             j++;
         }
-        Value *strct = emit_allocobj(ctx, sty->size,
-                                     literal_pointer_val((jl_value_t*)ty));
+(??)        Value *strct = emit_allocobj(ctx, sty->size);
         jl_cgval_t strctinfo = mark_julia_type(strct, true, ty, ctx);
+(??)        tbaa_decorate(tbaa_tag, builder.CreateStore(literal_pointer_val((jl_value_t*)ty),
+(??)                                                    emit_typeptr_addr(strct)));
         if (f1) {
             jl_cgval_t f1info = mark_julia_type(f1, true, jl_any_type, ctx);
             if (!jl_subtype(expr_type(args[1],ctx), jl_field_type(sty,0), 0))
@@ -1731,7 +1734,6 @@ static jl_cgval_t emit_new_struct(jl_value_t *ty, size_t nargs, jl_value_t **arg
                 need_wb = true;
             }
             if (rhs.isboxed) {
-                if (!jl_subtype(expr_type(args[i],ctx), jl_svecref(sty->types,i-1), 0))
                     emit_typecheck(rhs, jl_svecref(sty->types,i-1), "new", ctx);
             }
             if (might_need_root(args[i])) // TODO: how to remove this?
