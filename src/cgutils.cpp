@@ -1704,8 +1704,17 @@ static jl_cgval_t emit_new_struct(jl_value_t *ty, size_t nargs, jl_value_t **arg
             f1 = boxed(fval_info, ctx);
             j++;
         }
-        Value *strct = emit_allocobj(ctx, sty->size,
-                                     literal_pointer_val((jl_value_t*)ty));
+        Value *strct;
+        Value *tag = literal_pointer_val((jl_value_t*)ty);
+        if (((jl_datatype_t*)ty)->layout->pointerfree) {
+            strct = builder.CreateConstGEP1_32(emit_bitcast(
+                        emit_static_alloca(T_int8, sty->size + sizeof(void*), ctx),  T_pjlvalue), 1);
+            // set the gc bits as marked & young
+            tag = builder.CreateIntToPtr(builder.CreateOr(builder.CreatePtrToInt(tag, T_size), 2), T_pjlvalue);
+        }
+        else {
+            strct = emit_allocobj(ctx, sty->size, tag);
+        }
         jl_cgval_t strctinfo = mark_julia_type(strct, true, ty, ctx);
         if (f1) {
             jl_cgval_t f1info = mark_julia_type(f1, true, jl_any_type, ctx);

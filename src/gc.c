@@ -1227,9 +1227,14 @@ NOINLINE static int gc_mark_module(jl_ptls_t ptls, jl_module_t *m, int d)
     return refyoung;
 }
 
+static char* gc_stack_top;
+static char* gc_stack_bot;
 static void gc_mark_stack(jl_ptls_t ptls, jl_value_t *ta, jl_gcframe_t *s,
                           intptr_t offset, int d)
 {
+    jl_task_t *task = (jl_task_t*)ta;
+    char *stkbuf = task == jl_current_task ? gc_stack_top : (char*) task->stkbuf;
+    char *stkend = task == jl_current_task ? gc_stack_bot : stkbuf + task->ssize;
     while (s != NULL) {
         s = (jl_gcframe_t*)((char*)s + offset);
         jl_value_t ***rts = (jl_value_t***)(((void**)s)+2);
@@ -1244,9 +1249,17 @@ static void gc_mark_stack(jl_ptls_t ptls, jl_value_t *ta, jl_gcframe_t *s,
         }
         else {
             for(size_t i=0; i < nr; i++) {
-                if (rts[i] != NULL) {
+                void *v = rts[i];
+                if (v != NULL) {
                     verify_parent2("task", ta, &rts[i], "stack(%d)", (int)i);
-                    gc_push_root(ptls, rts[i], d);
+                    if (stkbuf <= (char*)v && (char*)v <= stkend) {
+                        // if v is on the stack it is kept permanently marked
+                        // but we still need to scan it once
+                        push_root(ptls, (jl_value_t*)v, d, jl_astaggedvalue(v)->bits.gc);
+                    }
+                    else {
+                        gc_push_root(ptls, v, d);
+                    }
                 }
             }
         }
