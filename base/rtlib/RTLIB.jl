@@ -86,7 +86,7 @@ convert(::Type{Int32}, x::Float32) = fixsfsi(x)
 fixsfdi(x::Float32) = fixint(Int64, x)
 convert(::Type{Int64}, x::Float32) = fixsfdi(x)
 
-"convert Float32 to Int64"
+"convert Float32 to Int128"
 fixsfti(x::Float32) = fixint(Int128, x)
 convert(::Type{Int128}, x::Float32) = fixsfti(x)
 
@@ -98,7 +98,7 @@ convert(::Type{Int32}, x::Float64) = fixdfsi(x)
 fixdfdi(x::Float64) = fixint(Int64, x)
 convert(::Type{Int64}, x::Float64) = fixdfdi(x)
 
-"convert Float64 to Int64"
+"convert Float64 to Int128"
 fixdfti(x::Float64) = fixint(Int128, x)
 convert(::Type{Int128}, x::Float64) = fixdfti(x)
 
@@ -110,19 +110,46 @@ convert(::Type{Int128}, x::Float64) = fixdfti(x)
 # fixtfdi(x::Float128) = fixint(Int64, x)
 # convert(::Type{Int64}, x::Float128) = fixtfdi(x)
 
-# "convert Float128 to Int64"
+# "convert Float128 to Int128"
 # fixtfti(x::Float128) = fixint(Int128, x)
 # convert(::Type{Int128}, x::Float128) = fixtfti(x)
 
-# Names[RTLIB::FPTOUINT_F32_I32] = "__fixunssfsi";
-# Names[RTLIB::FPTOUINT_F32_I64] = "__fixunssfdi";
-# Names[RTLIB::FPTOUINT_F32_I128] = "__fixunssfti";
-# Names[RTLIB::FPTOUINT_F64_I32] = "__fixunsdfsi";
-# Names[RTLIB::FPTOUINT_F64_I64] = "__fixunsdfdi";
-# Names[RTLIB::FPTOUINT_F64_I128] = "__fixunsdfti";
-# Names[RTLIB::FPTOUINT_F128_I32] = "__fixunstfsi";
-# Names[RTLIB::FPTOUINT_F128_I64] = "__fixunstfdi";
-# Names[RTLIB::FPTOUINT_F128_I128] = "__fixunstfti";
+"convert Float32 to UInt32"
+fixunssfsi(x::Float32) = fixuint(UInt32, x)
+convert(::Type{UInt32}, x::Float32) = fixunssfsi(x)
+
+"convert Float32 to UInt64"
+fixunssfdi(x::Float32) = fixuint(UInt64, x)
+convert(::Type{UInt64}, x::Float32) = fixunssfdi(x)
+
+"convert Float32 to UInt128"
+fixunssfti(x::Float32) = fixuint(UInt128, x)
+convert(::Type{UInt128}, x::Float32) = fixunssfti(x)
+
+"convert Float64 to UInt32"
+fixunsdfsi(x::Float64) = fixuint(UInt32, x)
+convert(::Type{UInt32}, x::Float64) = fixunsdfsi(x)
+
+"convert Float64 to UInt64"
+fixunsdfdi(x::Float64) = fixuint(UInt64, x)
+convert(::Type{UInt64}, x::Float64) = fixunsdfdi(x)
+
+"convert Float64 to Int128"
+fixunsdfti(x::Float64) = fixuint(UInt128, x)
+convert(::Type{UInt128}, x::Float64) = fixunsdfti(x)
+
+# "convert Float128 to UInt32"
+# fixunstfsi(x::Float128) = fixuint(UInt32, x)
+# convert(::Type{UInt32}, x::Float128) = fixunstfsi(x)
+
+# "convert Float128 to UInt64"
+# fixunstfdi(x::Float128) = fixuint(UInt64, x)
+# convert(::Type{UInt64}, x::Float128) = fixunstfdi(x)
+
+# "convert Float128 to UInt128"
+# fixunstfti(x::Float128) = fixuint(UInt128, x)
+# convert(::Type{UInt128}, x::Float128) = fixunstfti(x)
+
 # Names[RTLIB::SINTTOFP_I32_F32] = "__floatsisf";
 # Names[RTLIB::SINTTOFP_I32_F64] = "__floatsidf";
 # Names[RTLIB::SINTTOFP_I32_F128] = "__floatsitf";
@@ -234,6 +261,16 @@ RTLIB.register(RTLIB.fixdfti, Int128, Tuple{Float64}, "__fixdfti")
 # RTLIB.register(RTLIB.fixtfsi, Int32, Tuple{Float128}, "__fixtfsi")
 # RTLIB.register(RTLIB.fixtfdi, Int64, Tuple{Float128}, "__fixtfdi")
 # RTLIB.register(RTLIB.fixtfti, Int128, Tuple{Float128}, "__fixtfti")
+
+RTLIB.register(RTLIB.fixunssfsi, UInt32, Tuple{Float32}, "__fixunssfsi")
+RTLIB.register(RTLIB.fixunssfdi, UInt64, Tuple{Float32}, "__fixunssfdi")
+RTLIB.register(RTLIB.fixunssfti, UInt128, Tuple{Float32}, "__fixunssfti")
+RTLIB.register(RTLIB.fixunsdfsi, UInt32, Tuple{Float64}, "__fixunsdfsi")
+RTLIB.register(RTLIB.fixunsdfdi, UInt64, Tuple{Float64}, "__fixunsdfdi")
+RTLIB.register(RTLIB.fixunsdfti, UInt128, Tuple{Float64}, "__fixunsdfti")
+# RTLIB.register(RTLIB.fixunstfsi, UInt32, Tuple{Float128}, "__fixunstfsi")
+# RTLIB.register(RTLIB.fixunstfdi, UInt64, Tuple{Float128}, "__fixunstfdi")
+# RTLIB.register(RTLIB.fixunstfti, UInt128, Tuple{Float128}, "__fixunstfti")
 
 RTLIB.register(RTLIB.floattisf, Float32, Tuple{Int128}, "__floattisf")
 RTLIB.register(RTLIB.floattidf, Float64, Tuple{Int128}, "__floattidf")
