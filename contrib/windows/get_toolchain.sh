@@ -27,14 +27,14 @@ case $bits in
     ;;
 esac
 echo "Downloading $host toolchain, check $PWD/get_toolchain.log for full output"
-contrib/windows/winrpm.sh http://download.opensuse.org/repositories/windows:/mingw:/win$bits/openSUSE_13.2 \
+contrib/windows/winrpm.sh http://download.opensuse.org/repositories/windows:/mingw:/win$bits/openSUSE_42.2 \
   "mingw$bits-gcc mingw$bits-gcc-c++ mingw$bits-gcc-fortran \
    mingw$bits-libssp0 mingw$bits-libstdc++6 mingw$bits-libgfortran3" > get_toolchain.log
 
 mingwdir=usr/$host/sys-root/mingw
 chmod +x $mingwdir/bin/* $mingwdir/$host/bin/* $mingwdir/libexec/gcc/$host/*/*
 mkdir -p usr/bin
-for i in gcc_s_$exc-1 ssp-0 stdc++-6 gfortran-3 quadmath-0; do
+for i in gcc_s_$exc-1 ssp-0 stdc++-6 gfortran-3 quadmath-0 atomic-1 winpthread-1; do
   cp $mingwdir/bin/lib$i.dll usr/bin
 done
 $mingwdir/bin/g++ --version
