@@ -312,13 +312,18 @@ void NotifyDebugger(jit_code_entry *JITCodeEntry)
 }
 // ------------------------ END OF TEMPORARY COPY FROM LLVM -----------------
 
-#if defined(_OS_LINUX_)
+#if defined(_OS_LINUX_) || defined(_OS_WINDOWS_)
 // Resolve non-lock free atomic functions in the libatomic library.
 // This is the library that provides support for c11/c++11 atomic operations.
 static uint64_t resolve_atomic(const char *name)
 {
+#if defined(_OS_LINUX_)
     static void *atomic_hdl = jl_load_dynamic_library_e("libatomic",
                                                         JL_RTLD_LOCAL);
+#elif defined(_OS_WINDOWS_)
+    static void *atomic_hdl = jl_load_dynamic_library_e("libatomic-1",
+                                                        JL_RTLD_LOCAL);
+#endif
     static const char *const atomic_prefix = "__atomic_";
     if (!atomic_hdl)
         return 0;
@@ -542,7 +547,7 @@ void JuliaOJIT::addModule(std::unique_ptr<Module> M)
                         // Step 2: Search the program symbols
                         if (uint64_t addr = SectionMemoryManager::getSymbolAddressInProcess(Name))
                             return JL_SymbolInfo(addr, JITSymbolFlags::Exported);
-#if defined(_OS_LINUX_)
+#if defined(_OS_LINUX_) || defined(_OS_WINDOWS_)
                         if (uint64_t addr = resolve_atomic(Name.c_str()))
                             return JL_SymbolInfo(addr, JITSymbolFlags::Exported);
 #endif
