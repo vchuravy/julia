@@ -687,6 +687,7 @@ static void jl_serialize_module(jl_serializer_state *s, jl_module_t *m)
     if (m == jl_main_module) {
         write_int32(s->s, 1);
         jl_serialize_value(s, (jl_value_t*)jl_core_module);
+        write_int32(s->s, 0);
     }
     else {
         write_int32(s->s, m->usings.len);
@@ -695,7 +696,7 @@ static void jl_serialize_module(jl_serializer_state *s, jl_module_t *m)
         }
         write_int32(s->s, m->optional.len);
         for(i=0; i < m->optional.len; i++) {
-            jl_serialize_value(s, (jl_value_t*)m->usings.items[i]);
+            jl_serialize_value(s, (jl_value_t*)m->optional.items[i]);
         }
     }
     write_uint8(s->s, m->istopmod);
