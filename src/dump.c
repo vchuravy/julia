@@ -2298,46 +2298,6 @@ static int size_isgreater(const void *a, const void *b)
     return *(size_t*)b - *(size_t*)a;
 }
 
-static jl_module_t *resolve_module(jl_sym_t *sym) {
-    jl_module_t *m = NULL;
-    if (jl_binding_resolved_p(jl_main_module, sym))
-        m = (jl_module_t*)jl_get_global(jl_main_module, sym);
-    if (!m) {
-        static jl_value_t *require_func = NULL;
-        if (!require_func)
-            require_func = jl_get_global(jl_base_module, jl_symbol("require"));
-        jl_value_t *reqargs[2] = {require_func, (jl_value_t*)sym};
-        jl_apply(reqargs, 2);
-        m = (jl_module_t*)jl_get_global(jl_main_module, sym);
-    }
-    return m;
-}
-
-static jl_value_t *read_verify_optional_list(ios_t *s) {
-    while (1) {
-        size_t len = read_int32(s);
-        if (len == 0)
-            return NULL;
-        char *name = (char*)alloca(len+1);
-        ios_read(s, name, len);
-        name[len] = '\0';
-        jl_module_t *m = NULL;
-        JL_TRY {
-            m = resolve_module(jl_symbol(name));
-        }
-        JL_CATCH {
-        }
-        // We currently don't rethrow the error, since Base.require
-        // throws when it doesn't find a module (which is kinda the point)
-        // We probably should first check that `Base.find_in_node` doesn't
-        // return empty. Oh well.
-        if (m && jl_is_module(m)) {
-            return jl_get_exceptionf(jl_errorexception_type,
-                "Optional module \"%s\" is now available.", name);
-        }
-    }
-}
-
 static jl_value_t *read_verify_mod_list(ios_t *s, arraylist_t *dependent_worlds)
 {
     if (!jl_main_module->uuid) {
@@ -2353,12 +2313,21 @@ static jl_value_t *read_verify_mod_list(ios_t *s, arraylist_t *dependent_worlds)
         name[len] = '\0';
         uint64_t uuid = read_uint64(s);
         jl_module_t *m = NULL;
-        JL_TRY {
-            m = resolve_module(jl_symbol(name));
-        }
-        JL_CATCH {
-            ios_close(s);
-            jl_rethrow();
+        if (jl_binding_resolved_p(jl_main_module, sym))
+            m = (jl_module_t*)jl_get_global(jl_main_module, sym);
+        if (!m) {
+            static jl_value_t *require_func = NULL;
+            if (!require_func)
+                require_func = jl_get_global(jl_base_module, jl_symbol("require"));
+            jl_value_t *reqargs[2] = {require_func, (jl_value_t*)sym};
+            JL_TRY {
+                jl_apply(reqargs, 2);
+            }
+            JL_CATCH {
+                ios_close(s);
+                jl_rethrow();
+            }
+            m = (jl_module_t*)jl_get_global(jl_main_module, sym);
         }
         if (!m) {
             return jl_get_exceptionf(jl_errorexception_type,
@@ -3296,11 +3265,10 @@ static jl_value_t *_jl_restore_incremental(ios_t *f)
         ios_skip(f, deplen);
     }
 
-    // verify that optional dependencies have not changed
-    jl_value_t *verify_error = read_verify_optional_list(f);
-    if (verify_error) {
-        ios_close(f);
-        return verify_error;
+    { // skip past the optional modules list
+        size_t len;
+        while ((len = read_int32(f)))
+          ios_skip(f, len);
     }
 
     // list of world counters of incremental dependencies
