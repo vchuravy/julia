@@ -1311,6 +1311,14 @@ static void write_mod_list(ios_t *s)
             }
         }
     }
+    // Write list of optional requires
+    for (i=0; i< m->optional.len; ++i) {
+      jl_sym_t *optional = (jl_sym_t*) m->optional.items[i];
+      size_t l = strlen(jl_symbol_name(optional));
+      write_int32(s, l);
+      ios_write(s, jl_symbol_name(optional), l);
+      write_uint64(s, 0);
+    }
     write_int32(s, 0);
 }
 
