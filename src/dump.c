@@ -2298,20 +2298,28 @@ static jl_value_t *read_verify_mod_list(ios_t *s, arraylist_t *dependent_worlds)
             }
             m = (jl_module_t*)jl_get_global(jl_main_module, sym);
         }
-        if (!m) {
-            return jl_get_exceptionf(jl_errorexception_type,
-                    "Requiring \"%s\" did not define a corresponding module.", name);
+        // Check if optional module is available
+        if (uuid == 0) {
+            if (m && jl_is_module(m)) {
+                return jl_get_exception(jl_errorexception_type,
+                        "Optional module \"%s\" is now available.", name);
+            }
+        } else {
+            if (!m) {
+                return jl_get_exceptionf(jl_errorexception_type,
+                        "Requiring \"%s\" did not define a corresponding module.", name);
+            }
+            if (!jl_is_module(m)) {
+                return jl_get_exceptionf(jl_errorexception_type,
+                    "Invalid module path (%s does not name a module).", name);
+            }
+            if (m->uuid != uuid) {
+                return jl_get_exceptionf(jl_errorexception_type,
+                    "Module %s uuid did not match cache file.", name);
+            }
+            if (m->primary_world > jl_main_module->primary_world)
+                arraylist_push(dependent_worlds, (void*)m->primary_world);
         }
-        if (!jl_is_module(m)) {
-            return jl_get_exceptionf(jl_errorexception_type,
-                "Invalid module path (%s does not name a module).", name);
-        }
-        if (m->uuid != uuid) {
-            return jl_get_exceptionf(jl_errorexception_type,
-                "Module %s uuid did not match cache file.", name);
-        }
-        if (m->primary_world > jl_main_module->primary_world)
-            arraylist_push(dependent_worlds, (void*)m->primary_world);
     }
 }
 
