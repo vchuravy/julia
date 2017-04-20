@@ -721,7 +721,15 @@ function parse_cache_header(f::IO)
         uuid = ntoh(read(f, UInt64)) # module UUID
         required_modules[sym] = uuid
     end
-    return modules, files, required_modules
+    optional_deps = Symbol[]
+    while true
+        n = ntoh(read(f, Int32))
+        n == 0 && break
+        sym = Symbol(read(f, n)) # module symbol
+        push!(optional_deps, sym)
+    end
+
+    return modules, files, required_modules, optional_deps
 end
 
 function parse_cache_header(cachefile::String)
@@ -735,8 +743,8 @@ function parse_cache_header(cachefile::String)
 end
 
 function cache_dependencies(f::IO)
-    defs, files, modules = parse_cache_header(f)
-    return modules, files
+    defs, files, modules, optional = parse_cache_header(f)
+    return modules, files, optional
 end
 
 function cache_dependencies(cachefile::String)
@@ -756,10 +764,10 @@ function stale_cachefile(modpath::String, cachefile::String)
             DEBUG_LOADING[] && info("JL_DEBUG_LOADING: Rejecting cache file $cachefile due to it containing an invalid cache header.")
             return true # invalid cache file
         end
-        modules, files, required_modules = parse_cache_header(io)
+        modules, files, required_deps, optional_deps = parse_cache_header(io)
 
         # Check if transitive dependencies can be fullfilled
-        for mod in keys(required_modules)
+        for mod in keys(required_deps)
             if mod == :Main || mod == :Core || mod == :Base
                 continue
             # Module is already loaded
@@ -784,6 +792,15 @@ function stale_cachefile(modpath::String, cachefile::String)
                 end
                 DEBUG_LOADING[] && info("JL_DEBUG_LOADING: Rejecting cache file $cachefile because it provides the wrong uuid (got $uuid) for $mod (want $uuid_req).")
                 return true # cachefile doesn't provide the required version of the dependency
+            end
+        end
+
+        for mod in optional
+            name = string(mod)
+            # TODO: is this the right method
+            if find_in_node_path(name, nothing, 1) !== nothing
+                DEBUG_LOADING[] && info("JL_DEBUG_LOADING: Rejecting cache file $cachefile because optional dependency $name became available.")
+                return true
             end
         end
 
