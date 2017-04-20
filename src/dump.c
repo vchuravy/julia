@@ -2326,9 +2326,11 @@ static jl_value_t *read_verify_optional_list(ios_t *s) {
             m = resolve_module(jl_symbol(name));
         }
         JL_CATCH {
-            ios_close(s);
-            jl_rethrow();
         }
+        // We currently don't rethrow the error, since Base.require
+        // throws when it doesn't find a module (which is kinda the point)
+        // We probably should first check that `Base.find_in_node` doesn't
+        // return empty. Oh well.
         if (m && jl_is_module(m)) {
             return jl_get_exceptionf(jl_errorexception_type,
                 "Optional module \"%s\" is now available.", name);
