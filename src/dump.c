@@ -2301,7 +2301,7 @@ static jl_value_t *read_verify_mod_list(ios_t *s, arraylist_t *dependent_worlds)
         // Check if optional module is available
         if (uuid == 0) {
             if (m && jl_is_module(m)) {
-                return jl_get_exception(jl_errorexception_type,
+                return jl_get_exceptionf(jl_errorexception_type,
                         "Optional module \"%s\" is now available.", name);
             }
         } else {
