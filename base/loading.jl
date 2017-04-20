@@ -221,6 +221,18 @@ function _require_from_serialized(node::Int, mod::Symbol, path_to_try::String, t
     return restored
 end
 
+"""
+    is_optional_module_available(name::String)
+
+Check that optional module with `name` is available.
+"""
+function is_optional_module_available(name::String)
+    # In the future this would be the right place to check
+    # if the module is available wrt to the loading module
+    # for versioned dependencies.
+    return find_in_node_path(name, nothing, 1) !== nothing
+end
+
 # returns `true` if require found a precompile cache for this mod, but couldn't load it
 # returns `false` if the module isn't known to be precompilable
 # returns the set of modules restored if the cache load succeeded
@@ -812,7 +824,7 @@ function stale_cachefile(modpath::String, cachefile::String)
         for mod in optional
             name = string(mod)
             # TODO: is this the right method
-            if find_in_node_path(name, nothing, 1) !== nothing
+            if is_optional_module_available(name)
                 DEBUG_LOADING[] && info("JL_DEBUG_LOADING: Rejecting cache file $cachefile because optional dependency $name became available.")
                 return true
             end
