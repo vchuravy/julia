@@ -30,7 +30,7 @@ JL_DLLEXPORT jl_module_t *jl_new_module(jl_sym_t *name)
     static unsigned int mcounter; // simple counter backup, in case hrtime is not incrementing
     m->uuid = jl_hrtime() + (++mcounter);
     if (!m->uuid)
-        m->uuid++; // uuid 0 is invalid
+        m->uuid++; // uuid 0 is invalid and used for optional modules
     m->primary_world = 0;
     m->counter = 0;
     htable_new(&m->bindings, 0);
@@ -600,6 +600,7 @@ JL_DLLEXPORT jl_value_t *jl_module_names(jl_module_t *m, int all, int imported)
 JL_DLLEXPORT jl_sym_t *jl_module_name(jl_module_t *m) { return m->name; }
 JL_DLLEXPORT jl_module_t *jl_module_parent(jl_module_t *m) { return m->parent; }
 JL_DLLEXPORT uint64_t jl_module_uuid(jl_module_t *m) { return m->uuid; }
+JL_DLLEXPORT void jl_module_optional(jl_module_t *m) { m->uuid = 0; }
 
 int jl_is_submodule(jl_module_t *child, jl_module_t *parent)
 {
