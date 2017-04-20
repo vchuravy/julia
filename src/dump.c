@@ -1308,14 +1308,6 @@ static void write_mod_list(ios_t *s)
                     write_int32(s, l);
                     ios_write(s, jl_symbol_name(child->name), l);
                     write_uint64(s, child->uuid);
-                    // Write list of optional requires
-                    for (i=0; i< child->optional.len; ++i) {
-                        jl_sym_t *optional = (jl_sym_t*) child->optional.items[i];
-                        size_t l = strlen(jl_symbol_name(optional));
-                        write_int32(s, l);
-                        ios_write(s, jl_symbol_name(optional), l);
-                        write_uint64(s, 0); // uuid zero for optional
-                    }
                 }
             }
         }
@@ -1403,6 +1395,25 @@ static void write_dependency_list(ios_t *s)
         write_int32(s, 0); // terminator, for ease of reading
     }
     JL_GC_POP();
+}
+
+// serialize information about the optional dependencies
+static void write_optional_list(ios_t *s)
+{
+    int i, l = jl_array_len(serializer_worklist);
+    for (i = 0; i < l; i++) {
+        jl_module_t *workmod = (jl_module_t*)jl_array_ptr_ref(serializer_worklist, i);
+        if (workmod->parent == jl_main_module) {
+            // Write list of optional requires
+            for (i=0; i< workmod->optional.len; ++i) {
+                jl_sym_t *optional = (jl_sym_t*) workmod->optional.items[i];
+                size_t l = strlen(jl_symbol_name(optional));
+                write_int32(s, l);
+                ios_write(s, jl_symbol_name(optional), l);
+            }
+        }
+    }
+    write_int32(s, 0);
 }
 
 // --- deserialize ---
@@ -2287,6 +2298,44 @@ static int size_isgreater(const void *a, const void *b)
     return *(size_t*)b - *(size_t*)a;
 }
 
+static jl_module_t *resolve_module(jl_sym_t *sym) {
+    jl_module_t *m = NULL;
+    if (jl_binding_resolved_p(jl_main_module, sym))
+        m = (jl_module_t*)jl_get_global(jl_main_module, sym);
+    if (!m) {
+        static jl_value_t *require_func = NULL;
+        if (!require_func)
+            require_func = jl_get_global(jl_base_module, jl_symbol("require"));
+        jl_value_t *reqargs[2] = {require_func, (jl_value_t*)sym};
+        jl_apply(reqargs, 2);
+        m = (jl_module_t*)jl_get_global(jl_main_module, sym);
+    }
+    return m;
+}
+
+static jl_value_t *read_verify_optional_list(ios_t *s) {
+    while (1) {
+        size_t len = read_int32(s);
+        if (len == 0)
+            return NULL;
+        char *name = (char*)alloca(len+1);
+        ios_read(s, name, len);
+        name[len] = '\0';
+        jl_module_t *m = NULL;
+        JL_TRY {
+            m = resolve_module(jl_symbol(name));
+        }
+        JL_CATCH {
+            ios_close(s);
+            jl_rethrow();
+        }
+        if (m && jl_is_module(m)) {
+            return jl_get_exceptionf(jl_errorexception_type,
+                "Optional module \"%s\" is now available.", name);
+        }
+    }
+}
+
 static jl_value_t *read_verify_mod_list(ios_t *s, arraylist_t *dependent_worlds)
 {
     if (!jl_main_module->uuid) {
@@ -2301,46 +2350,28 @@ static jl_value_t *read_verify_mod_list(ios_t *s, arraylist_t *dependent_worlds)
         ios_read(s, name, len);
         name[len] = '\0';
         uint64_t uuid = read_uint64(s);
-        jl_sym_t *sym = jl_symbol(name);
         jl_module_t *m = NULL;
-        if (jl_binding_resolved_p(jl_main_module, sym))
-            m = (jl_module_t*)jl_get_global(jl_main_module, sym);
+        JL_TRY {
+            m = resolve_module(jl_symbol(name));
+        }
+        JL_CATCH {
+            ios_close(s);
+            jl_rethrow();
+        }
         if (!m) {
-            static jl_value_t *require_func = NULL;
-            if (!require_func)
-                require_func = jl_get_global(jl_base_module, jl_symbol("require"));
-            jl_value_t *reqargs[2] = {require_func, (jl_value_t*)sym};
-            JL_TRY {
-                jl_apply(reqargs, 2);
-            }
-            JL_CATCH {
-                ios_close(s);
-                jl_rethrow();
-            }
-            m = (jl_module_t*)jl_get_global(jl_main_module, sym);
+            return jl_get_exceptionf(jl_errorexception_type,
+                "Requiring \"%s\" did not define a corresponding module.", name);
         }
-        // Check if optional module is available
-        if (uuid == 0) {
-            if (m && jl_is_module(m)) {
-                return jl_get_exceptionf(jl_errorexception_type,
-                        "Optional module \"%s\" is now available.", name);
-            }
-        } else {
-            if (!m) {
-                return jl_get_exceptionf(jl_errorexception_type,
-                        "Requiring \"%s\" did not define a corresponding module.", name);
-            }
-            if (!jl_is_module(m)) {
-                return jl_get_exceptionf(jl_errorexception_type,
-                    "Invalid module path (%s does not name a module).", name);
-            }
-            if (m->uuid != uuid) {
-                return jl_get_exceptionf(jl_errorexception_type,
-                    "Module %s uuid did not match cache file.", name);
-            }
-            if (m->primary_world > jl_main_module->primary_world)
-                arraylist_push(dependent_worlds, (void*)m->primary_world);
+        if (!jl_is_module(m)) {
+            return jl_get_exceptionf(jl_errorexception_type,
+                "Invalid module path (%s does not name a module).", name);
         }
+        if (m->uuid != uuid) {
+            return jl_get_exceptionf(jl_errorexception_type,
+                "Module %s uuid did not match cache file.", name);
+        }
+        if (m->primary_world > jl_main_module->primary_world)
+            arraylist_push(dependent_worlds, (void*)m->primary_world);
     }
 }
 
@@ -2920,6 +2951,7 @@ JL_DLLEXPORT int jl_save_incremental(const char *fname, jl_array_t *worklist)
     write_header(&f);
     write_work_list(&f);
     write_dependency_list(&f);
+    write_optional_list(&f);
     write_mod_list(&f); // this can return errors during deserialize,
                         // best to keep it early (before any actual initialization)
 
@@ -3262,12 +3294,19 @@ static jl_value_t *_jl_restore_incremental(ios_t *f)
         ios_skip(f, deplen);
     }
 
+    // verify that optional dependencies have not changed
+    jl_value_t *verify_error = read_verify_optional_list(f);
+    if (verify_error) {
+        ios_close(f);
+        return verify_error;
+    }
+
     // list of world counters of incremental dependencies
     arraylist_t dependent_worlds;
     arraylist_new(&dependent_worlds, 0);
 
     // verify that the system state is valid
-    jl_value_t *verify_error = read_verify_mod_list(f, &dependent_worlds);
+    verify_error = read_verify_mod_list(f, &dependent_worlds);
     if (verify_error) {
         arraylist_free(&dependent_worlds);
         ios_close(f);
