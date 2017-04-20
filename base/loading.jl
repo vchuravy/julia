@@ -148,6 +148,20 @@ function find_all_in_cache_path(mod::Symbol)
     return paths
 end
 
+"""
+    evict_cache(module)
+
+Deletes all cache files in that are in LOAD_CACHE_PATH
+for module $mod
+"""
+function evict_cache(mod::Symbol)
+  paths = find_all_in_cache_path(mod)
+  for p in paths
+    rm(p)
+  end
+  nothing
+end
+
 # these return either the array of modules loaded from the path / content given
 # or an Exception that describes why it couldn't be loaded
 function _include_from_serialized(content::Vector{UInt8})
