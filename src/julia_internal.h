@@ -176,10 +176,29 @@ static const int jl_gc_sizeclasses[JL_GC_N_POOLS] = {
 //    64,   32,  160,   64,   16,   64,  112,  128, bytes lost
 };
 
-JL_DLLEXPORT int jl_alignment(void* ty);
-
-STATIC_INLINE int JL_CONST_FUNC jl_gc_szclass(size_t sz, size_t alignment)
+STATIC_INLINE int JL_CONST_FUNC jl_gc_alignsz(size_t sz, size_t alignment)
 {
+    // The pools are aligned wit JL_CACHE_BYTE_ALIGNMENT (typically 64)
+    // and we can't guarantee a bigger alignment. This is problematic since
+    // vectortypes have an alignment fallback that is the next power of two.
+    // TODO: Needs to be first fixed in LLVM. See #20961
+    if (alignment > JL_CACHE_BYTE_ALIGNMENT)
+        alignment = JL_CACHE_BYTE_ALIGNMENT
+
+    // Pools with the correct alignment will have an object size that
+    // is a multiple of the alignment. As an example an allocation with
+    // sz of 48 and an alignment of 32 will need to be in pool of size 64.
+    // An alignment of 0 or 1 means unaligned and we can use sz directly.
+    if (alignment != 0 && alignment != 1 && alignment != sz)
+        sz = ((sz / alignment) + 1) * alignment;
+    return sz;
+}
+
+// Use jl_gc_alignsz to obtain the right sz.
+STATIC_INLINE int JL_CONST_FUNC jl_gc_szclass(size_t sz)
+{
+    // Check that the object fits in the largest pool.
+    assert(sz <= GC_MAX_SZCLASS + sizeof(jl_taggedvalue_t));
 #ifdef _P64
     if (sz <=    8)
         return 0;
@@ -207,18 +226,28 @@ STATIC_INLINE int JL_CONST_FUNC jl_gc_szclass(size_t sz, size_t alignment)
 #else
 #  define jl_is_constexpr(e) (0)
 #endif
+<<<<<<< HEAD
+=======
+
+#define jl_buff_tag ((uintptr_t)0x4eade800)
+>>>>>>> 84f91e6f5e... select bucket that fits multiple of alignment
 
 STATIC_INLINE jl_value_t *jl_gc_alloc_(jl_ptls_t ptls, size_t sz, size_t alignment, void *ty)
 {
     const size_t allocsz = sz + sizeof(jl_taggedvalue_t);
     if (allocsz < sz) // overflow in adding offs, size was "negative"
         jl_throw(jl_memory_exception);
+    size_t alignment = JL_SMALL_BYTE_ALIGNMENT;
+    if (ty && ((uintptr_t)ty != jl_buff_tag) &&
+        jl_is_datatype(ty) && ((jl_datatype_t*)ty)->layout)
+        alignment = jl_datatype_align(ty);
+    const size_t alignsz = jl_gc_alignsz(allocsz, alignment);
     jl_value_t *v;
-    if (allocsz <= GC_MAX_SZCLASS + sizeof(jl_taggedvalue_t)) {
-        int pool_id = jl_gc_szclass(allocsz, alignment);
+    if (alignsz <= GC_MAX_SZCLASS + sizeof(jl_taggedvalue_t)) {
+        int pool_id = jl_gc_szclass(alignsz);
         jl_gc_pool_t *p = &ptls->heap.norm_pools[pool_id];
         int osize;
-        if (jl_is_constexpr(allocsz)) {
+        if (jl_is_constexpr(alignsz)) {
             osize = jl_gc_sizeclasses[pool_id];
         }
         else {
@@ -243,7 +272,6 @@ JL_DLLEXPORT jl_value_t *jl_gc_alloc(jl_ptls_t ptls, size_t sz, size_t alignment
 #  define jl_gc_alloc(ptls, sz, align, ty) jl_gc_alloc_(ptls, sz, align, ty)
 #endif
 
-#define jl_buff_tag ((uintptr_t)0x4eade800)
 STATIC_INLINE void *jl_gc_alloc_buf(jl_ptls_t ptls, size_t sz)
 {
     return jl_gc_alloc(ptls, sz, 0, (void*)jl_buff_tag);
