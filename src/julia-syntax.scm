@@ -926,7 +926,7 @@
        ,@(map (lambda (n v) (make-assignment n (bounds-to-TypeVar v))) params bounds)
        (abstract_type ,name (call (core svec) ,@params) ,super))))))
 
-(define (bits-def-expr n name params super align)
+(define (bits-def-expr n name params super fields)
   (receive
    (params bounds) (sparam-name-bounds params)
    `(block
@@ -935,7 +935,7 @@
       (block
        ,@(map (lambda (v) `(local ,v)) params)
        ,@(map (lambda (n v) (make-assignment n (bounds-to-TypeVar v))) params bounds)
-       (bits_type ,name (call (core svec) ,@params) ,n ,super ,align))))))
+       (bits_type ,name (call (core svec) ,@params) ,n ,super ,fields))))))
 
 ;; take apart a type signature, e.g. T{X} <: S{Y}
 (define (analyze-type-sig ex)
@@ -2054,11 +2054,11 @@
    'bitstype
    (lambda (e)
      (let ((n (cadr e))
-           (align (caddr e))
-           (sig (cadddr e)))
+           (sig (caddr e))
+           (fields (cadddr e)))
        (expand-forms
         (receive (name params super) (analyze-type-sig sig)
-                 (bits-def-expr n name params super align)))))
+                 (bits-def-expr n name params super fields)))))
 
    'comparison
    (lambda (e) (expand-forms (expand-compare-chain (cdr e))))
@@ -3613,8 +3613,9 @@ f(x) = yt(x)
                   (emit `(abstract_type ,(cadr e) ,para ,supe))))
                ((bits_type)
                 (let* ((para (compile (caddr e) break-labels #t #f))
-                       (supe (compile (list-ref e 4) break-labels #t #f)))
-                  (emit `(bits_type ,(cadr e) ,para ,(cadddr e) ,supe ,(car (cdr (cddddr e)))))))
+                       (supe (compile (list-ref e 4) break-labels #t #f))
+                       (ftys (compile (list-ref e 5) break-labels #t #f #f)))
+                  (emit `(bits_type ,(cadr e) ,para ,(cadddr e) ,supe ,ftys))))
                ((composite_type)
                 (let* ((para (compile (caddr e) break-labels #t #f))
                        (supe (compile (list-ref e 4) break-labels #t #f))
