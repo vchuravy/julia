@@ -1,0 +1,32 @@
+From 8ba11e6bfb673ef5b1266335ca92e77104a5d3f8 Mon Sep 17 00:00:00 2001
+From: Valentin Churavy <v.churavy@gmail.com>
+Date: Thu, 15 Mar 2018 18:36:12 -0400
+Subject: [PATCH] hacky CMAKE fix for MINGW32
+
+---
+ tools/llvm-cfi-verify/lib/CMakeLists.txt | 11 ++---------
+ 1 file changed, 2 insertions(+), 9 deletions(-)
+
+diff --git a/tools/llvm-cfi-verify/lib/CMakeLists.txt b/tools/llvm-cfi-verify/lib/CMakeLists.txt
+index cd728e004b2..c6c2896737c 100644
+--- a/tools/llvm-cfi-verify/lib/CMakeLists.txt
++++ b/tools/llvm-cfi-verify/lib/CMakeLists.txt
+@@ -6,12 +6,5 @@ add_library(LLVMCFIVerify
+   GraphBuilder.h)
+ 
+ llvm_update_compile_flags(LLVMCFIVerify)
+-llvm_map_components_to_libnames(libs
+-  DebugInfoDWARF
+-  MC
+-  MCParser
+-  Object
+-  Support
+-  Symbolize)
+-target_link_libraries(LLVMCFIVerify ${libs})
+-set_target_properties(LLVMCFIVerify PROPERTIES FOLDER "Libraries")
+\ No newline at end of file
++target_link_libraries(LLVMCFIVerify LLVM)
++set_target_properties(LLVMCFIVerify PROPERTIES FOLDER "Libraries")
+-- 
+2.16.2
+

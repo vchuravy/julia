@@ -523,6 +523,7 @@ $(eval $(call LLVM_PATCH,llvm-PPC-addrspaces)) # PPC
 $(eval $(call LLVM_PATCH,llvm-D42260)) # remove for 7.0 (probably)
 $(eval $(call LLVM_PATCH,llvm-rL326843-missing-header)) # remove for 7.0 (might be nominated for 6.0.1)
 $(eval $(call LLVM_PATCH,llvm-6.0-r327540)) # remove for 7.0 (might be nominated for 6.0.1)
+$(eval $(call LLVM_PATCH,llvm-6.0-cmake-mingw32)) # HACK, needs to be polished and upstreamed
 endif # LLVM_VER
 
 # Remove hardcoded OS X requirements in compilter-rt cmake build
