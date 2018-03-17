@@ -1,0 +1,43 @@
+From a1fd0a5f0659d68172b5b1e21e1e7eb882388386 Mon Sep 17 00:00:00 2001
+From: Valentin Churavy <v.churavy@gmail.com>
+Date: Sat, 17 Mar 2018 16:13:30 -0400
+Subject: [PATCH] bufferoverflowU.lib is not part of msvcrt.dll and therefore
+ is hard to make work with mingw32
+
+---
+ lib/Target/X86/X86ISelLowering.cpp | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/lib/Target/X86/X86ISelLowering.cpp b/lib/Target/X86/X86ISelLowering.cpp
+index 0df09187d0e..1670db62002 100644
+--- a/lib/Target/X86/X86ISelLowering.cpp
++++ b/lib/Target/X86/X86ISelLowering.cpp
+@@ -2098,7 +2098,7 @@ Value *X86TargetLowering::getIRStackGuard(IRBuilder<> &IRB) const {
+ 
+ void X86TargetLowering::insertSSPDeclarations(Module &M) const {
+   // MSVC CRT provides functionalities for stack protection.
+-  if (Subtarget.getTargetTriple().isOSMSVCRT()) {
++  if (Subtarget.getTargetTriple().isWindowsMSVCEnvironment()) {
+     // MSVC CRT has a global variable holding security cookie.
+     M.getOrInsertGlobal("__security_cookie",
+                         Type::getInt8PtrTy(M.getContext()));
+@@ -2120,14 +2120,14 @@ void X86TargetLowering::insertSSPDeclarations(Module &M) const {
+ 
+ Value *X86TargetLowering::getSDagStackGuard(const Module &M) const {
+   // MSVC CRT has a global variable holding security cookie.
+-  if (Subtarget.getTargetTriple().isOSMSVCRT())
++  if (Subtarget.getTargetTriple().isWindowsMSVCEnvironment())
+     return M.getGlobalVariable("__security_cookie");
+   return TargetLowering::getSDagStackGuard(M);
+ }
+ 
+ Value *X86TargetLowering::getSSPStackGuardCheck(const Module &M) const {
+   // MSVC CRT has a function to validate security cookie.
+-  if (Subtarget.getTargetTriple().isOSMSVCRT())
++  if (Subtarget.getTargetTriple().isWindowsMSVCEnvironment())
+     return M.getFunction("__security_check_cookie");
+   return TargetLowering::getSSPStackGuardCheck(M);
+ }
+-- 
+2.16.2
+
