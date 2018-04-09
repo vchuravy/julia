@@ -298,6 +298,56 @@ asm(
 
 #define CALLBACK_ABI
 
+#elif defined(_CPU_PPC64_)
+
+#define MAX_INTERP_STATE_SIZE 64
+#define MIN_STACK 112
+#define STACK_PADDING 0
+#define STACK_SIZE (MIN_STACK + MAX_INTERP_STATE_SIZE + STACK_PADDING)
+
+size_t TOTAL_STACK_PADDING = MIN_STACK;
+
+// Check that the interpreter state can fit
+static_assert(sizeof(interpreter_state) <= MAX_INTERP_STATE_SIZE,
+              "Stack layout invariants violated.");
+// Check that the alignment of the type is satisfied
+static_assert(alignof(interpreter_state) <= 16, "Stack layout invariants violated");
+// Check that ABI stack alignment requirement is maintained.
+static_assert(STACK_SIZE % 16 == 0, "Stack layout invariants violated");
+
+asm(
+    ASM_ENTRY
+    MANGLE("enter_interpreter_frame") ":\n"
+    // set up stack frame & back pointer (112 bytes -- minimum stack)
+    "\tstdu 1, -" XSTR(STACK_SIZE) "(1)\n"
+    // save LR
+    "\tmflr 0\n"
+    "\tstd 0, " XSTR(STACK_SIZE+16) "(1)\n" // save in callee
+    "\tld 6, 0(3)\n" // arg1 contains function descriptor
+    "\tcal 3, " XSTR(MIN_STACK) "(1)\n" // move pointer to INTERP_STATE to arg1
+    // zero out src and mi field
+    "\tli 6, 0\n"
+    "\tstd 6, 0(3)\n"
+    "\tstd 6, 8(3)\n"
+    "\tld 0, 0(5)\n" // load func pointer
+    "\tstd 2, 40(1)\n" // store TOC
+    "\tmtctr 0\n"
+    "\tld 2, 8(5)\n" // load TOC of func
+    "Lenter_interpreter_frame_start_val:\n"
+    "\tbctrl\n"
+    "Lenter_interpreter_frame_end_val:\n"
+    "\tld 2, 40(1)\n" // restore TOC
+    // restore LR
+    "\tld 0, " XSTR(STACK_SIZE+16) "(1)\n"
+    "\tmtlr 0\n"
+    // restore stack frame
+    "\tld 1, 0(1)\n"
+    "\tblr\n"
+    ASM_EXIT
+    );
+
+#define CALLBACK_ABI
+
 #else
 #warning "Interpreter backtraces not implemented for this platform"
 #define NO_INTERP_BT
