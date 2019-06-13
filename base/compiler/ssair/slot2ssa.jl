@@ -338,6 +338,71 @@ function idf(cfg::CFG, liveness::BlockLiveness, domtree::DomTree)
     phiblocks
 end
 
+###
+# Spindel analysis pass:
+# A Spindle is a set of basic blocks that form a unit of logical parallelism.
+# This analysis is basically `idf` 
+function spindel_analysis(cfg::CFG, domtree::DomTree, code::Vector{Any})
+    # This should be a priority queue, but TODO - sorted array for now
+    pq = Tuple{Int, Int}[(i, domtree.nodes[i].level) for i in 1:length(cfg.blocks)]
+    sort!(pq, by=x->x[2])
+    spindels = zeros(Int, length(pq))
+   
+    next_id = 1
+    gen_id() = (id=next_id; next_id += 1; id)
+
+    # This bitset makes sure we only add a phi node to a given block once.
+    processed = BitSet()
+    # This bitset implements the `key insight` mentioned above. In particular, it prevents
+    # us from visiting a subtree that we have already visited before.
+    visited = BitSet()
+    while !isempty(pq)
+        # We pop from the end of the array - i.e. the element with the highest level.
+        node, level = pop!(pq)
+        worklist = Int[]
+        push!(worklist, node)
+        while !isempty(worklist)
+            active = pop!(worklist)
+            if spindels[active] == 0
+                spindels[active] = gen_id() 
+            end
+            current_id = spindels[active]
+            terminator = code[last(cfg.blocks[active].stmts)]
+
+            for succ in cfg.blocks[active].succs
+                # Check whether the current root (`node`) dominates succ.
+                # We are guaranteed that `node` dominates `active`, since
+                # we've arrived at `active` by following dominator tree edges.
+                # If `succ`'s level is less than or equal to that of `node`,
+                # it cannot possibly be dominated by `node`. On the other hand,
+                # since at this point we know that there is an edge from `node`'s
+                # subtree to `succ`, we know that if succ's level is greater than
+                # that of `node`, it must be dominated by `node`.
+                succ_level = domtree.nodes[succ].level
+                if succ_level > level
+                    if terminator isa DetachNode
+                        spindels[level] = gen_id()
+                    else
+                        spindels[level] = current_id
+                    end
+                    continue
+                end
+                # We don't dominate succ. We need to place a phinode,
+                # unless liveness said otherwise.
+                succ in processed && continue
+                push!(processed, succ)
+            end
+            # Recurse down the current subtree
+            for child in domtree.nodes[active].children
+                child in visited && continue
+                push!(visited, child)
+                push!(worklist, child)
+            end
+        end
+    end
+    spindels
+end
+
 function rename_incoming_edge(old_edge, old_to, result_order, bb_rename)
     new_edge_from = bb_rename[old_edge]
     if old_edge == old_to - 1
@@ -589,6 +654,8 @@ function construct_ssa!(ci::CodeInfo, code::Vector{Any}, ir::IRCode, domtree::Do
                         slottypes::Vector{Any})
     cfg = ir.cfg
     left = Int[]
+    spindels = spindel_analysis(cfg, domtree, code)
+    @show spindels
     catch_entry_blocks = Tuple{Int, Int}[]
     for (idx, stmt) in pairs(code)
         if isexpr(stmt, :enter)
