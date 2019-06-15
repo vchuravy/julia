@@ -338,69 +338,81 @@ function idf(cfg::CFG, liveness::BlockLiveness, domtree::DomTree)
     phiblocks
 end
 
+struct Spindle
+    entry::Int
+    kind::Symbol
+    blocks::Vector{Int}
+end
+
 ###
 # Spindel analysis pass:
 # A Spindle is a set of basic blocks that form a unit of logical parallelism.
-# This analysis is basically `idf` 
+# TODO:
+#  - Extract tasks and assoicate spindles to tasks
 function spindel_analysis(cfg::CFG, domtree::DomTree, code::Vector{Any})
-    # This should be a priority queue, but TODO - sorted array for now
-    pq = Tuple{Int, Int}[(i, domtree.nodes[i].level) for i in 1:length(cfg.blocks)]
-    sort!(pq, by=x->x[2])
-    spindels = zeros(Int, length(pq))
-   
-    next_id = 1
-    gen_id() = (id=next_id; next_id += 1; id)
+    # Implementation based on TapirTaskInfo.cpp
+    # 1. Compute defining blocks based on detach and sync
+    defs = BitSet()
+    spindlekinds = IdDict{Int, Symbol}()
 
-    # This bitset makes sure we only add a phi node to a given block once.
-    processed = BitSet()
-    # This bitset implements the `key insight` mentioned above. In particular, it prevents
-    # us from visiting a subtree that we have already visited before.
-    visited = BitSet()
-    while !isempty(pq)
-        # We pop from the end of the array - i.e. the element with the highest level.
-        node, level = pop!(pq)
-        worklist = Int[]
-        push!(worklist, node)
-        while !isempty(worklist)
-            active = pop!(worklist)
-            if spindels[active] == 0
-                spindels[active] = gen_id() 
-            end
-            current_id = spindels[active]
-            terminator = code[last(cfg.blocks[active].stmts)]
+    push!(defs, 1)
+    spindlekinds[1] = :start
+    for (idx, bb) in enumerate(cfg.blocks)
+        terminator = code[last(bb.stmts)]
+        if isa(terminator, DetachNode)
+            # Mark the detached block
+            block = block_for_inst(cfg, (terminator::DetachNode).label)
+            push!(defs, block)
+            spindlekinds[block] = :detach
+        elseif isa(terminator, SyncNode)
+            # mark the BB containing the sync
+            push!(defs, idx)
+            # create a new spindle for the successor
+            spindlekinds[idx+1] = :sync
+        end
+    end   
 
-            for succ in cfg.blocks[active].succs
-                # Check whether the current root (`node`) dominates succ.
-                # We are guaranteed that `node` dominates `active`, since
-                # we've arrived at `active` by following dominator tree edges.
-                # If `succ`'s level is less than or equal to that of `node`,
-                # it cannot possibly be dominated by `node`. On the other hand,
-                # since at this point we know that there is an edge from `node`'s
-                # subtree to `succ`, we know that if succ's level is greater than
-                # that of `node`, it must be dominated by `node`.
-                succ_level = domtree.nodes[succ].level
-                if succ_level > level
-                    if terminator isa DetachNode
-                        spindels[level] = gen_id()
-                    else
-                        spindels[level] = current_id
-                    end
-                    continue
-                end
-                # We don't dominate succ. We need to place a phinode,
-                # unless liveness said otherwise.
-                succ in processed && continue
-                push!(processed, succ)
-            end
-            # Recurse down the current subtree
-            for child in domtree.nodes[active].children
-                child in visited && continue
-                push!(visited, child)
-                push!(worklist, child)
+    # 2. Use the defs to find phiblocks, note we assume that
+    #    uses is all blocks.
+    live = BlockLiveness(collect(defs), collect(1:length(cfg.blocks)))
+    phiblocks = idf(cfg, live, domtree)
+    for block in phiblocks
+        if haskey(spindlekinds, block)
+            @assert spindlekinds[block] == :sync
+        end
+        spindlekinds[block] = :phi
+    end
+
+    spindles = Spindle[] 
+    # 3. Partition the function's blocks into spindles
+    foundblocks = Int[]
+    for bb in postorder(domtree, 1)
+        # If BB is not a spindle entry mark it and continue
+        if !haskey(spindlekinds, bb)
+            push!(foundblocks, bb)
+            continue
+        end
+        # this block is a spindle entry
+        unassocblocks = Int[bb]
+
+        # determine which found blocks are associated with
+        # this spindle, because of the post-oder traversal,
+        # these blocks forma  suffix of foundblocks.
+        while !isempty(foundblocks)
+            fb = last(foundblocks)
+            if dominates(domtree, bb, fb)
+                push!(unassocblocks, fb)
+                pop!(foundblocks)
+            else
+                break
             end
         end
+
+        spindle = Spindle(bb, spindlekinds[bb], unassocblocks)
+        push!(spindles, spindle)
     end
-    spindels
+
+    return spindles
 end
 
 function rename_incoming_edge(old_edge, old_to, result_order, bb_rename)

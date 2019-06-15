@@ -167,45 +167,37 @@ end
     return x1 + x2
 end
 
-##
-# julia> @code_typed fib2(3)
-# CodeInfo(
-# 1 ─ %1  = Base.sle_int(N, 1)::Bool
-# └──       goto #3 if not %1
-# 2 ─       return N
-# 3 ─ %4  = $(Expr(:syncregion))
-# └──       detach within %4, #4, #5
-# 4 ─ %6  = Base.sub_int(N, 1)::Int64
-# │   %7  = invoke Main.fib2(%6::Int64)::Int64
-# └──       reattach within %4, #5
-# 5 ┄ %9  = φ (#3 => 0, #4 => %7)::Int64
-# │   %10 = Base.sub_int(N, 2)::Int64
-# │   %11 = invoke Main.fib2(%10::Int64)::Int64
-# │         sync within %4
-# │   %13 = Base.add_int(%9, %11)::Int64
-# └──       return %13
-# 6 ─       $(Expr(:meta, :noinline))
-# ) => Int64
+# Spindle examples
+# Use this for spindle analysis
+@noinline function fib3(n)
+    rv = n
+    x = Ref{Int}()
+    token = @syncregion()
+    if (n > 2)
+        @spawn token begin
+          x[] = fib3(n-1)
+        end
+        y = fib3(n-2)
+        @sync_end token
+        rv = y + x[]
+    end
+    return rv
+end
 
-## What we want:
-# julia> @code_typed fib2(3)
-# CodeInfo(
-# 1 ─ %1  = Base.sle_int(N, 1)::Bool
-# └──       goto #3 if not %1
-# 2 ─       return N
-# 3 ─ %4  = $(Expr(:syncregion))
-# └──       detach within %4, #4, #5
-# 4 ─ %6  = ϒ (0)::Int64
-#     %7  = Base.sub_int(N, 1)::Int64
-# │   %8  = invoke Main.fib2(%7::Int64)::Int64
-#     %9  = ϒ (%8)::Int64
-#     %10 = φᶜ (%6, %9)::Int64
-# └──       reattach within %4, #5
-# 5 ┄ %12 = φ (#3 => 0, #4 => %10)::Int64
-# │   %13 = Base.sub_int(N, 2)::Int64
-# │   %14 = invoke Main.fib2(%13::Int64)::Int64
-# │         sync within %4
-# │   %15 = Base.add_int(%12, %14)::Int64
-# └──       return %13
-# 6 ─       $(Expr(:meta, :noinline))
-# ) => Int64
+function tapir_2D(C, A, B)
+    outer = @syncregion()
+    for i in 1:size(A, 1) 
+        @spawn outer begin
+            inner = @syncregion()
+            for j in 1:size(B, 2)
+                @spawn inner begin
+                    for k in 1:size(B, 1)
+                        C[i, j] += A[i, k] * B[k, j]
+                    end
+                end
+                @sync_end outer
+            end
+        end
+    end
+    @sync_end outer
+end
