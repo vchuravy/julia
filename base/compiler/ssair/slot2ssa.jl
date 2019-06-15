@@ -344,25 +344,32 @@ struct Spindle
     blocks::Vector{Int}
 end
 
+struct Task
+    entry::Int
+    spindles::Vector{Spindle}
+    subtasks::Vector{Task}
+end
+
 ###
-# Spindel analysis pass:
+# Spindel and task analysis pass:
 # A Spindle is a set of basic blocks that form a unit of logical parallelism.
-# TODO:
-#  - Extract tasks and assoicate spindles to tasks
-function spindel_analysis(cfg::CFG, domtree::DomTree, code::Vector{Any})
+function taskinfo(cfg::CFG, domtree::DomTree, code::Vector{Any})
     # Implementation based on TapirTaskInfo.cpp
     # 1. Compute defining blocks based on detach and sync
     defs = BitSet()
     spindlekinds = IdDict{Int, Symbol}()
+    taskentries = BitSet()
 
     push!(defs, 1)
-    spindlekinds[1] = :start
+    push!(taskentries, 1) # function entry
+    spindlekinds[1] = :entry
     for (idx, bb) in enumerate(cfg.blocks)
         terminator = code[last(bb.stmts)]
         if isa(terminator, DetachNode)
             # Mark the detached block
             block = block_for_inst(cfg, (terminator::DetachNode).label)
             push!(defs, block)
+            push!(taskentries, block)
             spindlekinds[block] = :detach
         elseif isa(terminator, SyncNode)
             # mark the BB containing the sync
@@ -383,9 +390,33 @@ function spindel_analysis(cfg::CFG, domtree::DomTree, code::Vector{Any})
         spindlekinds[block] = :phi
     end
 
+    ## 3. Partition the function's blocks into spindles and tasks
+    # Use the following linear-time algorithm to partition the function's blocks
+    # into spindles, partition the spindles into tasks, and compute the tree of
+    # tasks in this function.
+  
+    # -) A post-order traversal of the dominator tree looks for a spindle entry
+    # and creates a stack of blocks it finds along the way.
+  
+    # -) Once a spindle entry is encountered, the blocks belonging to that
+    # spindle equal the suffix of the stack of found blocks that are all
+    # dominated by the spindle's entry.  These blocks are removed from the stack
+    # and added to the spindle according to a DFS CFG traversal starting at the
+    # spindle's entry.
+  
+    # -) Similarly, the post-order travesal of the dominator tree finds the set
+    # of spindles that make up each task.  These spindles are collected and added
+    # to their enclosing task using the same algorithm as above.
+  
+    # -) Finally, the post-order traversal of the dominator tree deduces the
+    # hierarchical nesting of tasks within the function.  Subtasks are associated
+    # with their parent task whenever a task entry that dominates the previous
+    # task entry is encountered.
+
     spindles = Spindle[] 
-    # 3. Partition the function's blocks into spindles
     foundblocks = Int[]
+    foundspindles = Spindle[]
+    foundtasks = Task[]
     for bb in postorder(domtree, 1)
         # If BB is not a spindle entry mark it and continue
         if !haskey(spindlekinds, bb)
@@ -410,9 +441,45 @@ function spindel_analysis(cfg::CFG, domtree::DomTree, code::Vector{Any})
 
         spindle = Spindle(bb, spindlekinds[bb], unassocblocks)
         push!(spindles, spindle)
+
+        # If spindle is not a task entry mark it
+        if !(bb in taskentries)
+            push!(foundspindles, spindle)
+            continue
+        end
+
+        unassocspindles = Spindle[spindle]
+        # associate spindels dominated by task with task
+        while !isempty(foundspindles)
+            fs = last(foundspindles)
+            if dominates(domtree, bb, fs.entry)
+                push!(unassocspindles, fs)
+                pop!(foundspindles)
+            else
+                break
+            end
+        end
+
+        # If the last task is dominated by this task, add the unassociated tasks as
+        # children of this task.
+        unassoctasks = Task[]
+        while !isempty(foundtasks)
+            ft = last(foundtasks)
+            if dominates(domtree, bb, ft.entry)
+                push!(unassoctasks, ft)
+                pop!(foundtasks)
+            else
+                break
+            end
+        end
+        task = Task(bb, unassocspindles, unassoctasks)
+        push!(foundtasks, task)
     end
 
-    return spindles
+    @assert length(foundtasks) == 1
+    root = first(foundtasks)
+
+    return spindles, root
 end
 
 function rename_incoming_edge(old_edge, old_to, result_order, bb_rename)
@@ -666,8 +733,9 @@ function construct_ssa!(ci::CodeInfo, code::Vector{Any}, ir::IRCode, domtree::Do
                         slottypes::Vector{Any})
     cfg = ir.cfg
     left = Int[]
-    spindels = spindel_analysis(cfg, domtree, code)
+    spindels, root = taskinfo(cfg, domtree, code)
     @show spindels
+    @show root
     catch_entry_blocks = Tuple{Int, Int}[]
     for (idx, stmt) in pairs(code)
         if isexpr(stmt, :enter)
