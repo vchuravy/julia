@@ -760,6 +760,7 @@ function construct_ssa!(ci::CodeInfo, code::Vector{Any}, ir::IRCode, domtree::Do
     for (_, exc) in catch_entry_blocks
         phicnodes[exc] = Vector{Tuple{SlotNumber, NewSSAValue, PhiCNode}}()
     end
+    # TODO PHICNode placement for tasks
     @timeit "idf" for (idx, slot) in Iterators.enumerate(defuse)
         # No uses => no need for phi nodes
         isempty(slot.uses) && continue
@@ -786,6 +787,7 @@ function construct_ssa!(ci::CodeInfo, code::Vector{Any}, ir::IRCode, domtree::Do
         end
         @timeit "liveness" (live = compute_live_ins(cfg, slot))
         for li in live.live_in_bbs
+            # TODO PHICNode for tasks
             cidx = findfirst(x->x[2] == li, catch_entry_blocks)
             if cidx !== nothing
                 # The slot is live-in into this block. We need to
@@ -877,6 +879,7 @@ function construct_ssa!(ci::CodeInfo, code::Vector{Any}, ir::IRCode, domtree::Do
             end
         end
         # Record initial upsilon nodes if necessary
+        # TODO: UpsilonNode placement for tasks
         eidx = findfirst(x->x[1] == item, catch_entry_blocks)
         if eidx !== nothing
             for (slot, _, node) in phicnodes[catch_entry_blocks[eidx][2]]
@@ -916,6 +919,7 @@ function construct_ssa!(ci::CodeInfo, code::Vector{Any}, ir::IRCode, domtree::Do
                         incoming_vals[id] = undef_token
                     end
                     eidx = item
+                    # TODO UpsilonNode for Tasks
                     while haskey(exc_handlers, eidx)
                         (eidx, exc) = exc_handlers[eidx]
                         cidx = findfirst(x->slot_id(x[1]) == id, phicnodes[exc])
