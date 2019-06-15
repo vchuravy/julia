@@ -58,6 +58,20 @@ function iterate(doms::DominatedBlocks, state::Nothing=nothing)
     return (bb, nothing)
 end
 
+# TODO non-recursive variant
+function _postorder!(order, domtree, root)
+    for child in domtree.nodes[root].children
+        _postorder!(order, domtree, child)
+    end
+    push!(order, root)
+end
+
+function postorder(domtree::DomTree, root::Int)
+    order = Int[]
+    _postorder!(order, domtree, root)
+    return order
+end
+
 function naive_idoms(cfg::CFG)
     nblocks = length(cfg.blocks)
     # The extra +1 helps us detect unreachable blocks below
