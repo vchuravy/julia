@@ -154,7 +154,7 @@ function stmt_affects_purity(@nospecialize(stmt), ir)
         return false
     end
     if isa(stmt, GotoIfNot)
-        t = argextype(stmt.cond, ir, ir.sptypes)
+        t = argextype(stmt.cond, ir, ir.sptypes, ir.argtypes)
         return !(t ⊑ Bool)
     end
     if isa(stmt, Expr)

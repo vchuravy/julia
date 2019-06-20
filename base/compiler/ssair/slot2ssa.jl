@@ -769,10 +769,13 @@ function construct_ssa!(ci::CodeInfo, code::Vector{Any}, ir::IRCode, domtree::Do
     for (_, exc) in catch_entry_blocks
         phicnodes[exc] = Vector{Tuple{SlotNumber, NewSSAValue, PhiCNode}}()
     end
-    # TODO PHICNode placement for tasks
+   
+    slots_to_keep = collect(1:length(defuse))
     @timeit "idf" for (idx, slot) in Iterators.enumerate(defuse)
         # No uses => no need for phi nodes
         isempty(slot.uses) && continue
+        # keep the slot
+        idx in slots_to_keep && continue
         # TODO: Restore this optimization
         if false # length(slot.defs) == 1 && slot.any_newvar
             if slot.defs[] == 0
@@ -822,7 +825,9 @@ function construct_ssa!(ci::CodeInfo, code::Vector{Any}, ir::IRCode, domtree::Do
     end
     # Perform SSA renaming
     initial_incoming_vals = Any[
-        if 0 in defuse[x].defs
+        if x in slots_to_keep
+            Core.SlotNumber(x)
+        elseif 0 in defuse[x].defs
             Argument(x)
         elseif !defuse[x].any_newvar
             undef_token
@@ -860,6 +865,9 @@ function construct_ssa!(ci::CodeInfo, code::Vector{Any}, ir::IRCode, domtree::Do
                 # Liveness analysis would probably have prevented us from inserting this phi node
                 continue
             end
+            if incoming_val isa Core.SlotNumber
+                continue # slot to keep
+            end
             push!(node.edges, pred)
             if incoming_val == undef_token
                 resize!(node.values, length(node.values)+1)
@@ -888,7 +896,6 @@ function construct_ssa!(ci::CodeInfo, code::Vector{Any}, ir::IRCode, domtree::Do
             end
         end
         # Record initial upsilon nodes if necessary
-        # TODO: UpsilonNode placement for tasks
         eidx = findfirst(x->x[1] == item, catch_entry_blocks)
         if eidx !== nothing
             for (slot, _, node) in phicnodes[catch_entry_blocks[eidx][2]]
@@ -905,6 +912,8 @@ function construct_ssa!(ci::CodeInfo, code::Vector{Any}, ir::IRCode, domtree::Do
             stmt = code[idx]
             (isa(stmt, PhiNode) || (isexpr(stmt, :(=)) && isa(stmt.args[2], PhiNode))) && continue
             if isa(stmt, NewvarNode)
+                id = slot_id(stmt.slot)
+                id in slots_to_keep && continue
                 incoming_vals[slot_id(stmt.slot)] = undef_token
                 code[idx] = nothing
             else
@@ -917,6 +926,7 @@ function construct_ssa!(ci::CodeInfo, code::Vector{Any}, ir::IRCode, domtree::Do
                 # Record a store
                 if isexpr(stmt, :(=)) && isa(stmt.args[1], SlotNumber)
                     id = slot_id(stmt.args[1])
+                    id in slots_to_keep && continue
                     val = stmt.args[2]
                     typ = typ_for_val(val, ci, sptypes, idx, slottypes)
                     # Having undef_token appear on the RHS is possible if we're on a dead branch.
@@ -928,7 +938,6 @@ function construct_ssa!(ci::CodeInfo, code::Vector{Any}, ir::IRCode, domtree::Do
                         incoming_vals[id] = undef_token
                     end
                     eidx = item
-                    # TODO UpsilonNode for Tasks
                     while haskey(exc_handlers, eidx)
                         (eidx, exc) = exc_handlers[eidx]
                         cidx = findfirst(x->slot_id(x[1]) == id, phicnodes[exc])

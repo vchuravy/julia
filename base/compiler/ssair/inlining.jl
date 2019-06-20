@@ -848,7 +848,7 @@ function inline_splatnew!(ir::IRCode, idx::Int)
     if nf isa Const
         eargs = stmt.args
         tup = eargs[2]
-        tt = argextype(tup, ir, ir.sptypes)
+        tt = argextype(tup, ir, ir.sptypes, ir.argtypes)
         tnf = nfields_tfunc(tt)
         # TODO: hoisting this tnf.val == nf.val check into codegen
         # would enable us to almost always do this transform
@@ -870,7 +870,7 @@ end
 
 function call_sig(ir::IRCode, stmt::Expr)
     isempty(stmt.args) && return nothing
-    ft = argextype(stmt.args[1], ir, ir.sptypes)
+    ft = argextype(stmt.args[1], ir, ir.sptypes, ir.argtypes)
     has_free_typevars(ft) && return nothing
     f = singleton_type(ft)
     f === Core.Intrinsics.llvmcall && return nothing
@@ -880,7 +880,7 @@ function call_sig(ir::IRCode, stmt::Expr)
     atypes[1] = ft
     ok = true
     for i = 2:length(stmt.args)
-        a = argextype(stmt.args[i], ir, ir.sptypes)
+        a = argextype(stmt.args[i], ir, ir.sptypes, ir.argtypes)
         (a === Bottom || isvarargtype(a)) && return nothing
         atypes[i] = a
     end

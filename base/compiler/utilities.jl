@@ -158,7 +158,7 @@ argextype(@nospecialize(x), state) = argextype(x, state.src, state.sptypes, stat
 
 const empty_slottypes = Any[]
 
-function argextype(@nospecialize(x), src, sptypes::Vector{Any}, slottypes::Vector{Any} = empty_slottypes)
+function argextype(@nospecialize(x), src, sptypes::Vector{Any}, slottypes::Vector{Any})
     if isa(x, Expr)
         if x.head === :static_parameter
             return sptypes[x.args[1]]
