@@ -348,6 +348,7 @@ struct Task
     entry::Int
     spindles::Vector{Spindle}
     subtasks::Vector{Task}
+    bbs::BitSet
 end
 
 ###
@@ -414,6 +415,8 @@ function taskinfo(cfg::CFG, domtree::DomTree, code::Vector{Any})
     # task entry is encountered.
 
     spindles = Spindle[] 
+    tasks = Task[]
+
     foundblocks = Int[]
     foundspindles = Spindle[]
     foundtasks = Task[]
@@ -472,14 +475,21 @@ function taskinfo(cfg::CFG, domtree::DomTree, code::Vector{Any})
                 break
             end
         end
-        task = Task(bb, unassocspindles, unassoctasks)
+        bbs = BitSet()
+        for spindle in unassocspindles
+            for bb in spindle.blocks
+                push!(bbs, bb)
+            end
+        end
+        task = Task(bb, unassocspindles, unassoctasks, bbs)
         push!(foundtasks, task)
+        push!(tasks, task)
     end
 
     @assert length(foundtasks) == 1
     root = first(foundtasks)
 
-    return spindles, root
+    return spindles, tasks, root
 end
 
 function rename_incoming_edge(old_edge, old_to, result_order, bb_rename)
@@ -733,9 +743,8 @@ function construct_ssa!(ci::CodeInfo, code::Vector{Any}, ir::IRCode, domtree::Do
                         slottypes::Vector{Any})
     cfg = ir.cfg
     left = Int[]
-    spindels, root = taskinfo(cfg, domtree, code)
-    @show spindels
-    @show root
+    spindels, tasks, root = taskinfo(cfg, domtree, code)
+
     catch_entry_blocks = Tuple{Int, Int}[]
     for (idx, stmt) in pairs(code)
         if isexpr(stmt, :enter)
