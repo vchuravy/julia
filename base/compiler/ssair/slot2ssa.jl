@@ -351,6 +351,8 @@ struct Task
     bbs::BitSet
 end
 
+isroot(t::Task) = t.entry == 1
+
 ###
 # Spindel and task analysis pass:
 # A Spindle is a set of basic blocks that form a unit of logical parallelism.
@@ -488,6 +490,7 @@ function taskinfo(cfg::CFG, domtree::DomTree, code::Vector{Any})
 
     @assert length(foundtasks) == 1
     root = first(foundtasks)
+    @assert isroot(root)
 
     return spindles, tasks, root
 end
