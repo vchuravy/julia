@@ -773,13 +773,11 @@ function construct_ssa!(ci::CodeInfo, code::Vector{Any}, ir::IRCode, domtree::Do
     for (_, exc) in catch_entry_blocks
         phicnodes[exc] = Vector{Tuple{SlotNumber, NewSSAValue, PhiCNode}}()
     end
-   
-    slots_to_keep = collect(1:length(defuse))
+
+    slots_to_keep = BitSet()
     @timeit "idf" for (idx, slot) in Iterators.enumerate(defuse)
         # No uses => no need for phi nodes
         isempty(slot.uses) && continue
-        # keep the slot
-        idx in slots_to_keep && continue
         # TODO: Restore this optimization
         if false # length(slot.defs) == 1 && slot.any_newvar
             if slot.defs[] == 0
@@ -801,9 +799,26 @@ function construct_ssa!(ci::CodeInfo, code::Vector{Any}, ir::IRCode, domtree::Do
             end
             continue
         end
+
         @timeit "liveness" (live = compute_live_ins(cfg, slot))
+        push!(slots_to_keep, idx)
+        # If a slot is divergent we need to keep it.
+        # 1. use in task without a def is fine
+        # 2. def in task with subsequent uses only in task is also fine
+        # 3. Ergo -- divergent if we have to place a phi node in the continuiation
+        # For now just see if there is a def or use
+        for task in tasks
+            isroot(task) && continue
+            for def in live.def_bbs
+                def in task.bbs && push!(slots_to_keep, idx)
+            end
+            for li in live.live_in_bbs
+                li in task.bbs && push!(slots_to_keep, idx)
+            end
+        end
+
+        idx in slots_to_keep && continue
         for li in live.live_in_bbs
-            # TODO PHICNode for tasks
             cidx = findfirst(x->x[2] == li, catch_entry_blocks)
             if cidx !== nothing
                 # The slot is live-in into this block. We need to
