@@ -237,7 +237,8 @@ function typ_for_val(@nospecialize(x), ci::CodeInfo, sptypes::Vector{Any}, idx::
     isa(x, Argument) && return slottypes[x.n]
     isa(x, NewSSAValue) && return DelayedTyp(x)
     isa(x, QuoteNode) && return Const(x.value)
-    isa(x, Union{Symbol, PiNode, PhiNode, SlotNumber, TypedSlot}) && error("unexpected val type")
+    isa(x, SlotNumber) && return slottypes[x.id]
+    isa(x, Union{Symbol, PiNode, PhiNode, TypedSlot}) && error("unexpected val type")
     return Const(x)
 end
 
