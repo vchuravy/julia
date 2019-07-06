@@ -389,7 +389,7 @@ function taskinfo(cfg::CFG, domtree::DomTree, code::Vector{Any})
     phiblocks = idf(cfg, live, domtree)
     for block in phiblocks
         if haskey(spindlekinds, block)
-            @assert spindlekinds[block] == :sync
+            @assert spindlekinds[block] == :sync "phiblock spindle is not :sync"
         end
         spindlekinds[block] = :phi
     end
@@ -801,7 +801,7 @@ function construct_ssa!(ci::CodeInfo, code::Vector{Any}, ir::IRCode, domtree::Do
         end
 
         @timeit "liveness" (live = compute_live_ins(cfg, slot))
-        push!(slots_to_keep, idx)
+        # push!(slots_to_keep, idx)
         # If a slot is divergent we need to keep it.
         # 1. use in task without a def is fine
         # 2. def in task with subsequent uses only in task is also fine
