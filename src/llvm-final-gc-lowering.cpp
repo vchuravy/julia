@@ -348,7 +348,13 @@ bool FinalLowerGC::runOnFunction(Function &F)
             }
             else if (callee == queueGCRootFunc) {
                 replaceInstruction(CI, lowerQueueGCRoot(CI, F), it);
-            } else if (CI->getNumOperandBundles() > 0) {
+            } 
+            else if (callee == gc_preserve_begin_func ||
+                     callee == gc_preserve_end_func) {
+                errs() << "Left over calls to gc_preserve_{begin|end}" << CI << "in Function " << F << "\n";
+                it = CI->eraseFromParent();
+            }
+            else if (CI->getNumOperandBundles() > 0) {
                 replaceInstruction(CI, stripJLRoots(CI), it);
             } else {
                 ++it;
