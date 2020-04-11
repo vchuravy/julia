@@ -239,6 +239,7 @@ Pass *createFinalLowerGCPass();
 Pass *createLateLowerGCFramePass();
 Pass *createLowerExcHandlersPass();
 Pass *createGCInvariantVerifierPass(bool Strong);
+Pass *createJLIRVerifierPass();
 Pass *createPropagateJuliaAddrspaces();
 Pass *createMultiVersioningPass();
 Pass *createAllocOptPass();

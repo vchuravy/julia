@@ -54,7 +54,7 @@ ifeq ($(JULIACODEGEN),LLVM)
 SRCS += codegen llvm-ptls
 RUNTIME_SRCS += jitlayers aotcompile debuginfo disasm llvm-simdloop llvm-muladd \
 	llvm-final-gc-lowering llvm-pass-helpers llvm-late-gc-lowering \
-	llvm-lower-handlers llvm-gc-invariant-verifier llvm-propagate-addrspaces \
+	llvm-lower-handlers llvm-gc-invariant-verifier llvm-jlir-verifier llvm-propagate-addrspaces \
 	llvm-multiversioning llvm-alloc-opt cgmemmgr llvm-api
 FLAGS += -I$(shell $(LLVM_CONFIG_HOST) --includedir)
 LLVM_LIBS := all
@@ -238,6 +238,7 @@ $(BUILDDIR)/libllvmcalltest.$(SHLIB_EXT): $(SRCDIR)/codegen_shared.h
 $(BUILDDIR)/llvm-alloc-opt.o $(BUILDDIR)/llvm-alloc-opt.dbg.obj: $(SRCDIR)/codegen_shared.h
 $(BUILDDIR)/llvm-final-gc-lowering.o $(BUILDDIR)/llvm-final-gc-lowering.dbg.obj: $(SRCDIR)/llvm-pass-helpers.h
 $(BUILDDIR)/llvm-gc-invariant-verifier.o $(BUILDDIR)/llvm-gc-invariant-verifier.dbg.obj: $(SRCDIR)/codegen_shared.h
+$(BUILDDIR)/llvm-jlir-verifier.o $(BUILDDIR)/llvm-jlir-verifier.dbg.obj: $(SRCDIR)/codegen_shared.h
 $(BUILDDIR)/llvm-late-gc-lowering.o $(BUILDDIR)/llvm-late-gc-lowering.dbg.obj: $(SRCDIR)/llvm-pass-helpers.h
 $(BUILDDIR)/llvm-multiversioning.o $(BUILDDIR)/llvm-multiversioning.dbg.obj: $(SRCDIR)/codegen_shared.h
 $(BUILDDIR)/llvm-pass-helpers.o $(BUILDDIR)/llvm-pass-helpers.dbg.obj: $(SRCDIR)/llvm-pass-helpers.h $(SRCDIR)/codegen_shared.h

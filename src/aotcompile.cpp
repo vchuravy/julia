@@ -612,6 +612,7 @@ void addOptimizationPasses(legacy::PassManagerBase *PM, int opt_level,
         }
         PM->add(createMemCpyOptPass());
         PM->add(createAlwaysInlinerLegacyPass()); // Respect always_inline
+        PM->add(createLowerSimdLoopPass()); // Annotate loop marked with "loopinfo" as LLVM parallel loop
         if (lower_intrinsics) {
             PM->add(createBarrierNoopPass());
             PM->add(createLowerExcHandlersPass());
@@ -619,8 +620,10 @@ void addOptimizationPasses(legacy::PassManagerBase *PM, int opt_level,
             PM->add(createLateLowerGCFramePass());
             PM->add(createFinalLowerGCPass());
             PM->add(createLowerPTLSPass(dump_native));
+#ifdef JL_DEBUG_BUILD
+            PM->add(createJLIRVerifierPass());
+#endif
         }
-        PM->add(createLowerSimdLoopPass()); // Annotate loop marked with "loopinfo" as LLVM parallel loop
         if (dump_native)
             PM->add(createMultiVersioningPass());
         return;
@@ -734,6 +737,9 @@ void addOptimizationPasses(legacy::PassManagerBase *PM, int opt_level,
         PM->add(createLowerPTLSPass(dump_native));
         // Clean up write barrier and ptls lowering
         PM->add(createCFGSimplificationPass());
+#ifdef JL_DEBUG_BUILD
+        PM->add(createJLIRVerifierPass());
+#endif
     }
     PM->add(createCombineMulAddPass());
     PM->add(createDivRemPairsPass());
