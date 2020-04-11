@@ -15,6 +15,8 @@ declare %jl_value_t addrspace(10)** @julia.get_gc_frame_slot(%jl_value_t addrspa
 declare void @julia.pop_gc_frame(%jl_value_t addrspace(10)**)
 declare noalias nonnull %jl_value_t addrspace(10)* @julia.gc_alloc_bytes(i8*, i64) #0
 declare %jl_value_t* @julia.pointer_from_objref(%jl_value_t addrspace(11)*)
+declare token @llvm.julia.gc_preserve_begin(...)
+declare void @llvm.julia.gc_preserve_end(token)
 
 attributes #0 = { allocsize(1) }
 
@@ -80,6 +82,16 @@ define void @bundle(i8* %fptr) {
   %f = bitcast i8* %fptr to void (i8*)*
 ; CHECK: call void %f(i8* %ptr) [ "unknown_bundle"(i8* %ptr) ]
   call void %f(i8* %ptr) [ "jl_roots"(%jl_value_t addrspace(10)* %v), "unknown_bundle"(i8* %ptr) ]
+  ret void
+}
+
+define void @left_over_gc_preserve() {
+; CHECK-LABEL: @left_over_gc_preserve
+  %ptls = call %jl_value_t*** @julia.ptls_states()
+; CHECK-NOT: @llvm.julia.gc_preserve_begin
+; CHECK-NOT: @llvm.julia.gc_preserve_end
+  %1 = call token (...) @llvm.julia.gc_preserve_begin()
+  call void @llvm.julia.gc_preserve_end(token %1)
   ret void
 }
 

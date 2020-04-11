@@ -302,13 +302,13 @@ bool FinalLowerGC::runOnFunction(Function &F)
     LLVM_DEBUG(dbgs() << "FINAL GC LOWERING: Processing function " << F.getName() << "\n");
     // Check availability of functions again since they might have been deleted.
     initFunctions(*F.getParent());
-    if (!ptls_getter)
-        return true;
+    // if (!ptls_getter)
+    //     return true;
 
     // Look for a call to 'julia.ptls_states'.
     ptlsStates = getPtls(F);
-    if (!ptlsStates)
-        return true;
+    // if (!ptlsStates)
+    //    return true;
 
     // Acquire intrinsic functions.
     auto newGCFrameFunc = getOrNull(jl_intrinsics::newGCFrame);
@@ -352,6 +352,9 @@ bool FinalLowerGC::runOnFunction(Function &F)
             else if (callee == gc_preserve_begin_func ||
                      callee == gc_preserve_end_func) {
                 errs() << "Left over calls to gc_preserve_{begin|end}" << CI << "in Function " << F << "\n";
+                if (!CI->use_empty()) {
+                    CI->replaceAllUsesWith(UndefValue::get(CI->getType()));
+                }
                 it = CI->eraseFromParent();
             }
             else if (CI->getNumOperandBundles() > 0) {
