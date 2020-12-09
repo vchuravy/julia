@@ -1961,12 +1961,12 @@ static void write_lcov_data(logdata_t &logData, const std::string &outfile)
     outf.close();
 }
 
-extern "C" void jl_write_coverage_data(const char *output)
+extern "C" JL_DLLEXPORT void jl_write_coverage_data(const char *output)
 {
     if (output) {
         StringRef output_pattern(output);
         if (output_pattern.endswith(".info"))
-            write_lcov_data(coverageData, jl_format_filename(output_pattern));
+            write_lcov_data(coverageData, jl_format_filename(output_pattern.data()));
     }
     else {
         std::string stm;
@@ -1975,7 +1975,7 @@ extern "C" void jl_write_coverage_data(const char *output)
     }
 }
 
-extern "C" void jl_write_malloc_log(void)
+extern "C" JL_DLLEXPORT void jl_write_malloc_log(void)
 {
     std::string stm;
     raw_string_ostream(stm) << "." << jl_getpid() << ".mem";
@@ -8028,7 +8028,7 @@ extern "C" void jl_init_llvm(void)
 #endif
 }
 
-extern "C" void jl_init_codegen(void)
+extern "C" JL_DLLEXPORT void jl_init_codegen(void)
 {
     jl_init_llvm();
     // Now that the execution engine exists, initialize all modules
@@ -8042,7 +8042,7 @@ extern "C" void jl_init_codegen(void)
     jl_init_intrinsic_functions_codegen();
 }
 
-extern "C" void jl_teardown_codegen()
+extern "C" JL_DLLEXPORT void jl_teardown_codegen()
 {
     // output LLVM timings and statistics
     reportAndResetTimings();
