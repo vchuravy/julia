@@ -10,6 +10,6 @@ CNAME(name)##: SEP \
     ldr x16, [x16, PAGEOFF(CNAME(name##_addr))] SEP \
     br x16 SEP \
 .cfi_endproc SEP \
-
-JL_EXPORTED_FUNCS(XX)
+JL_RUNTIME_EXPORTED_FUNCS(XX)
+JL_CODEGEN_EXPORTED_FUNCS(XX)
 #undef XX
