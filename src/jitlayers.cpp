@@ -228,7 +228,7 @@ static jl_callptr_t _jl_compile_codeinst(
 const char *jl_generate_ccallable(void *llvmmod, void *sysimg_handle, jl_value_t *declrt, jl_value_t *sigt, jl_codegen_params_t &params);
 
 // compile a C-callable alias
-extern "C"
+extern "C" JL_DLLEXPORT
 int jl_compile_extern_c(void *llvmmod, void *p, void *sysimg, jl_value_t *declrt, jl_value_t *sigt)
 {
     JL_LOCK(&codegen_lock);

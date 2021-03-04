@@ -44,7 +44,7 @@ JL_DLLEXPORT jl_sym_t *exc_sym;     JL_DLLEXPORT jl_sym_t *error_sym;
 JL_DLLEXPORT jl_sym_t *new_sym;     JL_DLLEXPORT jl_sym_t *using_sym;
 JL_DLLEXPORT jl_sym_t *splatnew_sym;
 JL_DLLEXPORT jl_sym_t *new_opaque_closure_sym;
-JL_DLLEXPORT jl_sym_t *opaque_closure_method_sym
+JL_DLLEXPORT jl_sym_t *opaque_closure_method_sym;
 JL_DLLEXPORT jl_sym_t *const_sym;   JL_DLLEXPORT jl_sym_t *thunk_sym;
 JL_DLLEXPORT jl_sym_t *foreigncall_sym; JL_DLLEXPORT jl_sym_t *as_sym;
 JL_DLLEXPORT jl_sym_t *global_sym; JL_DLLEXPORT jl_sym_t *list_sym;
@@ -67,6 +67,8 @@ JL_DLLEXPORT jl_sym_t *aliasscope_sym; JL_DLLEXPORT jl_sym_t *popaliasscope_sym;
 JL_DLLEXPORT jl_sym_t *optlevel_sym; JL_DLLEXPORT jl_sym_t *thismodule_sym;
 JL_DLLEXPORT jl_sym_t *atom_sym; JL_DLLEXPORT jl_sym_t *statement_sym; JL_DLLEXPORT jl_sym_t *all_sym;
 JL_DLLEXPORT jl_sym_t *compile_sym; JL_DLLEXPORT jl_sym_t *infer_sym;
+JL_DLLEXPORT jl_sym_t *aggressive_constprop_sym;
+
 
 static uint8_t flisp_system_image[] = {
 #include <julia_flisp.boot.inc>
