@@ -206,7 +206,6 @@ void jl_task_frame_noreturn(jl_task_t *ct);
 // cause this process to exit with WEXITSTATUS(signo), after waiting to finish all julia, C, and C++ cleanup
 JL_DLLEXPORT void jl_exit(int exitcode)
 {
-    LIKWID_MARKER_CLOSE;
     jl_atexit_hook(exitcode);
     exit(exitcode);
 }
@@ -346,6 +345,7 @@ JL_DLLEXPORT void jl_atexit_hook(int exitcode)
 #ifdef ENABLE_TIMINGS
     jl_print_timings();
 #endif
+    LIKWID_MARKER_CLOSE;
 
     jl_teardown_codegen();
     if (ct)

@@ -25,6 +25,9 @@ FLAGS += -Wno-unused-result
 endif
 JCFLAGS += -Wold-style-definition -Wstrict-prototypes -Wc++-compat
 
+JCFLAGS += -DLIKWID_PERFMON
+JLDFLAGS += -llikwid
+
 ifeq ($(USECLANG),1)
 FLAGS += -Wno-return-type-c-linkage
 endif
