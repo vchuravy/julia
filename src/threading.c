@@ -10,6 +10,8 @@
 #include "julia_internal.h"
 #include "julia_assert.h"
 
+#include <likwid-marker.h>
+
 // Ref https://www.uclibc.org/docs/tls.pdf
 // For variant 1 JL_ELF_TLS_INIT_SIZE is the size of the thread control block (TCB)
 // For variant 2 JL_ELF_TLS_INIT_SIZE is 0
@@ -399,6 +401,7 @@ jl_ptls_t jl_init_threadtls(int16_t tid)
     jl_fence();
     uv_mutex_unlock(&tls_lock);
 
+    LIKWID_MARKER_THREADINIT;
     return ptls;
 }
 

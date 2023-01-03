@@ -42,6 +42,8 @@ extern BOOL (WINAPI *hSymRefreshModuleList)(HANDLE);
 #include <unistd.h>
 #endif
 
+#include <likwid-marker.h>
+
 // list of modules being deserialized with __init__ methods
 jl_array_t *jl_module_init_order;
 
@@ -204,6 +206,7 @@ void jl_task_frame_noreturn(jl_task_t *ct);
 // cause this process to exit with WEXITSTATUS(signo), after waiting to finish all julia, C, and C++ cleanup
 JL_DLLEXPORT void jl_exit(int exitcode)
 {
+    LIKWID_MARKER_CLOSE;
     jl_atexit_hook(exitcode);
     exit(exitcode);
 }
@@ -773,6 +776,7 @@ JL_DLLEXPORT void julia_init(JL_IMAGE_SEARCH rel)
         jl_error("cannot generate code-coverage or track allocation information while generating a .o, .bc, or .s output file");
     }
 
+    LIKWID_MARKER_INIT;
     jl_init_rand();
     jl_init_profile_lock();
     jl_init_runtime_ccall();

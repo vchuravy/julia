@@ -7,6 +7,8 @@
 #include <malloc.h> // for malloc_trim
 #endif
 
+#include <likwid-marker.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -3172,6 +3174,7 @@ static int _jl_gc_collect(jl_ptls_t ptls, jl_gc_collection_t collection)
     uint64_t gc_start_time = jl_hrtime();
     int64_t last_perm_scanned_bytes = perm_scanned_bytes;
     JL_PROBE_GC_MARK_BEGIN();
+    LIKWID_MARKER_START("GC mark");
     uint64_t start_mark_time = jl_hrtime();
 
     // 1. fix GC bits of objects in the remset.
@@ -3207,6 +3210,7 @@ static int _jl_gc_collect(jl_ptls_t ptls, jl_gc_collection_t collection)
     gc_mark_loop(ptls, sp);
     gc_mark_sp_init(gc_cache, &sp);
     gc_num.since_sweep += gc_num.allocd;
+    LIKWID_MARKER_STOP("GC mark");
     JL_PROBE_GC_MARK_END(scanned_bytes, perm_scanned_bytes);
     gc_settime_premark_end();
     gc_time_mark_pause(gc_start_time, scanned_bytes, perm_scanned_bytes);
