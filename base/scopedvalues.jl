@@ -4,7 +4,9 @@ module ScopedValues
 
 export ScopedValue, with, @with
 
-"""
+import Core.Compiler: ScopedValue
+
+@doc """
     ScopedValue(x)
 
 Create a container that propagates values across dynamic scopes.
@@ -36,14 +38,7 @@ julia> sval[]
 !!! compat "Julia 1.11"
     Scoped values were introduced in Julia 1.11. In Julia 1.8+ a compatible
     implementation is available from the package ScopedValues.jl.
-"""
-mutable struct ScopedValue{T}
-    const has_default::Bool
-    const default::T
-    ScopedValue{T}() where T = new(false)
-    ScopedValue{T}(val) where T = new{T}(true, val)
-    ScopedValue(val::T) where T = new{T}(true, val)
-end
+""" ScopedValue
 
 Base.eltype(::ScopedValue{T}) where {T} = T
 

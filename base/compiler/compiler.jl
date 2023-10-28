@@ -152,12 +152,36 @@ else
     end
 end
 
+mutable struct ScopedValue{T}
+    const has_default::Bool
+    const default::T
+    ScopedValue{T}() where T = new(false)
+    ScopedValue{T}(val) where T = new{T}(true, val)
+    ScopedValue(val::T) where T = new{T}(true, val)
+end
+
+function getindex(val::ScopedValue{T})::T where T
+    val.has_default || throw(KeyError(val))
+    return val.default
+end
+
+abstract type AbstractCompiler end
+mutable struct NativeCompiler <: AbstractCompiler end
+
+const COMPILER = ScopedValue{AbstractCompiler}(NativeCompiler())
+current_compiler() = COMPILER[]
+_abstract_interpreter() = abstract_interpreter(current_compiler())
+
+abstract_interpreter() = invokelatest(_abstract_interpreter)
+
 include("compiler/cicache.jl")
 include("compiler/methodtable.jl")
 include("compiler/effects.jl")
 include("compiler/types.jl")
 include("compiler/utilities.jl")
 include("compiler/validation.jl")
+
+abstract_interpreter(::NativeCompiler) = NativeInterpreter()
 
 include("compiler/ssair/basicblock.jl")
 include("compiler/ssair/domtree.jl")
