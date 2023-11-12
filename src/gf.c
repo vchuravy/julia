@@ -2960,6 +2960,7 @@ void call_cache_stats()
 #endif
 
 STATIC_INLINE jl_method_instance_t *jl_lookup_generic_(jl_value_t *F, jl_value_t **args, uint32_t nargs,
+                                                       jl_value_t *FT, jl_tupletype_t *TT,
                                                        uint32_t callsite, size_t world)
 {
 #ifdef JL_GF_PROFILE
@@ -2971,7 +2972,8 @@ STATIC_INLINE jl_method_instance_t *jl_lookup_generic_(jl_value_t *F, jl_value_t
         show_call(F, args, nargs);
 #endif
     nargs++; // add F to argument count
-    jl_value_t *FT = jl_typeof(F);
+    if (!FT)
+        FT = jl_typeof(F);
 
     /*
       search order:
@@ -3015,7 +3017,6 @@ STATIC_INLINE jl_method_instance_t *jl_lookup_generic_(jl_value_t *F, jl_value_t
     LOOP_BODY(3);
 #undef LOOP_BODY
     i = 4;
-    jl_tupletype_t *tt = NULL;
     int64_t last_alloc = 0;
     if (i == 4) {
         // if no method was found in the associative cache, check the full cache
@@ -3026,18 +3027,20 @@ STATIC_INLINE jl_method_instance_t *jl_lookup_generic_(jl_value_t *F, jl_value_t
         if (leafcache != (jl_genericmemory_t*)jl_an_empty_memory_any &&
                 jl_typetagis(jl_atomic_load_relaxed(&mt->cache), jl_typemap_level_type)) {
             // hashing args is expensive, but looking at mt->cache is probably even more expensive
-            tt = lookup_arg_type_tuple(F, args, nargs);
-            if (tt != NULL)
-                entry = lookup_leafcache(leafcache, (jl_value_t*)tt, world);
+            if (TT == NULL) {
+                TT = lookup_arg_type_tuple(F, args, nargs);
+            }
+            if (TT != NULL)
+                entry = lookup_leafcache(leafcache, (jl_value_t*)TT, world);
         }
         if (entry == NULL) {
             jl_typemap_t *cache = jl_atomic_load_relaxed(&mt->cache); // XXX: gc root required?
             entry = jl_typemap_assoc_exact(cache, F, args, nargs, jl_cachearg_offset(mt), world);
             if (entry == NULL) {
                 last_alloc = jl_options.malloc_log ? jl_gc_diff_total_bytes() : 0;
-                if (tt == NULL) {
-                    tt = arg_type_tuple(F, args, nargs);
-                    entry = lookup_leafcache(leafcache, (jl_value_t*)tt, world);
+                if (TT == NULL) {
+                    TT = arg_type_tuple(F, args, nargs);
+                    entry = lookup_leafcache(leafcache, (jl_value_t*)TT, world);
                 }
             }
         }
@@ -3058,12 +3061,12 @@ have_entry:
         mfunc = entry->func.linfo;
     }
     else {
-        JL_GC_PUSH1(&tt);
-        assert(tt);
+        JL_GC_PUSH1(&TT);
+        assert(TT);
         JL_LOCK(&mt->writelock);
         // cache miss case
         JL_TIMING(METHOD_LOOKUP_SLOW, METHOD_LOOKUP_SLOW);
-        mfunc = jl_mt_assoc_by_type(mt, tt, world);
+        mfunc = jl_mt_assoc_by_type(mt, TT, world);
         JL_UNLOCK(&mt->writelock);
         JL_GC_POP();
         if (jl_options.malloc_log)
@@ -3089,10 +3092,22 @@ JL_DLLEXPORT jl_value_t *jl_apply_generic(jl_value_t *F, jl_value_t **args, uint
 {
     size_t world = jl_current_task->world_age;
     jl_method_instance_t *mfunc = jl_lookup_generic_(F, args, nargs,
+                                                     NULL, NULL,
                                                      jl_int32hash_fast(jl_return_address()),
                                                      world);
     JL_GC_PROMISE_ROOTED(mfunc);
     return _jl_invoke(F, args, nargs, mfunc, world);
+}
+
+JL_DLLEXPORT jl_value_t *jl_lookup_generic(jl_value_t *FT, jl_value_t *TT, uint32_t nargs)
+{
+    size_t world = jl_current_task->world_age;
+    jl_method_instance_t *mfunc = jl_lookup_generic_(NULL, NULL, nargs,
+                                                     FT, (jl_tupletype_t*)TT,
+                                                     jl_int32hash_fast(jl_return_address()),
+                                                     world);
+    JL_GC_PROMISE_ROOTED(mfunc);
+    return (jl_value_t*)mfunc;
 }
 
 static jl_method_match_t *_gf_invoke_lookup(jl_value_t *types JL_PROPAGATES_ROOT, jl_value_t *mt, size_t world, size_t *min_valid, size_t *max_valid)
