@@ -1121,7 +1121,7 @@ static void jl_insert_backedges(jl_array_t *edges, jl_array_t *ext_targets, jl_a
         else {
             assert(ci->max_world == ~(size_t)0);
             jl_method_instance_t *caller = ci->def;
-            if (jl_atomic_load_relaxed(&ci->inferred)  && jl_rettype_inferred(caller, minworld, ~(size_t)0) == jl_nothing) {
+            if (jl_atomic_load_relaxed(&ci->inferred)  && jl_rettype_inferred(ci->owner, caller, minworld, ~(size_t)0) == jl_nothing) {
                 jl_mi_cache_insert(caller, ci);
             }
             //jl_static_show((jl_stream*)ios_stderr, (jl_value_t*)caller);
@@ -1166,7 +1166,7 @@ static void jl_insert_backedges(jl_array_t *edges, jl_array_t *ext_targets, jl_a
             jl_code_instance_t *codeinst = (jl_code_instance_t*)ci;
             assert(codeinst->min_world == minworld && jl_atomic_load_relaxed(&codeinst->inferred) );
             codeinst->max_world = maxvalid;
-            if (jl_rettype_inferred(caller, minworld, maxvalid) == jl_nothing) {
+            if (jl_rettype_inferred(codeinst->owner, caller, minworld, maxvalid) == jl_nothing) {
                 jl_mi_cache_insert(caller, codeinst);
             }
         }

@@ -785,7 +785,6 @@ static void jl_insert_into_serialization_queue(jl_serializer_state *s, jl_value_
             // so must not be present here
             record_field_change((jl_value_t**)&mi->uninferred, NULL);
             record_field_change((jl_value_t**)&mi->backedges, NULL);
-            record_field_change((jl_value_t**)&mi->callbacks, NULL);
             record_field_change((jl_value_t**)&mi->cache, NULL);
         }
         else {
@@ -2354,7 +2353,6 @@ static void strip_specializations_(jl_method_instance_t *mi)
     if (jl_options.strip_ir) {
         record_field_change((jl_value_t**)&mi->uninferred, NULL);
         record_field_change((jl_value_t**)&mi->backedges, NULL);
-        record_field_change((jl_value_t**)&mi->callbacks, NULL);
     }
 }
 
