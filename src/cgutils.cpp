@@ -3974,7 +3974,7 @@ static int compare_cgparams(const jl_cgparams_t *a, const jl_cgparams_t *b)
            (a->safepoint_on_entry == b->safepoint_on_entry) &&
            (a->gcstack_arg == b->gcstack_arg) &&
            (a->use_jlplt == b->use_jlplt) &&
-           (a->lookup == b->lookup);
+           (jl_egal(a->compiler, b->compiler));
 }
 #endif
 

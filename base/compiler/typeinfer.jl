@@ -24,6 +24,7 @@ module Timings
 
 using Core.Compiler: -, +, :, Vector, length, first, empty!, push!, pop!, @inline,
     @inbounds, copy, backtrace
+import Core.Compiler: CompilerInstance, abstract_interpreter
 
 # What we record for any given frame we infer during type inference.
 struct InferenceFrameInfo
@@ -1067,7 +1068,8 @@ function typeinf_type(interp::AbstractInterpreter, method::Method, @nospecialize
 end
 
 # This is a bridge for the C code calling `jl_typeinf_func()`
-typeinf_ext_toplevel(mi::MethodInstance, world::UInt) = typeinf_ext_toplevel(NativeInterpreter(world), mi)
+typeinf_ext_toplevel(@nospecialize(C::CompilerInstance), mi::MethodInstance, world::UInt) = typeinf_ext_toplevel(abstract_interpreter(C, world), mi)
+
 function typeinf_ext_toplevel(interp::AbstractInterpreter, mi::MethodInstance)
     if isa(mi.def, Method)
         # method lambda - infer this specialization via the method cache

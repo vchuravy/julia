@@ -335,7 +335,7 @@ jl_datatype_t *jl_mk_builtin_func(jl_datatype_t *dt, const char *name, jl_fptr_a
 // returns the inferred source, and may cache the result in mi
 // if successful, also updates the mi argument to describe the validity of this src
 // if inference doesn't occur (or can't finish), returns NULL instead
-jl_code_info_t *jl_type_infer(jl_method_instance_t *mi, size_t world, int force)
+jl_code_info_t *jl_type_infer(jl_value_t* compiler, jl_method_instance_t *mi, size_t world, int force)
 {
     if (jl_typeinf_func == NULL)
         return NULL;
@@ -355,8 +355,9 @@ jl_code_info_t *jl_type_infer(jl_method_instance_t *mi, size_t world, int force)
         return NULL;
     JL_TIMING(INFERENCE, INFERENCE);
     jl_value_t **fargs;
-    JL_GC_PUSHARGS(fargs, 3);
+    JL_GC_PUSHARGS(fargs, 4);
     fargs[0] = (jl_value_t*)jl_typeinf_func;
+    fargs[1] = (jl_value_t*)compiler;
     fargs[1] = (jl_value_t*)mi;
     fargs[2] = jl_box_ulong(world);
 
@@ -384,7 +385,7 @@ jl_code_info_t *jl_type_infer(jl_method_instance_t *mi, size_t world, int force)
     // allocate another bit for the counter.
     ct->reentrant_timing += 0b10;
     JL_TRY {
-        src = (jl_code_info_t*)jl_apply(fargs, 3);
+        src = (jl_code_info_t*)jl_apply(fargs, 4);
     }
     JL_CATCH {
         jl_value_t *e = jl_current_exception();
@@ -456,23 +457,22 @@ JL_DLLEXPORT jl_value_t *jl_rettype_inferred_native(jl_method_instance_t *mi, si
 JL_DLLEXPORT jl_value_t *(*const jl_rettype_inferred_addr)(jl_method_instance_t *mi, size_t min_world, size_t max_world) JL_NOTSAFEPOINT = jl_rettype_inferred_native;
 
 
-JL_DLLEXPORT jl_code_instance_t *jl_get_method_inferred(
+JL_DLLEXPORT jl_code_instance_t *jl_get_method_inferred(jl_value_t *compiler,
         jl_method_instance_t *mi JL_PROPAGATES_ROOT, jl_value_t *rettype,
         size_t min_world, size_t max_world)
 {
-    jl_value_t *owner = jl_nothing; // TODO: owner should be arg
     jl_code_instance_t *codeinst = jl_atomic_load_relaxed(&mi->cache);
     while (codeinst) {
         if (codeinst->min_world == min_world &&
             codeinst->max_world == max_world &&
-            jl_egal(codeinst->owner, owner) &&
+            jl_egal(codeinst->owner, compiler) &&
             jl_egal(codeinst->rettype, rettype)) {
             return codeinst;
         }
         codeinst = jl_atomic_load_relaxed(&codeinst->next);
     }
     codeinst = jl_new_codeinst(
-        mi, owner, rettype, (jl_value_t*)jl_any_type, NULL, NULL,
+        mi, compiler, rettype, (jl_value_t*)jl_any_type, NULL, NULL,
         0, min_world, max_world, 0, 0, jl_nothing, 0);
     jl_mi_cache_insert(mi, codeinst);
     return codeinst;
@@ -686,7 +686,7 @@ JL_DLLEXPORT void jl_set_typeinf_func(jl_value_t *f)
         for (i = 0, l = jl_array_nrows(unspec); i < l; i++) {
             jl_method_instance_t *mi = (jl_method_instance_t*)jl_array_ptr_ref(unspec, i);
             if (jl_rettype_inferred_native(mi, world, world) == jl_nothing)
-                jl_type_infer(mi, world, 1);
+                jl_type_infer(jl_nothing, mi, world, 1);
         }
         JL_GC_POP();
     }
@@ -2739,7 +2739,7 @@ static void _generate_from_hint(jl_method_instance_t *mi, size_t world)
 {
     jl_value_t *codeinst = jl_rettype_inferred_native(mi, world, world);
     if (codeinst == jl_nothing) {
-        (void)jl_type_infer(mi, world, 1);
+        (void)jl_type_infer(jl_nothing, mi, world, 1);
         codeinst = jl_rettype_inferred_native(mi, world, world);
     }
     if (codeinst != jl_nothing) {
@@ -2780,10 +2780,10 @@ JL_DLLEXPORT void jl_compile_method_instance(jl_method_instance_t *mi, jl_tuplet
             JL_GC_POP();
             jl_atomic_store_relaxed(&mi2->precompiled, 1);
             if (jl_rettype_inferred_native(mi2, world, world) == jl_nothing)
-                (void)jl_type_infer(mi2, world, 1);
+                (void)jl_type_infer(jl_nothing, mi2, world, 1);
             if (jl_typeinf_func && mi->def.method->primary_world <= tworld) {
                 if (jl_rettype_inferred_native(mi2, tworld, tworld) == jl_nothing)
-                    (void)jl_type_infer(mi2, tworld, 1);
+                    (void)jl_type_infer(jl_nothing, mi2, tworld, 1);
             }
         }
     }

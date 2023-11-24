@@ -2500,8 +2500,6 @@ JL_DLLEXPORT void jl_set_safe_restore(jl_jmp_buf *) JL_NOTSAFEPOINT;
 // codegen interface ----------------------------------------------------------
 // The root propagation here doesn't have to be literal, but callers should
 // ensure that the return value outlives the MethodInstance
-typedef jl_value_t *(*jl_codeinstance_lookup_t)(jl_method_instance_t *mi JL_PROPAGATES_ROOT,
-    size_t min_world, size_t max_world);
 typedef struct {
     int track_allocations;  // can we track allocations?
     int code_coverage;      // can we measure coverage?
@@ -2516,8 +2514,7 @@ typedef struct {
     int gcstack_arg; // Pass the ptls value as an argument with swiftself
 
     int use_jlplt; // Whether to use the Julia PLT mechanism or emit symbols directly
-    // Cache access. Default: jl_rettype_inferred_native.
-    jl_codeinstance_lookup_t lookup;
+    jl_value_t *compiler; // TODO: Rooting?
 } jl_cgparams_t;
 extern JL_DLLEXPORT int jl_default_debug_info_kind;
 

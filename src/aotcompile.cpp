@@ -226,7 +226,7 @@ static void makeSafeName(GlobalObject &G)
 static void jl_ci_cache_lookup(const jl_cgparams_t &cgparams, jl_method_instance_t *mi, size_t world, jl_code_instance_t **ci_out, jl_code_info_t **src_out)
 {
     ++CICacheLookups;
-    jl_value_t *ci = cgparams.lookup(mi, world, world);
+    jl_value_t *ci = jl_rettype_inferred(cgparams.compiler, mi, world, world);
     JL_GC_PROMISE_ROOTED(ci);
     jl_code_instance_t *codeinst = NULL;
     if (ci != jl_nothing) {
@@ -239,17 +239,12 @@ static void jl_ci_cache_lookup(const jl_cgparams_t &cgparams, jl_method_instance
             *src_out = jl_uncompress_ir(def, codeinst, (jl_value_t*)*src_out);
     }
     if (*src_out == NULL || !jl_is_code_info(*src_out)) {
-        if (cgparams.lookup != jl_rettype_inferred_addr) {
-            jl_error("Refusing to automatically run type inference with custom cache lookup.");
-        }
-        else {
-            *src_out = jl_type_infer(mi, world, 0);
-            if (*src_out) {
-                codeinst = jl_get_codeinst_for_src(mi, *src_out);
-                if ((*src_out)->inferred) {
-                    jl_value_t *null = nullptr;
-                    jl_atomic_cmpswap_relaxed(&codeinst->inferred, &null, jl_nothing);
-                }
+        *src_out = jl_type_infer(cgparams.compiler, mi, world, 0);
+        if (*src_out) {
+            codeinst = jl_get_codeinst_for_src(mi, *src_out);
+            if ((*src_out)->inferred) {
+                jl_value_t *null = nullptr;
+                jl_atomic_cmpswap_relaxed(&codeinst->inferred, &null, jl_nothing);
             }
         }
     }
@@ -1838,7 +1833,7 @@ void jl_get_llvmf_defn_impl(jl_llvmf_dump_t* dump, jl_method_instance_t *mi, siz
             src = jl_uncompress_ir(mi->def.method, NULL, (jl_value_t*)src);
     }
     else {
-        jl_value_t *ci = params.lookup(mi, world, world);
+        jl_value_t *ci = jl_rettype_inferred(params.compiler, mi, world, world);
         if (ci != jl_nothing) {
             codeinst = (jl_code_instance_t*)ci;
             src = (jl_code_info_t*)jl_atomic_load_relaxed(&codeinst->inferred);
@@ -1848,7 +1843,7 @@ void jl_get_llvmf_defn_impl(jl_llvmf_dump_t* dump, jl_method_instance_t *mi, siz
             codeinst = NULL; // not needed outside of this branch
         }
         if (!src || (jl_value_t*)src == jl_nothing) {
-            src = jl_type_infer(mi, world, 0);
+            src = jl_type_infer(params.compiler, mi, world, 0);
             if (src)
                 jlrettype = src->rettype;
             else if (jl_is_method(mi->def.method)) {

@@ -33,6 +33,23 @@ macro _boundscheck() Expr(:boundscheck) end
 convert(::Type{Any}, Core.@nospecialize x) = x
 convert(::Type{T}, x::T) where {T} = x
 
+# abstract type CompilerInstance end
+# struct Native <: CompilerInstance end
+# const native = Native()
+abstract type AbstractCompiler end
+const CompilerInstance = Union{Nothing, AbstractCompiler}
+const Native = Nothing
+const native = nothing
+
+"""
+    abstract_interpreter(::CompilerInstance, world::UInt)
+
+Construct an abstract interpreter for the provided compiler instance.
+"""
+function abstract_interpreter end
+
+abstract_interpreter(::Native, world::UInt) = NativeInterpreter(world)
+
 # mostly used by compiler/methodtable.jl, but also by reflection.jl
 abstract type MethodTableView end
 abstract type AbstractInterpreter end
