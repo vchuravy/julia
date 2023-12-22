@@ -481,11 +481,12 @@ jl_code_instance_t *jl_generate_fptr_impl(jl_method_instance_t *mi JL_PROPAGATES
     if (measure_compile_time_enabled)
         compiler_start_time = jl_hrtime();
     // if we don't have any decls already, try to generate it now
+    jl_value_t *compiler = ct->compiler;
     jl_code_info_t *src = NULL;
     jl_code_instance_t *codeinst = NULL;
     JL_GC_PUSH2(&src, &codeinst);
     JL_LOCK(&jl_codegen_lock); // also disables finalizers, to prevent any unexpected recursion
-    jl_value_t *ci = jl_rettype_inferred_addr(mi, world, world);
+    jl_value_t *ci = jl_rettype_inferred(compiler, mi, world, world);
     if (ci != jl_nothing)
         codeinst = (jl_code_instance_t*)ci;
     if (codeinst) {
@@ -505,10 +506,11 @@ jl_code_instance_t *jl_generate_fptr_impl(jl_method_instance_t *mi JL_PROPAGATES
             // If the caller didn't provide the source and IR is available,
             // see if it is inferred, or try to infer it for ourself.
             // (but don't bother with typeinf on macros or toplevel thunks)
-            src = jl_type_infer(mi, world, 0);
+            src = jl_type_infer(compiler, mi, world, 0);
             codeinst = nullptr;
         }
     }
+    // todo(VC)
     jl_code_instance_t *compiled = jl_method_compiled(mi, world);
     if (compiled) {
         codeinst = compiled;
@@ -633,7 +635,7 @@ jl_value_t *jl_dump_method_asm_impl(jl_method_instance_t *mi, size_t world,
             JL_LOCK(&jl_codegen_lock); // also disables finalizers, to prevent any unexpected recursion
             specfptr = (uintptr_t)jl_atomic_load_relaxed(&codeinst->specptr.fptr);
             if (specfptr == 0) {
-                jl_code_info_t *src = jl_type_infer(mi, world, 0);
+                jl_code_info_t *src = jl_type_infer(jl_nothing, mi, world, 0);
                 JL_GC_PUSH1(&src);
                 jl_method_t *def = mi->def.method;
                 if (jl_is_method(def)) {

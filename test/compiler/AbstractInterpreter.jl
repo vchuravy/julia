@@ -411,6 +411,12 @@ using Base: CodegenParams
 using InteractiveUtils
 
 @newinterp ConstInvokeInterp
+
+import Core.Compiler: AbstractCompiler, abstract_interpreter
+struct ConstInvokeCompiler <: AbstractCompiler end
+abstract_interpreter(::ConstInvokeCompiler, world::UInt) =
+    ConstInvokeInterp(; world=CONST_INVOKE_INTERP_WORLD)
+
 function CC.concrete_eval_eligible(interp::ConstInvokeInterp,
     @nospecialize(f), result::CC.MethodCallResult, arginfo::CC.ArgInfo, sv::CC.AbsIntState)
     ret = @invoke CC.concrete_eval_eligible(interp::CC.AbstractInterpreter,
@@ -432,40 +438,20 @@ Base.@constprop :aggressive @noinline function custom_lookup_target(c::Bool, x::
 end
 custom_lookup_context(x::Int) = custom_lookup_target(true, x)
 
-const CONST_INVOKE_INTERP_WORLD = Base.get_world_counter()
-const CONST_INVOKE_INTERP = ConstInvokeInterp(; world=CONST_INVOKE_INTERP_WORLD)
-function custom_lookup(mi::MethodInstance, min_world::UInt, max_world::UInt)
-    for inf_result in CONST_INVOKE_INTERP.inf_cache
-        if inf_result.linfo === mi
-            if CC.any(inf_result.overridden_by_const)
-                return CodeInstance(CONST_INVOKE_INTERP, inf_result, inf_result.valid_worlds)
-            end
-        end
-    end
-    # XXX: This seems buggy, custom_lookup should probably construct the absint on demand.
-    return CC.getindex(CC.code_cache(CONST_INVOKE_INTERP), mi)
-end
-
-let # generate cache
-    code_typed(custom_lookup_context; world=CONST_INVOKE_INTERP_WORLD, interp=CONST_INVOKE_INTERP)
-
-    # check if the lookup function works as expected
-    target_mi = CC.specialize_method(only(methods(custom_lookup_target)), Tuple{typeof(custom_lookup_target),Bool,Int}, Core.svec())
-    target_ci = custom_lookup(target_mi, CONST_INVOKE_INTERP_WORLD, CONST_INVOKE_INTERP_WORLD)
-    @test target_ci.rettype == Tuple{Float64,Nothing} # constprop'ed source
-    # display(@ccall jl_uncompress_ir(target_ci.def.def::Any, C_NULL::Ptr{Cvoid}, target_ci.inferred::Any)::Any)
-
+let
     raw = false
-    lookup = @cfunction(custom_lookup, Any, (Any,Csize_t,Csize_t))
     params = CodegenParams(;
         debug_info_kind=Cint(0),
         debug_info_level=Cint(2),
         safepoint_on_entry=raw,
         gcstack_arg=raw,
-        lookup)
+        ConstInvokeCompiler())
     io = IOBuffer()
     code_llvm(io, custom_lookup_target, (Bool,Int,); params)
     s = String(take!(io))
     @test  occursin("j_sin_", s)
     @test !occursin("j_cos_", s)
+
+    Base.invoke_within(ConstInvokeCompiler(), custom_lookup_target, true, 1) == sin(1)
+    Base.invoke_within(ConstInvokeCompiler(), custom_lookup_target, false, 1) == cos(1)
 end

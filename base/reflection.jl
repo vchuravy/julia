@@ -1410,21 +1410,21 @@ struct CodegenParams
     that may be used by external compilers as a callback to look up the code instance corresponding
     to a particular method instance.
     """
-    lookup::Ptr{Cvoid}
+    compiler::Core.Compiler.CompilerInstance
 
     function CodegenParams(; track_allocations::Bool=true, code_coverage::Bool=true,
                    prefer_specsig::Bool=false,
                    gnu_pubnames::Bool=true, debug_info_kind::Cint = default_debug_info_kind(),
                    debug_info_level::Cint = Cint(JLOptions().debug_level), safepoint_on_entry::Bool=true,
                    gcstack_arg::Bool=true, use_jlplt::Bool=true,
-                   lookup::Ptr{Cvoid}=unsafe_load(cglobal(:jl_rettype_inferred_addr, Ptr{Cvoid})))
+                   compiler::Core.Compiler.CompilerInstance=nothing)
         return new(
             Cint(track_allocations), Cint(code_coverage),
             Cint(prefer_specsig),
             Cint(gnu_pubnames), debug_info_kind,
             debug_info_level, Cint(safepoint_on_entry),
             Cint(gcstack_arg), Cint(use_jlplt),
-            lookup)
+            compiler)
     end
 end
 

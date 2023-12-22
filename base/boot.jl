@@ -182,6 +182,7 @@
 #    exception::Any
 #    backtrace::Any
 #    scope::Any
+#    compiler::Any
 #    code::Any
 #end
 

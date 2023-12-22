@@ -2196,6 +2196,7 @@ typedef struct _jl_task_t {
     jl_value_t *donenotify;
     jl_value_t *result;
     jl_value_t *scope;
+    jl_value_t *compiler;
     jl_function_t *start;
     // 4 byte padding on 32-bit systems
     // uint32_t padding0;
@@ -2536,8 +2537,8 @@ typedef struct {
     int gcstack_arg; // Pass the ptls value as an argument with swiftself
 
     int use_jlplt; // Whether to use the Julia PLT mechanism or emit symbols directly
-    // Cache access. Default: jl_rettype_inferred_native.
-    jl_codeinstance_lookup_t lookup;
+    // Cache access. Default: NativeCompiler()
+    jl_value_t *compiler;
 } jl_cgparams_t;
 extern JL_DLLEXPORT int jl_default_debug_info_kind;
 

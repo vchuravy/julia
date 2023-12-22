@@ -33,6 +33,21 @@ macro _boundscheck() Expr(:boundscheck) end
 convert(::Type{Any}, Core.@nospecialize x) = x
 convert(::Type{T}, x::T) where {T} = x
 
+abstract type AbstractCompiler end
+const CompilerInstance = Union{AbstractCompiler, Nothing}
+const NativeCompiler = Nothing
+
+current_compiler() = ccall(:jl_get_current_task, Ref{Task}, ()).compiler::CompilerInstance
+
+"""
+    abstract_interpreter(::CompilerInstance, world::UInt)
+
+Construct an appropriate abstract interpreter for the given compiler instance.
+"""
+function abstract_interpreter end
+
+abstract_interpreter(::Nothing, world::UInt) = NativeInterpreter(world)
+
 # These types are used by reflection.jl and expr.jl too, so declare them here.
 # Note that `@assume_effects` is available only after loading namedtuple.jl.
 abstract type MethodTableView end

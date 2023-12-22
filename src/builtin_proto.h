@@ -32,6 +32,7 @@ DECLARE_BUILTIN(memoryrefset);
 DECLARE_BUILTIN(memoryref_isassigned);
 DECLARE_BUILTIN(_call_in_world);
 DECLARE_BUILTIN(_call_in_world_total);
+DECLARE_BUILTIN(_call_within);
 DECLARE_BUILTIN(_call_latest);
 DECLARE_BUILTIN(replacefield);
 DECLARE_BUILTIN(_expr);

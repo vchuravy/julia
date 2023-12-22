@@ -641,7 +641,7 @@ typedef union {
 
 // -- functions -- //
 
-JL_DLLEXPORT jl_code_info_t *jl_type_infer(jl_method_instance_t *li, size_t world, int force);
+JL_DLLEXPORT jl_code_info_t *jl_type_infer(jl_value_t *compiler, jl_method_instance_t *li, size_t world, int force);
 JL_DLLEXPORT jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *meth JL_PROPAGATES_ROOT, size_t world);
 JL_DLLEXPORT jl_code_instance_t *jl_get_method_inferred(
         jl_method_instance_t *mi JL_PROPAGATES_ROOT, jl_value_t *rettype,
@@ -1000,7 +1000,6 @@ JL_DLLEXPORT void jl_method_instance_add_backedge(jl_method_instance_t *callee, 
 JL_DLLEXPORT void jl_method_table_add_backedge(jl_methtable_t *mt, jl_value_t *typ, jl_value_t *caller);
 JL_DLLEXPORT void jl_mi_cache_insert(jl_method_instance_t *mi JL_ROOTING_ARGUMENT,
                                      jl_code_instance_t *ci JL_ROOTED_ARGUMENT JL_MAYBE_UNROOTED);
-JL_DLLEXPORT extern jl_value_t *(*const jl_rettype_inferred_addr)(jl_method_instance_t *mi JL_PROPAGATES_ROOT, size_t min_world, size_t max_world) JL_NOTSAFEPOINT;
 
 uint32_t jl_module_next_counter(jl_module_t *m) JL_NOTSAFEPOINT;
 jl_tupletype_t *arg_type_tuple(jl_value_t *arg1, jl_value_t **args, size_t nargs);
