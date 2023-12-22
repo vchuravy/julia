@@ -1073,7 +1073,15 @@ function typeinf_type(interp::AbstractInterpreter, mi::MethodInstance)
 end
 
 # This is a bridge for the C code calling `jl_typeinf_func()`
-typeinf_ext_toplevel(compiler::CompilerInstance, mi::MethodInstance, world::UInt) = typeinf_ext_toplevel(abstract_interpreter(compiler, world), mi)
+function typeinf_ext_toplevel(compiler::CompilerInstance, mi::MethodInstance, world::UInt)
+    if compiler === nothing
+        return typeinf_ext_toplevel(abstract_interpreter(compiler, world), mi)
+    else
+        absint = invokelatest(abstract_interpreter, compiler, world)
+        return invokelatest(typeinf_ext_toplevel, absint, mi)
+    end
+end
+
 function typeinf_ext_toplevel(interp::AbstractInterpreter, mi::MethodInstance)
     if isa(mi.def, Method)
         # method lambda - infer this specialization via the method cache

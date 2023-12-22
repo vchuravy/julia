@@ -415,7 +415,7 @@ using InteractiveUtils
 import Core.Compiler: AbstractCompiler, abstract_interpreter
 struct ConstInvokeCompiler <: AbstractCompiler end
 abstract_interpreter(::ConstInvokeCompiler, world::UInt) =
-    ConstInvokeInterp(; world=CONST_INVOKE_INTERP_WORLD)
+    ConstInvokeInterp(; world=world)
 
 function CC.concrete_eval_eligible(interp::ConstInvokeInterp,
     @nospecialize(f), result::CC.MethodCallResult, arginfo::CC.ArgInfo, sv::CC.AbsIntState)
