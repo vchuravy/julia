@@ -242,8 +242,7 @@ static void jl_ci_cache_lookup(const jl_cgparams_t &cgparams, jl_method_instance
     if (*src_out == NULL || !jl_is_code_info(*src_out)) {
         *src_out = jl_type_infer(cgparams.compiler, mi, world, 0);
         if (*src_out) {
-            // TODO
-            codeinst = jl_get_codeinst_for_src(mi, *src_out);
+            codeinst = jl_get_codeinst_for_src(cgparams.compiler, mi, *src_out);
             if ((*src_out)->inferred) {
                 jl_value_t *null = nullptr;
                 jl_atomic_cmpswap_relaxed(&codeinst->inferred, &null, jl_nothing);
@@ -303,6 +302,7 @@ void *jl_create_native_impl(jl_array_t *methods, LLVMOrcThreadSafeModuleRef llvm
     params.imaging_mode = imaging;
     params.debug_level = cgparams->debug_info_level;
     params.external_linkage = _external_linkage;
+    params.compiler = cgparams->compiler;
     size_t compile_for[] = { jl_typeinf_world, _world };
     for (int worlds = 0; worlds < 2; worlds++) {
         JL_TIMING(NATIVE_AOT, NATIVE_Codegen);
@@ -1934,6 +1934,7 @@ void jl_get_llvmf_defn_impl(jl_llvmf_dump_t* dump, jl_method_instance_t *mi, siz
         output.world = world;
         output.params = &params;
         output.imaging_mode = imaging_default();
+        output.compiler = params.compiler;
         // This would be nice, but currently it causes some assembly regressions that make printed output
         // differ very significantly from the actual non-imaging mode code.
         // // Force imaging mode for names of pointers

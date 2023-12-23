@@ -4656,7 +4656,7 @@ static jl_cgval_t emit_invoke(jl_codectx_t &ctx, const jl_cgval_t &lival, const 
             }
         }
         else {
-            jl_value_t *compiler = ctx.params->compiler;
+            jl_value_t *compiler = ctx.compiler;
             // TODO: need to use the right pair world here
             jl_value_t *ci = jl_rettype_inferred(compiler, mi, ctx.world, ctx.world);
             if (ci != jl_nothing) {
@@ -5655,6 +5655,7 @@ static std::pair<Function*, Function*> get_oc_function(jl_codectx_t &ctx, jl_met
     sigtype = jl_apply_tuple_type_v(jl_svec_data(sig_args), nsig);
 
     jl_method_instance_t *mi = jl_specializations_get_linfo(closure_method, sigtype, jl_emptysvec);
+    // TODO(VC)
     jl_code_instance_t *ci = (jl_code_instance_t*)jl_rettype_inferred(jl_nothing, mi, ctx.world, ctx.world);
 
     if (ci == NULL || (jl_value_t*)ci == jl_nothing) {
@@ -9323,7 +9324,7 @@ void jl_compile_workqueue(
                 // method body. See #34993
                 if (policy != CompilationPolicy::Default &&
                     jl_atomic_load_relaxed(&codeinst->inferred) == jl_nothing) {
-                    src = jl_type_infer(jl_nothing, codeinst->def, jl_atomic_load_acquire(&jl_world_counter), 0);
+                    src = jl_type_infer(codeinst->owner, codeinst->def, jl_atomic_load_acquire(&jl_world_counter), 0);
                     if (src) {
                         orc::ThreadSafeModule result_m =
                         jl_create_ts_module(name_from_method_instance(codeinst->def),

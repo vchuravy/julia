@@ -214,6 +214,7 @@ static jl_callptr_t _jl_compile_codeinst(
     params.world = world;
     params.imaging_mode = imaging_default();
     params.debug_level = jl_options.debug_level;
+    params.compiler = codeinst->owner;
     {
         orc::ThreadSafeModule result_m =
             jl_create_ts_module(name_from_method_instance(codeinst->def), params.tsctx, params.DL, params.TargetTriple);
@@ -515,7 +516,7 @@ jl_code_instance_t *jl_generate_fptr_impl(jl_value_t *compiler, jl_method_instan
     }
     else if (src && jl_is_code_info(src)) {
         if (!codeinst) {
-            codeinst = jl_get_codeinst_for_src(mi, src);
+            codeinst = jl_get_codeinst_for_src(compiler, mi, src);
             if (src->inferred) {
                 jl_value_t *null = nullptr;
                 jl_atomic_cmpswap_relaxed(&codeinst->inferred, &null, jl_nothing);

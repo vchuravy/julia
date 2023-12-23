@@ -241,6 +241,7 @@ struct jl_codegen_params_t {
     bool external_linkage = false;
     bool imaging_mode;
     int debug_level;
+    jl_value_t *compiler = nullptr;
     jl_codegen_params_t(orc::ThreadSafeContext ctx, DataLayout DL, Triple triple)
         : tsctx(std::move(ctx)), tsctx_lock(tsctx.getLock()),
             DL(std::move(DL)), TargetTriple(std::move(triple)), imaging_mode(imaging_default()) {}
