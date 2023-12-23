@@ -410,12 +410,7 @@ using Core: MethodInstance, CodeInstance
 using Base: CodegenParams
 using InteractiveUtils
 
-@newinterp ConstInvokeInterp
-
-import Core.Compiler: AbstractCompiler, abstract_interpreter
-struct ConstInvokeCompiler <: AbstractCompiler end
-abstract_interpreter(::ConstInvokeCompiler, world::UInt) =
-    ConstInvokeInterp(; world=world)
+@newinterp ConstInvokeInterp # Also defines ConstInvokeInterpCompiler
 
 function CC.concrete_eval_eligible(interp::ConstInvokeInterp,
     @nospecialize(f), result::CC.MethodCallResult, arginfo::CC.ArgInfo, sv::CC.AbsIntState)
@@ -445,13 +440,13 @@ let
         debug_info_level=Cint(2),
         safepoint_on_entry=raw,
         gcstack_arg=raw,
-        ConstInvokeCompiler())
+        ConstInvokeInterpCompiler())
     io = IOBuffer()
     code_llvm(io, custom_lookup_target, (Bool,Int,); params)
     s = String(take!(io))
     @test  occursin("j_sin_", s)
     @test !occursin("j_cos_", s)
 
-    Base.invoke_within(ConstInvokeCompiler(), custom_lookup_target, true, 1) == sin(1)
-    Base.invoke_within(ConstInvokeCompiler(), custom_lookup_target, false, 1) == cos(1)
+    Base.invoke_within(ConstInvokeInterpCompiler(), custom_lookup_target, true, 1) == sin(1)
+    Base.invoke_within(ConstInvokeInterpCompiler(), custom_lookup_target, false, 1) == cos(1)
 end
