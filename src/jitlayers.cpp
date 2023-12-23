@@ -469,7 +469,7 @@ void jl_extern_c_impl(jl_value_t *declrt, jl_tupletype_t *sigt)
 
 // this compiles li and emits fptr
 extern "C" JL_DLLEXPORT_CODEGEN
-jl_code_instance_t *jl_generate_fptr_impl(jl_method_instance_t *mi JL_PROPAGATES_ROOT, size_t world)
+jl_code_instance_t *jl_generate_fptr_impl(jl_value_t *compiler, jl_method_instance_t *mi JL_PROPAGATES_ROOT, size_t world)
 {
     auto ct = jl_current_task;
     bool timed = (ct->reentrant_timing & 1) == 0;
@@ -481,7 +481,6 @@ jl_code_instance_t *jl_generate_fptr_impl(jl_method_instance_t *mi JL_PROPAGATES
     if (measure_compile_time_enabled)
         compiler_start_time = jl_hrtime();
     // if we don't have any decls already, try to generate it now
-    jl_value_t *compiler = ct->compiler;
     jl_code_info_t *src = NULL;
     jl_code_instance_t *codeinst = NULL;
     JL_GC_PUSH2(&src, &codeinst);
@@ -510,8 +509,7 @@ jl_code_instance_t *jl_generate_fptr_impl(jl_method_instance_t *mi JL_PROPAGATES
             codeinst = nullptr;
         }
     }
-    // todo(VC)
-    jl_code_instance_t *compiled = jl_method_compiled(mi, world);
+    jl_code_instance_t *compiled = jl_method_compiled(compiler, mi, world);
     if (compiled) {
         codeinst = compiled;
     }
@@ -614,7 +612,8 @@ jl_value_t *jl_dump_method_asm_impl(jl_method_instance_t *mi, size_t world,
         char emit_mc, char getwrapper, const char* asm_variant, const char *debuginfo, char binary)
 {
     // printing via disassembly
-    jl_code_instance_t *codeinst = jl_generate_fptr(mi, world);
+    jl_value_t *compiler = jl_nothing; // Native
+    jl_code_instance_t *codeinst = jl_generate_fptr(compiler, mi, world);
     if (codeinst) {
         uintptr_t fptr = (uintptr_t)jl_atomic_load_acquire(&codeinst->invoke);
         if (getwrapper)

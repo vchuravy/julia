@@ -52,10 +52,11 @@ static jl_opaque_closure_t *new_opaque_closure(jl_tupletype_t *argt, jl_value_t 
 
     jl_method_instance_t *mi = jl_specializations_get_linfo(source, sigtype, jl_emptysvec);
     jl_task_t *ct = jl_current_task;
+    jl_value_t *compiler = ct->compiler;
     size_t world = ct->world_age;
     jl_code_instance_t *ci = NULL;
     if (do_compile) {
-        ci = jl_compile_method_internal(mi, world);
+        ci = jl_compile_method_internal(compiler, mi, world);
     }
 
     jl_fptr_args_t invoke = (jl_fptr_args_t)jl_interpret_opaque_closure;
@@ -105,7 +106,7 @@ static jl_opaque_closure_t *new_opaque_closure(jl_tupletype_t *argt, jl_value_t 
         jl_method_instance_t *mi_generic = jl_specializations_get_linfo(jl_opaque_closure_method, sigtype, jl_emptysvec);
 
         // OC wrapper methods are not world dependent
-        ci = jl_get_method_inferred(mi_generic, selected_rt, 1, ~(size_t)0);
+        ci = jl_get_method_inferred(compiler, mi_generic, selected_rt, 1, ~(size_t)0);
         if (!jl_atomic_load_acquire(&ci->invoke))
             jl_generate_fptr_for_oc_wrapper(ci);
         specptr = jl_atomic_load_relaxed(&ci->specptr.fptr);

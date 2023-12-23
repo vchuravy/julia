@@ -449,22 +449,22 @@ JL_DLLEXPORT jl_value_t *jl_rettype_inferred(jl_value_t *owner, jl_method_instan
 }
 
 JL_DLLEXPORT jl_code_instance_t *jl_get_method_inferred(
+        jl_value_t* compiler,
         jl_method_instance_t *mi JL_PROPAGATES_ROOT, jl_value_t *rettype,
         size_t min_world, size_t max_world)
 {
-    jl_value_t *owner = jl_nothing; // TODO: owner should be arg
     jl_code_instance_t *codeinst = jl_atomic_load_relaxed(&mi->cache);
     while (codeinst) {
         if (codeinst->min_world == min_world &&
             codeinst->max_world == max_world &&
-            jl_egal(codeinst->owner, owner) &&
+            jl_egal(codeinst->owner, compiler) &&
             jl_egal(codeinst->rettype, rettype)) {
             return codeinst;
         }
         codeinst = jl_atomic_load_relaxed(&codeinst->next);
     }
     codeinst = jl_new_codeinst(
-        mi, owner, rettype, (jl_value_t*)jl_any_type, NULL, NULL,
+        mi, compiler, rettype, (jl_value_t*)jl_any_type, NULL, NULL,
         0, min_world, max_world, 0, 0, jl_nothing, 0);
     jl_mi_cache_insert(mi, codeinst);
     return codeinst;
@@ -474,10 +474,12 @@ JL_DLLEXPORT jl_code_instance_t *jl_get_codeinst_for_src(
         jl_method_instance_t *mi JL_PROPAGATES_ROOT, jl_code_info_t *src)
 {
     // TODO: copy backedges from src to mi
+    // TODO: Get either through arg or context
+    jl_value_t *owner = jl_nothing;
     size_t max_world = src->max_world;
     if (max_world >= jl_atomic_load_acquire(&jl_world_counter))
         max_world = ~(size_t)0;
-    return jl_get_method_inferred(mi, src->rettype, src->min_world, max_world);
+    return jl_get_method_inferred(owner, mi, src->rettype, src->min_world, max_world);
 }
 
 JL_DLLEXPORT jl_code_instance_t *jl_new_codeinst(
@@ -2299,11 +2301,12 @@ jl_method_instance_t *jl_get_unspecialized(jl_method_t *def JL_PROPAGATES_ROOT)
 }
 
 
-jl_code_instance_t *jl_method_compiled(jl_method_instance_t *mi, size_t world)
+jl_code_instance_t *jl_method_compiled(jl_value_t *compiler, jl_method_instance_t *mi, size_t world)
 {
     jl_code_instance_t *codeinst = jl_atomic_load_relaxed(&mi->cache);
     while (codeinst) {
-        if (codeinst->min_world <= world && world <= codeinst->max_world) {
+        if (codeinst->min_world <= world && world <= codeinst->max_world &&
+            jl_egal(codeinst->owner, compiler) ) {
             if (jl_atomic_load_relaxed(&codeinst->invoke) != NULL)
                 return codeinst;
         }
@@ -2367,11 +2370,10 @@ JL_DLLEXPORT void jl_write_precompile_statement(char* statement)
 
 jl_method_instance_t *jl_normalize_to_compilable_mi(jl_method_instance_t *mi JL_PROPAGATES_ROOT);
 
-jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *mi, size_t world)
+jl_code_instance_t *jl_compile_method_internal(jl_value_t *compiler, jl_method_instance_t *mi, size_t world)
 {
-    jl_value_t *compiler = jl_nothing; // Native
     // quick check if we already have a compiled result
-    jl_code_instance_t *codeinst = jl_method_compiled(mi, world);
+    jl_code_instance_t *codeinst = jl_method_compiled(compiler, mi, world);
     if (codeinst)
         return codeinst;
 
@@ -2379,8 +2381,9 @@ jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *mi, size_t 
     // instead and just copy it here for caching
     jl_method_instance_t *mi2 = jl_normalize_to_compilable_mi(mi);
     if (mi2 != mi) {
-        jl_code_instance_t *codeinst2 = jl_compile_method_internal(mi2, world);
+        jl_code_instance_t *codeinst2 = jl_compile_method_internal(compiler, mi2, world);
         jl_code_instance_t *codeinst = jl_get_method_inferred(
+                compiler,
                 mi, codeinst2->rettype,
                 codeinst2->min_world, codeinst2->max_world);
         if (jl_atomic_load_relaxed(&codeinst->invoke) == NULL) {
@@ -2480,10 +2483,10 @@ jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *mi, size_t 
         }
     }
 
-    codeinst = jl_generate_fptr(mi, world);
+    codeinst = jl_generate_fptr(compiler, mi, world);
     if (!codeinst) {
         jl_method_instance_t *unspec = jl_get_unspecialized_from_mi(mi);
-        jl_code_instance_t *ucache = jl_get_method_inferred(unspec, (jl_value_t*)jl_any_type, 1, ~(size_t)0);
+        jl_code_instance_t *ucache = jl_get_method_inferred(compiler, unspec, (jl_value_t*)jl_any_type, 1, ~(size_t)0);
         // ask codegen to make the fptr for unspec
         jl_callptr_t ucache_invoke = jl_atomic_load_acquire(&ucache->invoke);
         if (ucache_invoke == NULL) {
@@ -2806,7 +2809,7 @@ JL_DLLEXPORT void jl_compile_method_instance(jl_method_instance_t *mi, jl_tuplet
     else {
         // Otherwise (this branch), assuming we are at runtime (normal JIT) and
         // we should generate the native code immediately in preparation for use.
-        (void)jl_compile_method_internal(mi, world);
+        (void)jl_compile_method_internal(compiler, mi, world);
     }
 }
 
@@ -2870,9 +2873,11 @@ STATIC_INLINE jl_value_t *verify_type(jl_value_t *v) JL_NOTSAFEPOINT
 STATIC_INLINE jl_value_t *_jl_invoke(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *mfunc, size_t world)
 {
     // manually inlined copy of jl_method_compiled
+    jl_value_t *compiler = jl_current_task->compiler;
     jl_code_instance_t *codeinst = jl_atomic_load_relaxed(&mfunc->cache);
     while (codeinst) {
-        if (codeinst->min_world <= world && world <= codeinst->max_world) {
+        if (codeinst->min_world <= world && world <= codeinst->max_world &&
+            jl_egal(codeinst->owner, compiler) ) {
             jl_callptr_t invoke = jl_atomic_load_acquire(&codeinst->invoke);
             if (invoke != NULL) {
                 jl_value_t *res = invoke(F, args, nargs, codeinst);
@@ -2886,7 +2891,7 @@ STATIC_INLINE jl_value_t *_jl_invoke(jl_value_t *F, jl_value_t **args, uint32_t 
 #ifdef _OS_WINDOWS_
     DWORD last_error = GetLastError();
 #endif
-    codeinst = jl_compile_method_internal(mfunc, world);
+    codeinst = jl_compile_method_internal(compiler, mfunc, world);
 #ifdef _OS_WINDOWS_
     SetLastError(last_error);
 #endif

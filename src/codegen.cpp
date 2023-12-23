@@ -6366,7 +6366,7 @@ static Function* gen_cfun_wrapper(
         name = jl_symbol_name(lam->def.method->name);
     if (lam && params.cache) {
         // TODO: this isn't ideal to be unconditionally calling type inference (and compile) from here
-        codeinst = jl_compile_method_internal(lam, world);
+        codeinst = jl_compile_method_internal(params.compiler, lam, world);
         auto invoke = jl_atomic_load_acquire(&codeinst->invoke);
         auto fptr = jl_atomic_load_relaxed(&codeinst->specptr.fptr);
         assert(invoke);
