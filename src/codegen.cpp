@@ -1867,6 +1867,7 @@ public:
     bool use_cache = false;
     bool external_linkage = false;
     const jl_cgparams_t *params = NULL;
+    jl_value_t *compiler = NULL;
 
     SmallVector<std::unique_ptr<Module>, 0> llvmcall_modules;
 
@@ -1877,7 +1878,8 @@ public:
         world(params.world),
         use_cache(params.cache),
         external_linkage(params.external_linkage),
-        params(params.params) { }
+        params(params.params),
+        compiler(params.compiler) { }
 
     jl_typecache_t &types() {
         type_cache.initialize(builder.getContext(), emission_context.DL);
