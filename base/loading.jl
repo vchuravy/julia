@@ -390,6 +390,33 @@ identify_package(where::Module, name::String) = _nothing_or_first(identify_packa
 identify_package(where::PkgId, name::String)  = _nothing_or_first(identify_package_env(where, name))
 identify_package(name::String)                = _nothing_or_first(identify_package_env(name))
 
+"""
+    Base.identify_package_extension(parent::Union{Module,PkgId}, name::String)::Union{PkgId, Nothing}
+
+Identify the package extension by its name and its parent from the current environment stack, returning
+its `PkgId`, or `nothing` if it cannot be found.
+
+"""
+identify_package_extension(parent::Module, name::String) = identify_package_extension(PkgId(parent), name)
+function identify_package_extension(parentid::PkgId, name::String)
+    project = env_project_file(dirname(dirname(locate_package(parentid))))
+
+    d = parsed_toml(project)
+    exts = get(d, "extensions", nothing)::Union{Dict{String, Any}, Nothing}
+    exts === nothing && return nothing
+    if haskey(exts, name)
+        return PkgId(uuid5(parentid.uuid, name), name)
+    end
+    return nothing
+end
+function identify_package_extension(parent::String, name::String)
+    parentid = Base.identify_package(parent)
+    if parentid === nothing
+        return nothing
+    end
+    identify_package_extension(parentid, name)
+end
+
 function locate_package_env(pkg::PkgId, stopenv::Union{String, Nothing}=nothing)
     cache = LOADING_CACHE[]
     if cache !== nothing

@@ -1101,6 +1101,8 @@ end
         test_ext_proj = """
         begin
             using HasExtensions
+            Base.identify_package_extension(HasExtensions, "Extension") !== nothing || error("expected to find extension")
+            Base.identify_package_extension(HasExtensions, "NotAnExtension") === nothing || error("expected to not find extension")
             using ExtDep
             Base.get_extension(HasExtensions, :Extension) isa Module || error("expected extension to load")
             using ExtDep2
