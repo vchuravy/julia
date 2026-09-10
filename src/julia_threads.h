@@ -135,6 +135,35 @@ typedef struct _jl_reset_ctx_t {
     jl_jmp_buf mctx;
 } jl_reset_ctx_t;
 
+// Stackmap GC-root mode (--gc-roots=stackmap, see src/stackmaps.cpp).
+//
+// Compiled code in this mode keeps no shadow stack: the GC finds roots by
+// unwinding machine stacks and looking up stackmap records. To unwind a task
+// that is in the GC-safe state (inside a foreign call, possibly under frames
+// without unwind info) the runtime records a *frame anchor* when the task
+// enters that state: a pc inside the frame that entered it, that frame's stack
+// and frame pointer, and its callee-saved registers. Anchors form a per-task
+// stack that follows the nesting of gc-safe regions; exception handlers and
+// cancellation reset points truncate it like `gcstack`.
+#if defined(_CPU_X86_64_)
+#define JL_GC_ANCHOR_NREGS 5 // rbx, r12, r13, r14, r15 (the x86-64 asm stub depends on this layout)
+#else
+#define JL_GC_ANCHOR_NREGS 1 // unused
+#endif
+typedef struct _jl_gc_anchor_t {
+    uintptr_t pc;
+    uintptr_t sp;
+    uintptr_t fp;
+    uintptr_t regs[JL_GC_ANCHOR_NREGS];
+} jl_gc_anchor_t;
+
+// GC-managed buffer (allocated with jl_gc_alloc_buf, marked with the task).
+typedef struct _jl_gc_anchor_stack_t {
+    size_t top;
+    size_t reserved_size;
+    jl_gc_anchor_t anchors[1]; // reserved_size entries
+} jl_gc_anchor_stack_t;
+
 // A foreign-call cancellation handler and state argument, published in
 // `jl_task_t.cancel_handler_ctx` for exactly the duration of a foreign call
 // annotated `@ccall cancel_handler=(fn, state) ...`. Delivery is signal-handler
@@ -253,6 +282,10 @@ typedef struct _jl_tls_states_t {
     // Temporary backtrace buffer. Scanned for gc roots when bt_size > 0.
     struct _jl_bt_element_t *bt_data; // JL_MAX_BT_SIZE + 1 elements long
     size_t bt_size;    // Size for backtrace in transit in bt_data
+    // Stackmap GC roots: register context (a bt_context_t) of this thread while
+    // it is in JL_GC_STATE_WAITING, valid for the GC to unwind from; NULL when
+    // the thread is gc-safe (then its task's anchors are used) or running.
+    void *gc_stack_ctx;
     // Temporary backtrace buffer used only for allocations profiler.
     struct _jl_bt_element_t *profiling_bt_buffer;
     // Atomically set by the sender, reset by the handler.
@@ -567,6 +600,8 @@ typedef struct _jl_task_t {
 #endif
     // saved exception stack
     jl_excstack_t *excstack;
+    // frame anchors for stackmap GC roots (NULL until first gc-safe transition)
+    jl_gc_anchor_stack_t *gc_anchors;
     // current exception handler
     jl_handler_t *eh;
     // saved thread state
@@ -665,9 +700,18 @@ void jl_gc_safe_leave(jl_ptls_t ptls, int8_t state) JL_CANSAFEPOINT_ENTER;
 #else
 #define jl_gc_unsafe_enter(ptls) jl_gc_state_save_and_set(ptls, JL_GC_STATE_UNSAFE)
 #define jl_gc_unsafe_leave(ptls, state) ((void)jl_gc_state_set(ptls, (state), JL_GC_STATE_UNSAFE))
-#define jl_gc_safe_enter(ptls) jl_gc_state_save_and_set(ptls, JL_GC_STATE_SAFE)
-#define jl_gc_safe_leave(ptls, state) ((void)jl_gc_state_set(ptls, (state), JL_GC_STATE_SAFE))
+// Entering the gc-safe state records a frame anchor for the *calling* frame
+// (stackmap GC-root mode, no-op otherwise), so these are out-of-line calls.
+// `__builtin_frame_address(0)` is evaluated in the caller (macro expansion);
+// the return address and stack pointer are taken by the helper.
+#define jl_gc_safe_enter(ptls) jl_gc_safe_enter_anchor(ptls, __builtin_frame_address(0))
+#define jl_gc_safe_leave(ptls, state) jl_gc_safe_leave_anchor(ptls, (state))
 #endif
+// Stackmap GC-root mode helpers (safepoint.c). Enter records the caller frame
+// as an anchor and switches to JL_GC_STATE_SAFE, returning the previous state;
+// leave restores `state` and drops the anchor.
+JL_DLLEXPORT int8_t jl_gc_safe_enter_anchor(jl_ptls_t ptls, void *caller_fp) JL_CANSAFEPOINT_LEAVE;
+JL_DLLEXPORT void jl_gc_safe_leave_anchor(jl_ptls_t ptls, int8_t state) JL_CANSAFEPOINT_ENTER;
 
 JL_DLLEXPORT void jl_gc_enable_finalizers(struct _jl_task_t *ct, int on) JL_CANSAFEPOINT;
 JL_DLLEXPORT void jl_gc_disable_finalizers_internal(void) JL_NOTSAFEPOINT;

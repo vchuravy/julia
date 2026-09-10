@@ -17,6 +17,20 @@ function run_gctest(file)
     end
 end
 
+# Stackmap GC roots (--gc-roots=stackmap): run the stress scenarios in a process
+# started in that mode, and in the verification mode that emits both the shadow
+# stack and the stackmaps. Only supported on x86-64 Linux.
+function run_stackmap_gctest(file)
+    @testset for mode in ("both", "stackmap")
+        cmd = `$(Base.julia_cmd()) --depwarn=error --startup-file=no --experimental --gc-roots=$mode $file`
+        @testset for test_nthreads in (1, 4)
+            new_env = copy(ENV)
+            new_env["JULIA_NUM_THREADS"] = "$test_nthreads"
+            @test success(run(pipeline(setenv(cmd, new_env), stdout = stdout, stderr = stderr)))
+        end
+    end
+end
+
 function run_nonzero_page_utilization_test()
     GC.gc()
     page_utilization = Base.gc_page_utilization_data()
@@ -66,6 +80,12 @@ end
     run_gctest("gc/objarray.jl")
     run_gctest("gc/chunks.jl")
     run_gctest("gc/copyto.jl")
+end
+
+@static if Base.USING_STOCK_GC && Sys.islinux() && Sys.ARCH === :x86_64
+@testset "stackmap GC roots" begin
+    run_stackmap_gctest("gc/stackmaps.jl")
+end
 end
 
 #FIXME: Issue #57103 disabling tests for MMTk, since

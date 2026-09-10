@@ -320,7 +320,7 @@ static void mach_safepoint_trampoline(jl_ptls_t ptls)
     jl_task_t *ct = jl_atomic_load_relaxed(&ptls->current_task);
     if (ct == NULL)
         return; // thread is dead, just resume
-    jl_set_gc_and_wait(ct);
+    jl_set_gc_and_wait(ct, NULL);
     // (The sigint force-throw that lived here is gone: SIGINT is delivered
     // through the cancellation system - see jl_sigint_request_cancellation -
     // and nothing arms the sigint page anymore.)
@@ -751,6 +751,7 @@ static void jl_send_reset_signal(int16_t tid, int reset_code) JL_NOTSAFEPOINT
                                      (thread_state_t)&state,
                                      MACH_THREAD_STATE_COUNT) == KERN_SUCCESS) {
                     ct2->gcstack = reset_ctx->gcstack;
+                    jl_gc_anchors_trim(ct2, reset_ctx->sp);
                     ct2->eh = reset_ctx->eh;
                 }
                 else {

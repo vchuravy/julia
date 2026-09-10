@@ -209,6 +209,11 @@ function julia_cmd(julia=joinpath(Sys.BINDIR, julia_exename()); cpu_target::Unio
     opts.use_compiled_modules == 2 && push!(addflags, "--compiled-modules=existing")
     opts.use_compiled_modules == 3 && push!(addflags, "--compiled-modules=strict")
     opts.use_pkgimages == 0 && push!(addflags, "--pkgimages=no")
+    if opts.gc_roots != 0
+        # child processes (precompilation) must compile and scan roots the same way
+        push!(addflags, "--experimental")
+        push!(addflags, "--gc-roots=$(opts.gc_roots == 1 ? "stackmap" : "both")")
+    end
     opts.use_pkgimages == 2 && push!(addflags, "--pkgimages=existing")
     opts.opt_level == 2 || push!(addflags, "-O$(opts.opt_level)")
     opts.opt_level_min == 0 || push!(addflags, "--min-optlevel=$(opts.opt_level_min)")

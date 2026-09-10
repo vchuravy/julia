@@ -395,4 +395,55 @@ namespace jl_well_known {
             allocTypedFunc->addFnAttr(Attribute::getWithAllocSizeArgs(ctx, 1, None));
             return addResetSafeGCAllocAttributes(allocTypedFunc);
         });
+
+    static const char *GC_SAFE_ENTER_ANCHOR_NAME = XSTR(jl_gc_safe_enter_anchor);
+    static const char *GC_SAFE_LEAVE_ANCHOR_NAME = XSTR(jl_gc_safe_leave_anchor);
+    static const char *GC_SAFEPOINT_POLL_NAME = XSTR(jl_gc_safepoint_poll);
+
+    // These deliberately carry no memory-effect attributes: LateLowerGCFrame
+    // must treat them as safepoints.
+    const WellKnownFunctionDescription GCSafeEnterAnchor(
+        GC_SAFE_ENTER_ANCHOR_NAME,
+        [](Type *T_size) {
+            auto &ctx = T_size->getContext();
+            auto func = Function::Create(
+                FunctionType::get(
+                    Type::getInt8Ty(ctx),
+                    { PointerType::get(ctx, 0), PointerType::get(ctx, 0) },
+                    false),
+                Function::ExternalLinkage,
+                GC_SAFE_ENTER_ANCHOR_NAME);
+            func->addFnAttr(Attribute::NoUnwind);
+            return func;
+        });
+
+    const WellKnownFunctionDescription GCSafeLeaveAnchor(
+        GC_SAFE_LEAVE_ANCHOR_NAME,
+        [](Type *T_size) {
+            auto &ctx = T_size->getContext();
+            auto func = Function::Create(
+                FunctionType::get(
+                    Type::getVoidTy(ctx),
+                    { PointerType::get(ctx, 0), Type::getInt8Ty(ctx) },
+                    false),
+                Function::ExternalLinkage,
+                GC_SAFE_LEAVE_ANCHOR_NAME);
+            func->addFnAttr(Attribute::NoUnwind);
+            return func;
+        });
+
+    const WellKnownFunctionDescription GCSafepointPoll(
+        GC_SAFEPOINT_POLL_NAME,
+        [](Type *T_size) {
+            auto &ctx = T_size->getContext();
+            auto func = Function::Create(
+                FunctionType::get(
+                    Type::getVoidTy(ctx),
+                    { PointerType::get(ctx, 0) },
+                    false),
+                Function::ExternalLinkage,
+                GC_SAFEPOINT_POLL_NAME);
+            func->addFnAttr(Attribute::NoUnwind);
+            return func;
+        });
 }

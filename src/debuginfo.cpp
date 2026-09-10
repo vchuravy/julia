@@ -364,6 +364,19 @@ void JITDebugInfoRegistry::registerJITObject(
     jl_jit_add_bytes(ObjectCopy->data.size());
     auto symbols = object::computeSymbolSizes(Object);
     bool hassection = false;
+    // Stackmap GC roots: the object's `.llvm_stackmaps` section (if any) and
+    // the extents of its functions, registered with the runtime below.
+    SmallVector<jl_stackmap_fn_bounds_t, 0> stackmap_fns;
+    uint64_t stackmap_addr = 0, stackmap_size = 0;
+    if (jl_gc_stackmaps_enabled) {
+        for (const object::SectionRef &Sec : Object.sections()) {
+            StringRef name = cantFail(Sec.getName());
+            if (name == ".llvm_stackmaps" || name == "__llvm_stackmaps") {
+                stackmap_addr = getLoadAddress(name);
+                stackmap_size = Sec.getSize();
+            }
+        }
+    }
     for (const auto &sym_size : symbols) {
         const object::SymbolRef &sym_iter = sym_size.first;
         object::SymbolRef::Type SymbolType = cantFail(sym_iter.getType());
@@ -379,6 +392,8 @@ void JITDebugInfoRegistry::registerJITObject(
         StringRef sName = cantFail(sym_iter.getName());
         uint64_t SectionSize = Section->getSize();
         size_t Size = sym_size.second;
+        if (stackmap_addr && Size > 0)
+            stackmap_fns.push_back({(uintptr_t)Addr, (uintptr_t)(Addr + Size)});
 #if defined(_OS_WINDOWS_)
         if (SectionAddrCheck)
             assert(SectionAddrCheck == SectionAddr &&
@@ -409,6 +424,12 @@ void JITDebugInfoRegistry::registerJITObject(
                 Section->getIndex()
                 }});
         });
+    }
+    if (stackmap_addr && stackmap_size) {
+        std::sort(stackmap_fns.begin(), stackmap_fns.end(),
+                  [](const jl_stackmap_fn_bounds_t &a, const jl_stackmap_fn_bounds_t &b) JL_NOTSAFEPOINT { return a.start < b.start; });
+        jl_stackmap_register((const void*)(uintptr_t)stackmap_addr, (size_t)stackmap_size,
+                             stackmap_fns.data(), stackmap_fns.size());
     }
     if (!hassection) // clang-sa demands that we do this to fool cplusplus.NewDeleteLeaks
         delete ObjectCopy;

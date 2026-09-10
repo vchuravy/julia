@@ -17,6 +17,9 @@ Value* FinalLowerGC::lowerGCAllocBytes(CallInst *target, Function &F)
     // (annotated by CancellationLowering) allocate through the reset-safe
     // entry points, which unpublish/republish the region themselves.
     bool resetSafe = target->hasMetadata("julia.reset_region");
+    // Keep the `julia.gcroots` bundle (stackmap mode) on the runtime call.
+    SmallVector<OperandBundleDef, 1> bundles;
+    target->getOperandBundlesAsDefs(bundles);
     uint64_t derefBytes = 0;
     if (auto CI = dyn_cast<ConstantInt>(target->getArgOperand(1))) {
         size_t sz = (size_t)CI->getZExtValue();
@@ -26,7 +29,7 @@ Value* FinalLowerGC::lowerGCAllocBytes(CallInst *target, Function &F)
         if (offset < 0) {
             newI = builder.CreateCall(
                 resetSafe ? bigAllocResetSafeFunc : bigAllocFunc,
-                { ptls, ConstantInt::get(T_size, sz + sizeof(void*)), type });
+                { ptls, ConstantInt::get(T_size, sz + sizeof(void*)), type }, bundles);
             if (sz > 0)
                 derefBytes = sz;
         }
@@ -34,7 +37,7 @@ Value* FinalLowerGC::lowerGCAllocBytes(CallInst *target, Function &F)
             auto pool_offs = ConstantInt::get(Type::getInt32Ty(F.getContext()), offset);
             auto pool_osize = ConstantInt::get(Type::getInt32Ty(F.getContext()), osize);
             newI = builder.CreateCall(resetSafe ? smallAllocResetSafeFunc : smallAllocFunc,
-                                      { ptls, pool_offs, pool_osize, type });
+                                      { ptls, pool_offs, pool_osize, type }, bundles);
             if (sz > 0)
                 derefBytes = sz;
         }
@@ -42,7 +45,7 @@ Value* FinalLowerGC::lowerGCAllocBytes(CallInst *target, Function &F)
         auto size = builder.CreateZExtOrTrunc(target->getArgOperand(1), T_size);
         // allocTypedFunc does not include the type tag in the allocation size!
         newI = builder.CreateCall(resetSafe ? allocTypedResetSafeFunc : allocTypedFunc,
-                                  { ptls, size, type });
+                                  { ptls, size, type }, bundles);
         derefBytes = sizeof(void*);
     }
     newI->setAttributes(newI->getCalledFunction()->getAttributes());

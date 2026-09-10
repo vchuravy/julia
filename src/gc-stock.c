@@ -2258,6 +2258,23 @@ STATIC_INLINE void gc_mark_stack(jl_ptls_t ptls, jl_gcframe_t *s, uint32_t nroot
     }
 }
 
+// Stackmap GC roots: mark the roots found by unwinding a task's machine frames
+static void gc_mark_task_frame_root(void *frame, jl_value_t *obj, void *arg) JL_NOTSAFEPOINT
+{
+    jl_ptls_t ptls = (jl_ptls_t)arg;
+    gc_try_claim_and_push(&ptls->gc_tls.mark_queue, obj, NULL);
+    gc_heap_snapshot_record_frame_to_object_edge(frame, obj);
+}
+
+STATIC_INLINE void gc_mark_task_frames(jl_ptls_t ptls, jl_task_t *ta, uintptr_t bits) JL_NOTSAFEPOINT
+{
+    jl_gc_anchor_stack_t *anchors = ta->gc_anchors;
+    if (anchors)
+        gc_setmark_buf(ptls, anchors, bits,
+                       offsetof(jl_gc_anchor_stack_t, anchors) + anchors->reserved_size * sizeof(jl_gc_anchor_t));
+    jl_gc_scan_task_frames(ta, gc_mark_task_frame_root, ptls);
+}
+
 // Mark exception stack
 STATIC_INLINE void gc_mark_excstack(jl_ptls_t ptls, jl_excstack_t *excstack, size_t itr) JL_NOTSAFEPOINT
 {
@@ -2531,6 +2548,8 @@ FORCE_INLINE void gc_mark_outrefs(jl_ptls_t ptls, jl_gc_markqueue_t *mq, void *_
                     assert(nroots <= UINT32_MAX);
                     gc_mark_stack(ptls, s, (uint32_t)nroots, offset, lb, ub);
                 }
+                if (jl_gc_stackmaps_enabled)
+                    gc_mark_task_frames(ptls, ta, bits);
                 if (ta->excstack) {
                     jl_excstack_t *excstack = ta->excstack;
                     gc_heap_snapshot_record_task_to_frame_edge(ta, excstack);
@@ -3786,12 +3805,20 @@ JL_DLLEXPORT void jl_gc_collect(jl_gc_collection_t collection)
     }
     jl_gc_debug_print();
 
+    // Stackmap GC roots: publish our register state so that whichever thread
+    // runs the collection can unwind this one (this frame outlives the GC).
+    bt_context_t gc_stack_ctx;
+    if (jl_gc_stackmaps_enabled) {
+        jl_unw_get(&gc_stack_ctx);
+        ptls->gc_stack_ctx = &gc_stack_ctx;
+    }
     int8_t old_state = jl_atomic_load_relaxed(&ptls->gc_state);
     jl_atomic_store_release(&ptls->gc_state, JL_GC_STATE_WAITING);
     // `jl_safepoint_start_gc()` makes sure only one thread can run the GC.
     uint64_t t0 = jl_hrtime();
     if (!jl_safepoint_start_gc(ct)) {
         // either another thread is running GC, or the GC got disabled just now.
+        ptls->gc_stack_ctx = NULL;
         jl_gc_state_set(ptls, old_state, JL_GC_STATE_WAITING);
         jl_safepoint_wait_thread_resume(ct); // block in thread-suspend now if requested, after clearing the gc_state
         if (old_state == JL_GC_STATE_UNSAFE)
@@ -3845,6 +3872,7 @@ JL_DLLEXPORT void jl_gc_collect(jl_gc_collection_t collection)
     gc_n_threads = 0;
     gc_all_tls_states = NULL;
     jl_safepoint_end_gc();
+    ptls->gc_stack_ctx = NULL;
     jl_gc_state_set(ptls, old_state, JL_GC_STATE_WAITING);
     JL_PROBE_GC_END();
     jl_safepoint_wait_thread_resume(ct); // block in thread-suspend now if requested, after clearing the gc_state

@@ -1423,7 +1423,7 @@ JL_DLLEXPORT void jl_pgcstack_getkey(jl_get_pgcstack_func_t *f, jl_pgcstack_key_
 extern pthread_mutex_t in_signal_lock;
 #endif
 
-void jl_set_gc_and_wait(jl_task_t *ct) JL_CANSAFEPOINT;
+void jl_set_gc_and_wait(jl_task_t *ct, void *ctx) JL_CANSAFEPOINT;
 void jl_gc_safe_enter_from_nonmutator(jl_ptls_t ptls) JL_CANSAFEPOINT_LEAVE;
 
 // Query if this object is perm-allocated in an image.
@@ -1637,6 +1637,55 @@ typedef int bt_cursor_t;
 size_t rec_backtrace(jl_bt_element_t *bt_data, size_t maxsize, int skip) JL_NOTSAFEPOINT;
 // Record backtrace from a signal handler. `ctx` is the context of the code
 // which was asynchronously interrupted.
+// Capture the current register context for unwinding. A macro because (like
+// setjmp) the context is invalid once the capturing function returns.
+#ifdef _OS_WINDOWS_
+#define jl_unw_get(context) (RtlCaptureContext(context), 0)
+#elif !defined(JL_DISABLE_LIBUNWIND)
+#define jl_unw_get(context) unw_getcontext(context)
+#else
+#define jl_unw_get(context) (-1)
+#endif
+
+// --- Stackmap GC roots (--gc-roots=stackmap; src/stackmaps.cpp, safepoint.c, stackwalk.c) ---
+// Set once at startup: the GC unwinds stacks and reads stackmap records, and
+// gc-safe transitions record frame anchors.
+extern JL_DLLEXPORT int jl_gc_stackmaps_enabled;
+typedef struct {
+    uintptr_t start;
+    uintptr_t end;
+} jl_stackmap_fn_bounds_t;
+// Register a `.llvm_stackmaps` blob (or several concatenated ones) whose
+// function addresses have been relocated. `fns` (optional, sorted by start)
+// gives function extents; otherwise each function extends to the next start.
+JL_DLLEXPORT void jl_stackmap_register(const void *data, size_t size,
+                                       const jl_stackmap_fn_bounds_t *fns, size_t nfns) JL_NOTSAFEPOINT;
+// Register the `.llvm_stackmaps` section of a loaded image (sysimage/pkgimage).
+// Returns 1 if the image had one.
+JL_DLLEXPORT int jl_stackmap_register_image(const char *path, uintptr_t base) JL_NOTSAFEPOINT;
+typedef void (*jl_gc_root_cb_t)(void *frame, jl_value_t *obj, void *arg) JL_NOTSAFEPOINT;
+// Report the roots of the frame at `ip` (a return address unless
+// `is_return_address` is 0) using the unwind cursor for register values.
+void jl_stackmap_visit_frame(uintptr_t ip, int is_return_address, bt_cursor_t *cursor,
+                             jl_gc_root_cb_t cb, void *arg, void *verify) JL_NOTSAFEPOINT;
+// Verification mode (--gc-roots=both): collect what the unwinder found and
+// cross-check it against the task's shadow stack.
+void *jl_stackmap_verify_begin(void) JL_NOTSAFEPOINT;
+void jl_stackmap_verify_note_sp(void *verify, uintptr_t sp) JL_NOTSAFEPOINT;
+void jl_stackmap_verify_end(void *verify, jl_task_t *t, size_t nframes) JL_NOTSAFEPOINT;
+// Unwind all Julia frames of task `t` (running, stopped or suspended) and
+// report their stackmap roots. Returns the number of frames visited.
+size_t jl_gc_scan_task_frames(jl_task_t *t, jl_gc_root_cb_t cb, void *arg) JL_NOTSAFEPOINT;
+// Fill an anchor with the register state of the frame `skip` levels above the
+// caller of this function (0 = the caller itself). Returns 0 on failure.
+int jl_gc_capture_anchor(jl_gc_anchor_t *anchor, int skip) JL_NOTSAFEPOINT;
+int8_t jl_gc_safe_enter_anchor_impl(jl_ptls_t ptls, const jl_gc_anchor_t *anchor) JL_CANSAFEPOINT_LEAVE;
+// Drop the anchors of frames at or below stack pointer `sp` (a non-local exit
+// abandoned them).
+void jl_gc_anchors_trim(jl_task_t *ct, uintptr_t sp) JL_NOTSAFEPOINT;
+// Out-of-line safepoint poll used by stackmap-mode code.
+JL_DLLEXPORT void jl_gc_safepoint_poll(size_t *signal_page);
+
 size_t rec_backtrace_ctx(jl_bt_element_t *bt_data, size_t maxsize, bt_context_t *ctx,
                          jl_gcframe_t *pgcstack) JL_NOTSAFEPOINT;
 #ifdef LLVMLIBUNWIND

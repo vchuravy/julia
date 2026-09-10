@@ -11,17 +11,11 @@
 #include "threading.h"
 #include "julia_assert.h"
 
-// define `jl_unw_get` as a macro, since (like setjmp)
-// returning from the callee function will invalidate the context
+// `jl_unw_get` is defined in julia_internal.h
 #ifdef _OS_WINDOWS_
 #include <winternl.h>
 uv_mutex_t jl_in_stackwalk;
 uv_mutex_t jl_dll_notify_lock;
-#define jl_unw_get(context) (RtlCaptureContext(context), 0)
-#elif !defined(JL_DISABLE_LIBUNWIND)
-#define jl_unw_get(context) unw_getcontext(context)
-#else
-int jl_unw_get(void *context) { return -1; }
 #endif
 
 #ifdef __cplusplus
@@ -1762,6 +1756,154 @@ JL_DLLEXPORT void jl_print_task_backtraces(int show_done) JL_NOTSAFEPOINT
 {
     jl_fprint_task_backtraces(ios_safe_stderr, show_done);
 }
+
+
+// --- Stackmap GC roots: unwind the frames of a task ------------------------------------
+//
+// See stackmaps.cpp for the record lookup and julia_threads.h for the anchor
+// design. The walk starts from the register state the runtime captured for the
+// task (signal context of a thread stopped at a poll, getcontext of a thread in
+// jl_gc_collect, the saved jmp_buf of a suspended task) and continues with CFI.
+// Frames of foreign code without unwind info end a walk; the task's anchors
+// (recorded on gc-safe transitions, below any such frames) restart it.
+
+#if !defined(_OS_WINDOWS_) && !defined(JL_DISABLE_LIBUNWIND)
+
+static void jl_gc_anchor_to_context(const jl_gc_anchor_t *a, bt_context_t *c) JL_NOTSAFEPOINT
+{
+    memset(c, 0, sizeof(*c));
+#if defined(_CPU_X86_64_) && defined(_OS_LINUX_)
+    mcontext_t *mc = &c->uc_mcontext;
+    mc->gregs[REG_RIP] = a->pc;
+    mc->gregs[REG_RSP] = a->sp;
+    mc->gregs[REG_RBP] = a->fp;
+    mc->gregs[REG_RBX] = a->regs[0];
+    mc->gregs[REG_R12] = a->regs[1];
+    mc->gregs[REG_R13] = a->regs[2];
+    mc->gregs[REG_R14] = a->regs[3];
+    mc->gregs[REG_R15] = a->regs[4];
+#else
+    (void)a;
+#endif
+}
+
+static size_t jl_gc_scan_frames_ctx(bt_context_t *ctx, int from_signal, int first_is_return,
+                                    uintptr_t *max_sp, jl_gc_root_cb_t cb, void *arg, void *verify) JL_NOTSAFEPOINT
+{
+    bt_cursor_t cursor;
+    if (!jl_unw_init(&cursor, ctx, from_signal))
+        return 0;
+    size_t n = 0;
+    int is_ret = first_is_return;
+    while (1) {
+        unw_word_t ip = 0, sp = 0;
+        if (unw_get_reg(&cursor, UNW_REG_IP, &ip) < 0 || unw_get_reg(&cursor, UNW_REG_SP, &sp) < 0)
+            break;
+        if (ip == 0)
+            break;
+        if ((uintptr_t)sp > *max_sp)
+            *max_sp = (uintptr_t)sp;
+        if (verify)
+            jl_stackmap_verify_note_sp(verify, (uintptr_t)sp);
+        jl_stackmap_visit_frame((uintptr_t)ip, is_ret, &cursor, cb, arg, verify);
+        n++;
+        is_ret = 1;
+        if (unw_step(&cursor) <= 0)
+            break;
+    }
+    return n;
+}
+
+size_t jl_gc_scan_task_frames(jl_task_t *t, jl_gc_root_cb_t cb, void *arg)
+{
+    bt_context_t c;
+    bt_context_t *ctx = NULL;
+    jl_ptls_t ptls2 = t->ptls;
+    if (ptls2 != NULL) {
+        // running on a thread: either stopped with a published context
+        // (WAITING) or gc-safe (anchors only)
+        ctx = (bt_context_t*)ptls2->gc_stack_ctx;
+    }
+    else if (t->ctx.started && jl_atomic_load_relaxed(&t->_state) == JL_TASK_STATE_RUNNABLE &&
+             !t->ctx.copy_stack && t->ctx.ctx != NULL) {
+        // suspended in ctx_switch
+#if defined(JL_TASK_SWITCH_LIBUNWIND)
+        ctx = t->ctx.ctx;
+#else
+        memset(&c, 0, sizeof(c));
+        if (jl_simulate_longjmp(t->ctx.ctx->uc_mcontext, &c, 1))
+            ctx = &c;
+#endif
+    }
+    uintptr_t max_sp = 0;
+    size_t n = 0;
+    void *verify = jl_options.gc_roots == JL_GC_ROOTS_BOTH ? jl_stackmap_verify_begin() : NULL;
+    if (ctx)
+        n += jl_gc_scan_frames_ctx(ctx, 1, 0, &max_sp, cb, arg, verify);
+    jl_gc_anchor_stack_t *as = t->gc_anchors;
+    if (as) {
+        for (size_t i = as->top; i-- > 0;) {
+            const jl_gc_anchor_t *a = &as->anchors[i];
+            if (a->sp <= max_sp)
+                continue; // the walk above already reached this frame
+            bt_context_t ac;
+            jl_gc_anchor_to_context(a, &ac);
+            n += jl_gc_scan_frames_ctx(&ac, 0, 1, &max_sp, cb, arg, verify);
+        }
+    }
+    if (verify)
+        jl_stackmap_verify_end(verify, t, n);
+    return n;
+}
+
+NOINLINE int jl_gc_capture_anchor(jl_gc_anchor_t *anchor, int skip)
+{
+    // Make this frame save every callee-saved register so that the CFI walk
+    // below recovers the caller's values.
+    __builtin_unwind_init();
+    bt_context_t ctx;
+    jl_unw_get(&ctx);
+    bt_cursor_t cursor;
+    if (!jl_unw_init(&cursor, &ctx, 1))
+        return 0;
+    for (int i = 0; i < skip + 1; i++) {
+        if (unw_step(&cursor) <= 0)
+            return 0;
+    }
+    unw_word_t v;
+    if (unw_get_reg(&cursor, UNW_REG_IP, &v) < 0) return 0;
+    anchor->pc = v;
+    if (unw_get_reg(&cursor, UNW_REG_SP, &v) < 0) return 0;
+    anchor->sp = v;
+#if defined(_CPU_X86_64_)
+    if (unw_get_reg(&cursor, UNW_X86_64_RBP, &v) < 0) return 0;
+    anchor->fp = v;
+    static const int regs[JL_GC_ANCHOR_NREGS] = {UNW_X86_64_RBX, UNW_X86_64_R12, UNW_X86_64_R13, UNW_X86_64_R14, UNW_X86_64_R15};
+    for (int i = 0; i < JL_GC_ANCHOR_NREGS; i++) {
+        if (unw_get_reg(&cursor, regs[i], &v) < 0) return 0;
+        anchor->regs[i] = v;
+    }
+#else
+    anchor->fp = 0;
+#endif
+    return 1;
+}
+
+#else // Windows or no libunwind
+
+size_t jl_gc_scan_task_frames(jl_task_t *t, jl_gc_root_cb_t cb, void *arg)
+{
+    (void)t; (void)cb; (void)arg;
+    return 0;
+}
+
+int jl_gc_capture_anchor(jl_gc_anchor_t *anchor, int skip)
+{
+    (void)anchor; (void)skip;
+    return 0;
+}
+
+#endif
 
 #ifdef __cplusplus
 }

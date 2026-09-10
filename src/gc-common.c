@@ -587,6 +587,7 @@ STATIC_INLINE void reset_region_deliver_pending(jl_task_t *ct)
         return;
     ct->gcstack = reset_ctx->gcstack;
     ct->eh = reset_ctx->eh;
+    jl_gc_anchors_trim(ct, reset_ctx->sp);
     asan_unpoison_task_stack(ct, &reset_ctx->mctx);
     jl_longjmp(reset_ctx->mctx, JL_RESET_CODE_CANCEL);
 }

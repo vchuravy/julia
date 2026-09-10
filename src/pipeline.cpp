@@ -583,8 +583,8 @@ static void buildIntrinsicLoweringPipeline(ModulePassManager &MPM, PassBuilder *
         {
             FunctionPassManager FPM;
             JULIA_PASS(FPM.addPass(CancellationLoweringPass())); // Lower cancellation points to setjmp (before GC lowering)
-            JULIA_PASS(FPM.addPass(LateLowerGCPass()));
-            JULIA_PASS(FPM.addPass(FinalLowerGCPass()));
+            JULIA_PASS(FPM.addPass(LateLowerGCPass(GCRootMode(options.gc_stackmaps, options.gc_shadowstack))));
+            JULIA_PASS(FPM.addPass(FinalLowerGCPass(GCRootMode(options.gc_stackmaps, options.gc_shadowstack))));
             JULIA_PASS(FPM.addPass(ExpandAtomicModifyPass())); // after LateLowerGCPass so that all IPO is valid
             MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
         }
@@ -600,6 +600,13 @@ static void buildIntrinsicLoweringPipeline(ModulePassManager &MPM, PassBuilder *
             }
             FPM.addPass(InstCombinePass());
             FPM.addPass(SimplifyCFGPass(aggressiveSimplifyCFGOptions()));
+            MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+        }
+        if (options.gc_stackmaps) {
+            // Must run last: turns the safepoint calls carrying `julia.gcroots` bundles into
+            // gc.statepoints whose stackmap records the GC reads (see stackmaps.cpp).
+            FunctionPassManager FPM;
+            JULIA_PASS(FPM.addPass(EmitGCStatepointsPass()));
             MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
         }
     }
@@ -1070,6 +1077,8 @@ static std::optional<std::pair<OptimizationLevel, OptimizationOptions>> parseJul
             OPTION(sanitize_memory),
             OPTION(sanitize_thread),
             OPTION(sanitize_address),
+            OPTION(gc_stackmaps),
+            OPTION(gc_shadowstack),
 #undef OPTION
         };
         while (!name.empty()) {

@@ -444,6 +444,7 @@ static void jl_send_reset_signal(int16_t tid, int reset_code) JL_NOTSAFEPOINT
     // inside a callee whose pushes onto either chain die with the abandoned
     // stack region.
     ct2->gcstack = reset_ctx->gcstack;
+    jl_gc_anchors_trim(ct2, reset_ctx->sp);
     ct2->eh = reset_ctx->eh;
     goto resume;
 republish:
@@ -562,7 +563,7 @@ LONG WINAPI jl_exception_handler(struct _EXCEPTION_POINTERS *ExceptionInfo)
             break;
         case EXCEPTION_ACCESS_VIOLATION:
             if (jl_addr_is_safepoint(ExceptionInfo->ExceptionRecord->ExceptionInformation[1])) {
-                jl_set_gc_and_wait(ct);
+                jl_set_gc_and_wait(ct, NULL);
                 // (The sigint force-throw that lived here is gone: SIGINT is
                 // delivered through the cancellation system - see
                 // jl_sigint_request_cancellation - and nothing arms the

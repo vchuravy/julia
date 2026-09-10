@@ -536,7 +536,8 @@ JL_NO_ASAN static void segv_handler(int sig, siginfo_t *info, void *context) JL_
         return;
     }
     if (sig == SIGSEGV && info->si_code == SEGV_ACCERR && jl_addr_is_safepoint((uintptr_t)info->si_addr) && !is_write_fault(context)) {
-        jl_set_gc_and_wait(ct);
+        // stackmap GC roots: let the GC unwind this thread from the interrupted state
+        jl_set_gc_and_wait(ct, jl_to_bt_context(context));
         // (vestigial thread-0 gate from the old sigint force-throw, which
         // is now delivered through the cancellation system instead - see
         // jl_sigint_request_cancellation; nothing arms the sigint page
@@ -848,6 +849,7 @@ static void usr2_deliver_reset(jl_task_t *ct, jl_ptls_t ptls, uint8_t reqflags,
                 jl_atomic_store_relaxed(&ct->reset_ctx, NULL);
                 ct->gcstack = reset_ctx->gcstack;
                 ct->eh = reset_ctx->eh;
+                jl_gc_anchors_trim(ct, reset_ctx->sp);
                 // The frames being abandoned were never unwound by the
                 // sanitizer's longjmp interceptor, so unpoison them
                 // explicitly.

@@ -103,6 +103,8 @@ struct OptimizationOptions {
     bool sanitize_memory;
     bool sanitize_thread;
     bool sanitize_address;
+    bool gc_stackmaps;
+    bool gc_shadowstack;
 
     static constexpr OptimizationOptions defaults(
         bool lower_intrinsics=true,
@@ -130,10 +132,12 @@ struct OptimizationOptions {
         bool sanitize_thread=false,
 #endif
 #ifdef _COMPILER_ASAN_ENABLED_
-        bool sanitize_address=true
+        bool sanitize_address=true,
 #else
-        bool sanitize_address=false
+        bool sanitize_address=false,
 #endif
+        bool gc_stackmaps=false,
+        bool gc_shadowstack=true
 ) JL_NOTSAFEPOINT {
         return {lower_intrinsics,
                 dump_native,
@@ -151,7 +155,9 @@ struct OptimizationOptions {
                 warn_missed_transformations,
                 sanitize_memory,
                 sanitize_thread,
-                sanitize_address};
+                sanitize_address,
+                gc_stackmaps,
+                gc_shadowstack};
     }
 };
 

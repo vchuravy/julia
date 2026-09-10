@@ -732,6 +732,7 @@ static int NoteSafepoint(State &S, BBState &BBS, CallInst *CI, SmallVectorImpl<i
     assert(BBS.FirstSafepoint == -1 || BBS.FirstSafepoint == S.MaxSafepointNumber);
     int Number = ++S.MaxSafepointNumber;
     S.SafepointNumbering.push_back(CI);
+    S.SafepointIndex[CI] = Number;
     // Note which pointers are upward exposed live here. They need to be
     // considered live at this safepoint even when they have a def earlier
     // in this BB (i.e. even when they don't participate in the dataflow
@@ -1324,6 +1325,12 @@ State LateLowerGCFrame::LocalScan(Function &F) {
                     S.ReturnsTwice.push_back(SafepointNumber);
                     HasDefBefore = true;
                 }
+                else if (Mode.stackmaps && !isStatepointable(CI)) {
+                    // No exact record can be emitted for this call: keep its
+                    // live roots in dedicated memory slots (like returns_twice)
+                    // so the whole-frame record covers them.
+                    S.ReturnsTwice.push_back(SafepointNumber);
+                }
                 if (HasDefBefore) // With sret, the Def happens before the instruction instead of after
                     BBS.FirstSafepointAfterFirstDef = SafepointNumber;
                 continue;
@@ -1821,6 +1828,28 @@ static inline void UpdatePtrNumbering(Value *From, Value *To, State *S)
 {
     if (!S)
         return;
+    if (auto *FromI = dyn_cast<Instruction>(From)) {
+        auto sit = S->SafepointIndex.find(FromI);
+        if (sit != S->SafepointIndex.end()) {
+            int Idx = sit->second;
+            S->SafepointIndex.erase(sit);
+            Instruction *ToI = To ? dyn_cast<CallInst>(To) : nullptr;
+            S->SafepointNumbering[Idx] = ToI;
+            if (ToI)
+                S->SafepointIndex[ToI] = Idx;
+        }
+    }
+    auto cit = S->AllCompositeNumbering.find(From);
+    if (cit != S->AllCompositeNumbering.end()) {
+        auto Nums = std::move(cit->second);
+        S->AllCompositeNumbering.erase(cit);
+        if (To) {
+            for (int Num : Nums)
+                if (Num >= 0)
+                    S->ReversePtrNumbering[Num] = To;
+            S->AllCompositeNumbering[To] = std::move(Nums);
+        }
+    }
     auto it = S->AllPtrNumbering.find(From);
     if (it == S->AllPtrNumbering.end())
         return;
@@ -1828,6 +1857,9 @@ static inline void UpdatePtrNumbering(Value *From, Value *To, State *S)
     S->AllPtrNumbering.erase(it);
     if (To) {
         S->AllPtrNumbering[To] = Num;
+        // keep the reverse map usable after CleanupIR (AttachGCRootBundles)
+        if (Num >= 0 && S->ReversePtrNumbering.count(Num) && S->ReversePtrNumbering[Num] == From)
+            S->ReversePtrNumbering[Num] = To;
     }
 }
 
@@ -2268,8 +2300,8 @@ bool LateLowerGCFrame::CleanupIR(Function &F, State *S, bool *CFGModified) {
             }
             if (!CI->use_empty()) {
                 CI->replaceAllUsesWith(UndefValue::get(CI->getType()));
-                UpdatePtrNumbering(CI, nullptr, S);
             }
+            UpdatePtrNumbering(CI, nullptr, S);
             it = CI->eraseFromParent();
             ChangesMade = true;
         }
@@ -2359,9 +2391,34 @@ void LateLowerGCFrame::PlaceGCFrameReset(State &S, unsigned R, unsigned MinColor
 #endif
 }
 
-void LateLowerGCFrame::PlaceGCFrameStores(State &S, unsigned MinColorRoot,
-                                          ArrayRef<int> Colors, int PreAssignedColors, Value *GCFrame)
+void LateLowerGCFrame::PlaceGCFrameResetSlot(unsigned Slot, Value *GCFrame, Instruction *InsertBefore)
 {
+    llvm_dialects::Builder builder(InsertBefore);
+    auto slotAddress = builder.create<julia::GetGCFrameSlot>(
+        GCFrame, ConstantInt::get(Type::getInt32Ty(InsertBefore->getContext()), Slot),
+        "gc_slot_addr_" + StringRef(std::to_string(Slot)));
+    Value *Val = ConstantPointerNull::get(T_prjlvalue);
+#if JL_LLVM_VERSION >= 200000
+    new StoreInst(Val, slotAddress, InsertBefore->getIterator());
+#else
+    new StoreInst(Val, slotAddress, InsertBefore);
+#endif
+}
+
+void LateLowerGCFrame::PlaceGCFrameStores(State &S, unsigned MinColorRoot,
+                                          ArrayRef<int> Colors, int PreAssignedColors, Value *GCFrame,
+                                          bool OnlyPreAssigned)
+{
+    // Verification mode (--gc-roots=both): the GC cross-checks the shadow-stack
+    // slots against the statepoint records, so the frame must hold exactly the
+    // live set at every safepoint. The regular placement leaves slots stale when
+    // a value dies on only some paths into a block, so here every non-live slot
+    // is reset at every safepoint (cost is irrelevant in this mode).
+    bool ResetAllDead = Mode.stackmaps && Mode.shadowstack;
+    int MaxColor = -1;
+    for (int C : Colors)
+        if (C > MaxColor)
+            MaxColor = C;
     for (auto &BB : *S.F) {
         const BBState &BBS = S.BBStates[&BB];
         if (!BBS.HasSafepoint)
@@ -2372,15 +2429,30 @@ void LateLowerGCFrame::PlaceGCFrameStores(State &S, unsigned MinColorRoot,
         for (int Safepoint = BBS.FirstSafepoint; Safepoint >= BBS.LastSafepoint; --Safepoint) {
             const LargeSparseBitVector &NowLive = S.LiveSets[Safepoint];
             // reset slots which are no longer alive
-            for (int Idx : *LastLive) {
-                if (Colors[Idx] >= PreAssignedColors && !HasBitSet(NowLive, Idx)) {
-                    PlaceGCFrameReset(S, Idx, MinColorRoot, Colors, GCFrame,
-                        S.SafepointNumbering[Safepoint]);
+            // (in stackmap mode only the pre-assigned colors live in the frame,
+            // and those are never reset, so there is nothing to do)
+            if (ResetAllDead) {
+                SmallVector<bool, 32> LiveColor(MaxColor + 1, false);
+                for (int Idx : NowLive)
+                    if (Colors[Idx] >= 0)
+                        LiveColor[Colors[Idx]] = true;
+                for (int C = PreAssignedColors; C <= MaxColor; C++)
+                    if (!LiveColor[C])
+                        PlaceGCFrameResetSlot(C + MinColorRoot, GCFrame, S.SafepointNumbering[Safepoint]);
+            }
+            else if (!OnlyPreAssigned) {
+                for (int Idx : *LastLive) {
+                    if (Colors[Idx] >= PreAssignedColors && !HasBitSet(NowLive, Idx)) {
+                        PlaceGCFrameReset(S, Idx, MinColorRoot, Colors, GCFrame,
+                            S.SafepointNumbering[Safepoint]);
+                    }
                 }
             }
             // store values which are alive in this safepoint but
             // haven't been stored in the GC frame before
             for (int Idx : NowLive) {
+                if (OnlyPreAssigned && Colors[Idx] >= PreAssignedColors)
+                    continue;
                 if (!HasBitSet(*LastLive, Idx)) {
                     PlaceGCFrameStore(S, Idx, MinColorRoot, Colors, GCFrame,
                       S.SafepointNumbering[Safepoint]);
@@ -2400,18 +2472,28 @@ void LateLowerGCFrame::PlaceRootsAndUpdateCalls(ArrayRef<int> Colors, int PreAss
         if (C > MaxColor)
             MaxColor = C;
 
+    // In stackmap-only mode the frame holds just the roots that must stay in
+    // memory (sret/array slots, tracked stores and the pre-assigned colors for
+    // returns_twice); everything else is reported to LLVM as statepoint deopt
+    // operands by AttachGCRootBundles.
+    bool MemOnly = Mode.stackmaps && !Mode.shadowstack;
+    int MaxFrameColor = MemOnly ? PreAssignedColors - 1 : MaxColor;
+
     // Insert instructions for the actual gc frame
-    if (MaxColor != -1 || !S.ArrayAllocas.empty() || !S.TrackedStores.empty()) {
+    if (MaxFrameColor != -1 || !S.ArrayAllocas.empty() || !S.TrackedStores.empty()) {
         // Create and push a GC frame.
         llvm_dialects::Builder entryBuilder(&F->getEntryBlock(), F->getEntryBlock().begin());
         auto gcframe = entryBuilder.create<julia::NewGCFrame>(
             ConstantInt::get(T_int32, 0), "gcframe");
 
-        Instruction *pushAnchor = isa<Argument>(pgcstack) ?
-            static_cast<Instruction*>(gcframe) : cast<Instruction>(pgcstack);
-        llvm_dialects::Builder pushBuilder(pushAnchor->getParent(), std::next(pushAnchor->getIterator()));
-        auto pushGcframe = pushBuilder.create<julia::PushGCFrame>(
-            gcframe, ConstantInt::get(T_int32, 0));
+        julia::PushGCFrame *pushGcframe = nullptr;
+        if (Mode.shadowstack) {
+            Instruction *pushAnchor = isa<Argument>(pgcstack) ?
+                static_cast<Instruction*>(gcframe) : cast<Instruction>(pgcstack);
+            llvm_dialects::Builder pushBuilder(pushAnchor->getParent(), std::next(pushAnchor->getIterator()));
+            pushGcframe = pushBuilder.create<julia::PushGCFrame>(
+                gcframe, ConstantInt::get(T_int32, 0));
+        }
 
         // we don't run memsetopt after this, so run a basic approximation of it
         // that removes any redundant memset calls in the prologue since getGCFrameSlot already includes the null store
@@ -2511,21 +2593,125 @@ void LateLowerGCFrame::PlaceRootsAndUpdateCalls(ArrayRef<int> Colors, int PreAss
                 AllocaSlot++;
             }
         }
-        auto NRoots = ConstantInt::get(T_int32, MaxColor + 1 + AllocaSlot - 2);
+        auto NRoots = ConstantInt::get(T_int32, MaxFrameColor + 1 + AllocaSlot - 2);
         gcframe->setArgOperand(0, NRoots);
         if (FrameAlign > Align(16))
             gcframe->addRetAttr(Attribute::getWithAlignment(F->getContext(), FrameAlign));
-        pushGcframe->setArgOperand(1, NRoots);
+        if (pushGcframe)
+            pushGcframe->setArgOperand(1, NRoots);
+        if (Mode.stackmaps) {
+            // Tell FinalLowerGC how many leading slots hold memory-resident roots
+            // (the whole-frame stackmap record covers exactly those; in `both`
+            // mode the remaining slots are only used by the shadow stack and by
+            // the verifier).
+            auto MemSlots = ConstantInt::get(T_int32, PreAssignedColors + AllocaSlot - 2);
+            gcframe->setMetadata("julia.gc_memslots",
+                MDNode::get(F->getContext(), {ConstantAsMetadata::get(MemSlots)}));
+        }
 
         // Insert GC frame stores
-        PlaceGCFrameStores(S, AllocaSlot - 2, Colors, PreAssignedColors, gcframe);
+        PlaceGCFrameStores(S, AllocaSlot - 2, Colors, PreAssignedColors, gcframe, MemOnly);
         // Insert GCFrame pops
-        for (auto &BB : *F) {
-            if (isa<ReturnInst>(BB.getTerminator())) {
-                llvm_dialects::Builder popBuilder(BB.getTerminator());
-                popBuilder.create<julia::PopGCFrame>(gcframe);
+        if (Mode.shadowstack) {
+            for (auto &BB : *F) {
+                if (isa<ReturnInst>(BB.getTerminator())) {
+                    llvm_dialects::Builder popBuilder(BB.getTerminator());
+                    popBuilder.create<julia::PopGCFrame>(gcframe);
+                }
             }
         }
+    }
+}
+
+// Stackmap mode: replace the inline gc_state stores that CleanupIR would emit
+// for a `gc-transition` (gc-safe ccall) with calls to runtime helpers that also
+// record a per-task frame anchor. The GC unwinds from that anchor to find the
+// roots of frames below foreign code that has no CFI. The helper calls are
+// ordinary calls, so LocalScan treats them as safepoints and they receive their
+// own stackmap records.
+// Whether EmitGCStatepoints can wrap this call in a gc.statepoint. LLVM's
+// statepoint lowering does not support non-void variadic callees.
+bool LateLowerGCFrame::isStatepointable(CallInst *CI)
+{
+    if (isa<IntrinsicInst>(CI) || isa<InlineAsm>(CI->getCalledOperand()))
+        return false;
+    FunctionType *FT = CI->getFunctionType();
+    if (FT->isVarArg() && !FT->getReturnType()->isVoidTy())
+        return false;
+    return true;
+}
+
+void LateLowerGCFrame::LowerGCTransitions(Function &F)
+{
+    SmallVector<CallInst *, 0> Transitions;
+    for (BasicBlock &BB : F) {
+        for (Instruction &I : BB) {
+            auto *CI = dyn_cast<CallInst>(&I);
+            if (CI && CI->getOperandBundle("gc-transition"))
+                Transitions.push_back(CI);
+        }
+    }
+    if (Transitions.empty())
+        return;
+    auto &ctx = F.getContext();
+    Function *enterFunc = getOrDeclare(jl_well_known::GCSafeEnterAnchor);
+    Function *leaveFunc = getOrDeclare(jl_well_known::GCSafeLeaveAnchor);
+    for (CallInst *CI : Transitions) {
+        Value *ptls = CI->getOperandBundle("gc-transition")->Inputs[0];
+        IRBuilder<> builder(CI);
+        builder.SetCurrentDebugLocation(CI->getDebugLoc());
+        Value *fp = builder.CreateIntrinsic(Intrinsic::frameaddress,
+            {PointerType::getUnqual(ctx)}, {builder.getInt32(0)});
+        Value *old_state = builder.CreateCall(enterFunc, {ptls, fp}, "gc_state_prev");
+        // Re-create the call without the gc-transition bundle.
+        SmallVector<OperandBundleDef, 2> bundles;
+        CI->getOperandBundlesAsDefs(bundles);
+        bundles.erase(std::remove_if(bundles.begin(), bundles.end(),
+            [](const OperandBundleDef &B) { return B.getTag() == "gc-transition"; }), bundles.end());
+        CallInst *NewCI = CallInst::Create(CI, bundles, CI->getIterator());
+        NewCI->takeName(CI);
+        NewCI->copyMetadata(*CI);
+        CI->replaceAllUsesWith(NewCI);
+        CI->eraseFromParent();
+        builder.SetInsertPoint(NewCI->getNextNode());
+        builder.CreateCall(leaveFunc, {ptls, old_state});
+    }
+}
+
+void LateLowerGCFrame::AttachGCRootBundles(State &S, ArrayRef<int> Colors, int PreAssignedColors)
+{
+    for (int Idx = 0; Idx <= S.MaxSafepointNumber; ++Idx) {
+        Instruction *I = S.SafepointNumbering[Idx];
+        if (!I)
+            continue; // erased by CleanupIR
+        auto *CI = cast<CallInst>(I);
+        // Everything live across a returns_twice call (or a call that cannot
+        // be wrapped in a statepoint) is pre-assigned to a memory slot, so
+        // there is nothing to report.
+        if (CI->canReturnTwice() || !isStatepointable(CI))
+            continue;
+        if (isa<IntrinsicInst>(CI))
+            continue;
+        SmallVector<Value *, 8> Roots;
+        for (int Num : S.LiveSets[Idx]) {
+            // Pre-assigned colors (and values that never needed a color) are
+            // covered by the whole-frame record.
+            if (Colors[Num] < PreAssignedColors)
+                continue;
+            Value *V = GetPtrForNumber(S, Num, CI);
+            if (isa<Constant>(V))
+                continue;
+            Roots.push_back(V);
+        }
+        SmallVector<OperandBundleDef, 2> bundles;
+        CI->getOperandBundlesAsDefs(bundles);
+        bundles.emplace_back("julia.gcroots", Roots);
+        CallInst *NewCI = CallInst::Create(CI, bundles, CI->getIterator());
+        NewCI->takeName(CI);
+        NewCI->copyMetadata(*CI);
+        CI->replaceAllUsesWith(NewCI);
+        UpdatePtrNumbering(CI, NewCI, &S);
+        CI->eraseFromParent();
     }
 }
 
@@ -2539,7 +2725,11 @@ bool LateLowerGCFrame::runOnFunction(Function &F, bool *CFGModified) {
 
     pgcstack = getPGCstack(F);
     if (pgcstack) {
+      if (Mode.stackmaps)
+          LowerGCTransitions(F);
       State S = LocalScan(F);
+      std::pair<SmallVector<int, 0>, int> Colors;
+      bool HaveRoots = false;
       // If there is no safepoint after the first reachable def, then we don't need any roots (even those for allocas)
       if (std::any_of(S.BBStates.begin(), S.BBStates.end(),
                   [&F](auto BBS) {
@@ -2548,11 +2738,14 @@ bool LateLowerGCFrame::runOnFunction(Function &F, bool *CFGModified) {
                       return BBS.second.HasSafepoint;
                   })) {
         ComputeLiveness(S);
-        auto Colors = ColorRoots(S);
+        Colors = ColorRoots(S);
         std::map<Value *, std::pair<int, int>> CallFrames; // = OptimizeCallFrames(S, Ordering);
         PlaceRootsAndUpdateCalls(Colors.first, Colors.second, S, CallFrames);
+        HaveRoots = true;
       }
       CleanupIR(F, &S, CFGModified);
+      if (Mode.stackmaps && HaveRoots)
+          AttachGCRootBundles(S, Colors.first, Colors.second);
     }
     else {
       CleanupIR(F, nullptr, CFGModified);
@@ -2567,7 +2760,7 @@ PreservedAnalyses LateLowerGCPass::run(Function &F, FunctionAnalysisManager &AM)
     auto GetDT = [&AM, &F]() -> DominatorTree & {
         return AM.getResult<DominatorTreeAnalysis>(F);
     };
-    auto lateLowerGCFrame = LateLowerGCFrame(GetDT);
+    auto lateLowerGCFrame = LateLowerGCFrame(GetDT, Mode);
     bool CFGModified = false;
     bool modified = lateLowerGCFrame.runOnFunction(F, &CFGModified);
 #ifdef JL_VERIFY_PASSES

@@ -1398,6 +1398,8 @@ namespace {
             auto TM = cantFail(JTMB.createTargetMachine());
             fixupTM(*TM);
             auto options = OptimizationOptions::defaults();
+            options.gc_stackmaps = jl_options.gc_roots != JL_GC_ROOTS_SHADOWSTACK;
+            options.gc_shadowstack = jl_options.gc_roots != JL_GC_ROOTS_STACKMAP;
             auto NPM = std::make_unique<NewPM>(std::move(TM), O, options);
             // TODO this needs to be locked, as different resource pools may add to the printer vector at the same time
             {
@@ -2552,6 +2554,17 @@ bool JuliaOJIT::linkOutput(orc::MaterializationResponsibility &MR, MemoryBufferR
         if (Sym->hasName() && KnownCISyms.contains(Sym->getName()) &&
             !OwnedSyms.contains(Sym->getName()))
             makeAnonymousLinkGraphSymbol(G, *Sym);
+    }
+    // Stackmap GC roots: every object with statepoints defines `__LLVM_StackMaps`
+    // at the start of its `.llvm_stackmaps` section. Keep the section alive
+    // (nothing references it) and make the symbol local so that objects do not
+    // clash in the JITDylib. The runtime finds the section by name
+    // (debuginfo.cpp), not through the symbol.
+    for (auto *Sym : DefinedSyms) {
+        if (Sym->hasName() && *Sym->getName() == "__LLVM_StackMaps") {
+            Sym->setScope(jitlink::Scope::Local);
+            Sym->setLive(true);
+        }
     }
 
     // Rename globals and add mappings

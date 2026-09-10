@@ -18,6 +18,12 @@ sysbase-debug: $(build_private_libdir)/sysbase-debug.$(SHLIB_EXT)
 
 VERSDIR := v$(shell cut -d. -f1-2 < $(JULIAHOME)/VERSION)
 
+# Experimental: build the system image with LLVM stackmap GC roots (see --gc-roots).
+# Set JULIA_GC_ROOTS=stackmap (or both) in Make.user.
+ifneq ($(JULIA_GC_ROOTS),)
+JULIA_SYSIMG_BUILD_FLAGS += --experimental --gc-roots=$(JULIA_GC_ROOTS)
+endif
+
 $(build_private_libdir)/%.$(SHLIB_EXT): $(build_private_libdir)/%-o.a
 	@$(call PRINT_LINK, $(call link-dll,$@, \
 		--disable-auto-import --disable-runtime-pseudo-reloc $(WIN_LD_LIBPATHS), \

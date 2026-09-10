@@ -77,6 +77,7 @@ typedef struct {
     int8_t target_sanitize_memory;
     int8_t target_sanitize_thread;
     int8_t target_sanitize_address;
+    int8_t gc_roots;
 } jl_options_t;
 
 #endif

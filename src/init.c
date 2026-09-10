@@ -672,6 +672,8 @@ JL_DLLEXPORT jl_cgparams_t jl_default_cgparams = {
 #else
         /* sanitize_address */ 0,
 #endif
+        /* unique_names */ 0,
+        /* gc_roots */ 0, // later jl_options.gc_roots
 };
 
 static void init_global_mutexes(void) JL_NOTSAFEPOINT {
@@ -685,6 +687,8 @@ static void init_global_mutexes(void) JL_NOTSAFEPOINT {
 
 JL_DLLEXPORT void jl_init_(jl_image_buf_t sysimage)
 {
+    // Stackmap GC roots are decided once, before any code that could depend on them runs.
+    jl_gc_stackmaps_enabled = (jl_options.gc_roots != JL_GC_ROOTS_SHADOWSTACK);
     // initialize many things, in no particular order
     // but generally running from simple platform things to optional
     // configuration features

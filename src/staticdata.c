@@ -4755,6 +4755,21 @@ JL_DLLEXPORT jl_value_t *jl_restore_incremental(const char *fname, jl_array_t *d
     return ret;
 }
 
+// Stackmap GC roots: an image compiled with --gc-roots=stackmap carries a
+// `.llvm_stackmaps` section; its records must be registered before any of its
+// code runs, and the runtime must have been started in that mode (anchors are
+// only recorded then).
+static void jl_register_image_stackmaps(const char *path, uint64_t base) JL_NOTSAFEPOINT
+{
+    if (path == NULL || base == 0)
+        return;
+    int found = jl_stackmap_register_image(path, (uintptr_t)base);
+    if (found == 1 && !jl_gc_stackmaps_enabled) {
+        jl_safe_printf("FATAL: image %s was compiled with --gc-roots=stackmap; start julia with --experimental --gc-roots=stackmap\n", path);
+        abort();
+    }
+}
+
 JL_DLLEXPORT void jl_restore_system_image(jl_image_t *image, jl_image_buf_t buf)
 {
     ios_t f;
@@ -4762,8 +4777,10 @@ JL_DLLEXPORT void jl_restore_system_image(jl_image_t *image, jl_image_buf_t buf)
     if (buf.kind == JL_IMAGE_KIND_NONE)
         return;
 
-    if (buf.kind == JL_IMAGE_KIND_SO)
+    if (buf.kind == JL_IMAGE_KIND_SO) {
         assert(image->fptrs.ptrs); // jl_load_sysimg should already be run
+        jl_register_image_stackmaps(jl_options.image_file, image->base);
+    }
 
     JL_SIGATOMIC_BEGIN();
     ios_static_buffer(&f, (char *)buf.data, buf.size);
@@ -4783,6 +4800,7 @@ JL_DLLEXPORT jl_value_t *jl_restore_package_image_from_file(const char *fname, j
 
     // Despite the name, this function actually parses the pkgimage
     jl_image_t pkgimage = jl_load_pkgimg(buf);
+    jl_register_image_stackmaps(fname, pkgimage.base);
 
     if (ignore_native) {
         // Must disable using native code in possible downstream users of this code:

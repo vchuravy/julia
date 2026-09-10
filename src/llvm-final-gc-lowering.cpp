@@ -30,6 +30,24 @@ void FinalLowerGC::lowerNewGCFrame(CallInst *target, Function &F)
     auto memset_instr = builder.CreateMemSet(gcframe, Constant::getNullValue(Type::getInt8Ty(F.getContext())), ptrsize * (nRoots + 2), Align(16));
     memset_instr->setMetadata(LLVMContext::MD_tbaa, tbaa_gcframe);
 
+    if (Mode.stackmaps) {
+        // Whole-frame stackmap record (id 0): a Direct location for the frame
+        // alloca followed by the number of leading slots that hold memory
+        // resident roots (see `julia.gc_memslots`, set by LateLowerGCFrame).
+        // The runtime scans these slots at any pc of the function; they are
+        // null-initialized here and only ever hold live objects.
+        unsigned memSlots = nRoots;
+        if (auto *MD = target->getMetadata("julia.gc_memslots"))
+            memSlots = mdconst::extract<ConstantInt>(MD->getOperand(0))->getLimitedValue(INT_MAX);
+        auto *stackmap = Intrinsic::getOrInsertDeclaration(F.getParent(), Intrinsic::experimental_stackmap);
+        auto T_int64 = Type::getInt64Ty(F.getContext());
+        builder.CreateCall(stackmap, {
+            ConstantInt::get(T_int64, 0),
+            ConstantInt::get(Type::getInt32Ty(F.getContext()), 0),
+            gcframe_alloca,
+            ConstantInt::get(T_int64, memSlots)});
+    }
+
     target->replaceAllUsesWith(gcframe);
     target->eraseFromParent();
 }
@@ -117,8 +135,20 @@ void FinalLowerGC::lowerSafepoint(CallInst *target, Function &F)
     ++SafepointCount;
     assert(target->arg_size() == 1);
     IRBuilder<> builder(target);
+    builder.SetCurrentDebugLocation(target->getDebugLoc());
     Value* signal_page = target->getOperand(0);
-    builder.CreateLoad(T_size, signal_page, true);
+    if (Mode.stackmaps) {
+        // Poll out of line so that the poll site is a call: EmitGCStatepoints
+        // turns it into a gc.statepoint with an exact record (carried by the
+        // `julia.gcroots` bundle), and a thread stopped at the poll sits in a
+        // C frame with CFI.
+        SmallVector<OperandBundleDef, 1> bundles;
+        target->getOperandBundlesAsDefs(bundles);
+        builder.CreateCall(safepointPollFunc, {signal_page}, bundles);
+    }
+    else {
+        builder.CreateLoad(T_size, signal_page, true);
+    }
     target->eraseFromParent();
 }
 
@@ -164,6 +194,7 @@ bool FinalLowerGC::runOnFunction(Function &F)
     smallAllocResetSafeFunc = getOrDeclare(jl_well_known::GCSmallAllocResetSafe);
     bigAllocResetSafeFunc = getOrDeclare(jl_well_known::GCBigAllocResetSafe);
     allocTypedResetSafeFunc = getOrDeclare(jl_well_known::GCAllocTypedResetSafe);
+    safepointPollFunc = Mode.stackmaps ? getOrDeclare(jl_well_known::GCSafepointPoll) : nullptr;
     T_size = F.getParent()->getDataLayout().getIntPtrType(F.getContext());
 
 
@@ -279,7 +310,7 @@ bool FinalLowerGC::runOnFunction(Function &F)
 PreservedAnalyses FinalLowerGCPass::run(Function &F, FunctionAnalysisManager &AM)
 {
     julia::ScopedDialects dialects(F.getContext());
-    if (FinalLowerGC().runOnFunction(F)) {
+    if (FinalLowerGC(Mode).runOnFunction(F)) {
 #ifdef JL_VERIFY_PASSES
         assert(!verifyLLVMIR(F));
 #endif

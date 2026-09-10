@@ -15,7 +15,27 @@ struct DemoteFloat16Pass : PassInfoMixin<DemoteFloat16Pass> {
     static bool isRequired() { return true; }
 };
 
+// How the GC lowering passes expose roots to the collector. `stackmaps` emits
+// `julia.gcroots` operand bundles + stackmap records (consumed by EmitGCStatepointsPass);
+// `shadowstack` emits the classic jl_gcframe_t chain. Both may be enabled at once
+// (verification mode, --gc-roots=both).
+struct GCRootMode {
+    bool stackmaps;
+    bool shadowstack;
+    constexpr GCRootMode(bool stackmaps = false, bool shadowstack = true) JL_NOTSAFEPOINT
+        : stackmaps(stackmaps), shadowstack(shadowstack) {}
+};
+
 struct LateLowerGCPass : PassInfoMixin<LateLowerGCPass> {
+    GCRootMode Mode;
+    LateLowerGCPass(GCRootMode Mode = GCRootMode()) JL_NOTSAFEPOINT : Mode(Mode) {}
+    PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM) JL_NOTSAFEPOINT;
+    static bool isRequired() { return true; }
+};
+
+// Converts calls carrying `julia.gcroots` operand bundles into gc.statepoints with the roots
+// as deopt operands, so that LLVM records their locations in the .llvm_stackmaps section.
+struct EmitGCStatepointsPass : PassInfoMixin<EmitGCStatepointsPass> {
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM) JL_NOTSAFEPOINT;
     static bool isRequired() { return true; }
 };
@@ -39,6 +59,8 @@ struct GCInvariantVerifierPass : PassInfoMixin<GCInvariantVerifierPass> {
 };
 
 struct FinalLowerGCPass : PassInfoMixin<FinalLowerGCPass> {
+    GCRootMode Mode;
+    FinalLowerGCPass(GCRootMode Mode = GCRootMode()) JL_NOTSAFEPOINT : Mode(Mode) {}
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM) JL_NOTSAFEPOINT;
     static bool isRequired() { return true; }
 };

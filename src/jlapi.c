@@ -774,7 +774,13 @@ JL_DLLEXPORT void (jl_gc_unsafe_leave)(int8_t state)
 JL_DLLEXPORT int8_t (jl_gc_safe_enter)(void)
 {
     jl_task_t *ct = jl_current_task;
-    return jl_gc_safe_enter(ct->ptls);
+    // The frame to anchor is our caller's (this frame returns immediately);
+    // recover its registers through CFI.
+    jl_gc_anchor_t a;
+    memset(&a, 0, sizeof(a));
+    if (jl_gc_stackmaps_enabled && !jl_gc_capture_anchor(&a, 1))
+        jl_safe_printf("WARNING: could not capture a frame anchor for jl_gc_safe_enter\n");
+    return jl_gc_safe_enter_anchor_impl(ct->ptls, &a);
 }
 
 /**

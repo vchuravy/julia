@@ -164,6 +164,17 @@ namespace jl_well_known {
     extern const WellKnownFunctionDescription GCSmallAllocResetSafe;
     extern const WellKnownFunctionDescription GCQueueRootResetSafe;
     extern const WellKnownFunctionDescription GCAllocTypedResetSafe;
+
+    // Stackmap GC-root mode helpers (see stackmaps.cpp / safepoint.c):
+    // `jl_gc_safe_enter_anchor(ptls, fp)`: record a frame anchor for the calling
+    // frame, then enter the GC-safe state; returns the previous state.
+    extern const WellKnownFunctionDescription GCSafeEnterAnchor;
+    // `jl_gc_safe_leave_anchor(ptls, state)`: leave the GC-safe state and drop
+    // the anchor pushed by GCSafeEnterAnchor.
+    extern const WellKnownFunctionDescription GCSafeLeaveAnchor;
+    // `jl_gc_safepoint_poll(signal_page)`: out-of-line safepoint poll, so that
+    // the poll site is a call with an exact stackmap record.
+    extern const WellKnownFunctionDescription GCSafepointPoll;
 }
 
 void setName(llvm::Value *V, const llvm::Twine &Name, int debug_info);

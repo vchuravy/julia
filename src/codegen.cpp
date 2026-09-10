@@ -3059,10 +3059,12 @@ void jl_init_function(Function *F, const jl_codegen_output_t &params) JL_NOTSAFE
         // to ensure compatibility with GCC codes
         attr.addStackAlignmentAttr(16);
     }
-    if (TT.isOSWindows() && TT.getArch() == Triple::x86_64) {
-        attr.addUWTableAttr(llvm::UWTableKind::Default); // force NeedsWinEH
-    }
     attr.addAttribute("frame-pointer", "all");
+    // All Julia code carries unwind tables: on Windows x86-64 this forces
+    // NeedsWinEH, and stackmap GC roots (--gc-roots=stackmap) recover the
+    // callee-saved registers of every frame on a task's stack through CFI,
+    // including frames of images compiled in the default mode.
+    attr.addUWTableAttr(llvm::UWTableKind::Async);
     if (!TT.isOSWindows() && !JL_FEAT_TEST(params, sanitize_address)) {
         // ASAN won't like us accessing undefined memory causing spurious issues,
         // and Windows has platform-specific handling which causes it to mishandle
@@ -10962,6 +10964,7 @@ extern "C" void jl_init_llvm(void)
     install_bad_alloc_error_handler(jl_report_llvm_bad_alloc);
     jl_default_debug_info_kind = jl_default_cgparams.debug_info_kind = (int) DICompileUnit::DebugEmissionKind::FullDebug;
     jl_default_cgparams.debug_info_level = (int) jl_options.debug_level;
+    jl_default_cgparams.gc_roots = (int) jl_options.gc_roots;
     InitializeNativeTarget();
     InitializeNativeTargetAsmPrinter();
     InitializeNativeTargetAsmParser();
@@ -11031,6 +11034,15 @@ extern "C" void jl_init_llvm(void)
 #else
         cl::ProvidePositionalOption(clopt, "64", 1);
 #endif
+    }
+
+    // Stackmap GC roots: let statepoint lowering keep deopt operands (our GC
+    // roots) in callee-saved registers instead of spilling them to dedicated
+    // slots, so root tracking costs no extra stores.
+    if (jl_options.gc_roots != JL_GC_ROOTS_SHADOWSTACK) {
+        clopt = llvmopts.lookup("use-registers-for-deopt-values");
+        if (clopt && clopt->getNumOccurrences() == 0)
+            cl::ProvidePositionalOption(clopt, "1", 1);
     }
 
     clopt = llvmopts.lookup("time-passes");

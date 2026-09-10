@@ -270,8 +270,21 @@ void jl_gc_safe_enter_from_nonmutator(jl_ptls_t ptls) JL_NO_SAFEPOINT_ANALYSIS
     jl_safepoint_wait_gc(NULL);
 }
 
-void jl_set_gc_and_wait(jl_task_t *ct)
+// `ctx` (a bt_context_t) is the register state of this thread at the point it
+// stopped, if the caller has one (the safepoint signal handler); otherwise it is
+// captured here. It is published in `ptls->gc_stack_ctx` for the duration of
+// the wait so a stackmap-mode GC can unwind this thread. This frame stays alive
+// until the GC is done, so a local context is valid for the whole wait.
+void jl_set_gc_and_wait(jl_task_t *ct, void *ctx)
 {
+    bt_context_t local_ctx;
+    if (jl_gc_stackmaps_enabled) {
+        if (ctx == NULL) {
+            jl_unw_get(&local_ctx);
+            ctx = &local_ctx;
+        }
+        ct->ptls->gc_stack_ctx = ctx;
+    }
     // reading own gc state doesn't need atomic ops since no one else
     // should store to it.
     int8_t state = jl_atomic_load_relaxed(&ct->ptls->gc_state);
@@ -281,6 +294,7 @@ void jl_set_gc_and_wait(jl_task_t *ct)
     uv_mutex_unlock(&safepoint_lock);
     jl_safepoint_wait_gc(ct);
     jl_gc_notify_task_resume(ct);
+    ct->ptls->gc_stack_ctx = NULL;
     jl_atomic_store_release(&ct->ptls->gc_state, state);
     jl_safepoint_wait_thread_resume(ct); // block in thread-suspend now if requested, after clearing the gc_state
 }
@@ -412,7 +426,7 @@ int jl_safepoint_suspend_thread(int tid, int waitstate)
             // It will be unable to reenter helping with GC because we have
             // changed its safepoint page.
             uv_mutex_unlock(&safepoint_lock);
-            jl_set_gc_and_wait(jl_current_task);
+            jl_set_gc_and_wait(jl_current_task, NULL);
             uv_mutex_lock(&safepoint_lock);
         }
         while (jl_atomic_load_acquire(&ptls2->suspend_count) != 0) {
@@ -465,3 +479,126 @@ int jl_safepoint_resume_thread(int tid) JL_NOTSAFEPOINT
 #ifdef __cplusplus
 }
 #endif
+
+
+// --- Stackmap GC roots: frame anchors -------------------------------------------
+//
+// See the comment on jl_gc_anchor_t in julia_threads.h. An anchor is pushed
+// when a task goes UNSAFE -> SAFE and popped when it goes back; nested
+// SAFE -> SAFE transitions (and UNSAFE brackets opened by callbacks) leave the
+// stack alone, so the top anchor always describes the youngest frame that
+// entered the gc-safe state, and everything below it is reachable by CFI
+// unwinding from there. Pushes happen while the task is still gc-unsafe and
+// pops after it is gc-unsafe again, so the GC never observes a mutation.
+
+JL_DLLEXPORT int jl_gc_stackmaps_enabled = 0;
+
+static void jl_gc_push_anchor(jl_task_t *ct, const jl_gc_anchor_t *a) JL_CANSAFEPOINT
+{
+    jl_gc_anchor_stack_t *s = ct->gc_anchors;
+    if (s == NULL || s->top == s->reserved_size) {
+        size_t n = s ? 2 * s->reserved_size : 8;
+        size_t bufsz = offsetof(jl_gc_anchor_stack_t, anchors) + n * sizeof(jl_gc_anchor_t);
+        // may collect: the (unchanged) anchor stack is still consistent
+        jl_gc_anchor_stack_t *ns = (jl_gc_anchor_stack_t*)jl_gc_alloc_buf(ct->ptls, bufsz);
+        ns->top = s ? s->top : 0;
+        ns->reserved_size = n;
+        if (s)
+            memcpy(ns->anchors, s->anchors, s->top * sizeof(jl_gc_anchor_t));
+        jl_gc_write(ct, ct->gc_anchors, jl_gc_anchor_stack_t, ns);
+        s = ns;
+    }
+    s->anchors[s->top++] = *a;
+}
+
+// The GC checker models these through their declarations (they enter/leave the
+// gc-unsafe region), like jl_gc_safe_enter/leave; their bodies are hidden from it.
+#ifndef __clang_gcanalyzer__
+int8_t jl_gc_safe_enter_anchor_impl(jl_ptls_t ptls, const jl_gc_anchor_t *a) JL_NO_SAFEPOINT_ANALYSIS
+{
+    int8_t old_state = jl_atomic_load_relaxed(&ptls->gc_state);
+    if (jl_gc_stackmaps_enabled && old_state == JL_GC_STATE_UNSAFE) {
+        jl_task_t *ct = jl_atomic_load_relaxed(&ptls->current_task);
+        if (ct != NULL)
+            jl_gc_push_anchor(ct, a);
+    }
+    return jl_gc_state_set(ptls, JL_GC_STATE_SAFE, old_state);
+}
+
+JL_DLLEXPORT void jl_gc_safe_leave_anchor(jl_ptls_t ptls, int8_t state) JL_NO_SAFEPOINT_ANALYSIS
+{
+    // become gc-unsafe (and wait for any running GC) before touching the anchors
+    jl_gc_state_set(ptls, state, JL_GC_STATE_SAFE);
+    if (jl_gc_stackmaps_enabled && state == JL_GC_STATE_UNSAFE) {
+        jl_task_t *ct = jl_atomic_load_relaxed(&ptls->current_task);
+        jl_gc_anchor_stack_t *s = ct ? ct->gc_anchors : NULL;
+        if (s && s->top > 0)
+            s->top--;
+    }
+}
+#endif // __clang_gcanalyzer__
+
+void jl_gc_anchors_trim(jl_task_t *ct, uintptr_t sp)
+{
+    jl_gc_anchor_stack_t *s = ct->gc_anchors;
+    if (s == NULL)
+        return;
+    while (s->top > 0 && s->anchors[s->top - 1].sp <= sp)
+        s->top--;
+}
+
+#if defined(_CPU_X86_64_) && !defined(_OS_WINDOWS_) && defined(__GNUC__)
+// The anchor must hold the *caller's* callee-saved registers, so the entry
+// point is an asm stub that stores them before any C code can clobber them:
+//   rdi = ptls, rsi = caller frame pointer, [rsp] = return address into the caller.
+// Layout of jl_gc_anchor_t: pc, sp, fp, rbx, r12, r13, r14, r15 (8 words).
+__asm__(
+    ".text\n"
+    ".globl jl_gc_safe_enter_anchor\n"
+    ".type jl_gc_safe_enter_anchor,@function\n"
+    "jl_gc_safe_enter_anchor:\n"
+    ".cfi_startproc\n"
+    "    subq $72, %rsp\n"            // 64-byte anchor + 8 to realign the stack for the call
+    ".cfi_adjust_cfa_offset 72\n"
+    "    movq 72(%rsp), %rax\n"       // return address
+    "    movq %rax, 0(%rsp)\n"        // .pc
+    "    leaq 80(%rsp), %rax\n"       // caller's stack pointer at the call
+    "    movq %rax, 8(%rsp)\n"        // .sp
+    "    movq %rsi, 16(%rsp)\n"       // .fp
+    "    movq %rbx, 24(%rsp)\n"
+    "    movq %r12, 32(%rsp)\n"
+    "    movq %r13, 40(%rsp)\n"
+    "    movq %r14, 48(%rsp)\n"
+    "    movq %r15, 56(%rsp)\n"
+    "    movq %rsp, %rsi\n"           // second argument: the anchor
+    "    call jl_gc_safe_enter_anchor_impl\n"
+    "    addq $72, %rsp\n"
+    ".cfi_adjust_cfa_offset -72\n"
+    "    ret\n"
+    ".cfi_endproc\n"
+    ".size jl_gc_safe_enter_anchor, .-jl_gc_safe_enter_anchor\n"
+);
+#else
+// Portable fallback: no callee-saved registers (statepoint records that place a
+// root in a register cannot be read from such an anchor; only x86-64 Linux is
+// supported for --gc-roots=stackmap, see jloptions.c).
+JL_DLLEXPORT NOINLINE int8_t jl_gc_safe_enter_anchor(jl_ptls_t ptls, void *caller_fp)
+{
+    jl_gc_anchor_t a;
+    memset(&a, 0, sizeof(a));
+    a.pc = (uintptr_t)__builtin_return_address(0);
+    a.sp = (uintptr_t)__builtin_dwarf_cfa();
+    a.fp = (uintptr_t)caller_fp;
+    return jl_gc_safe_enter_anchor_impl(ptls, &a);
+}
+#endif
+
+// Out-of-line safepoint poll for stackmap-mode code (the call site gets an
+// exact stackmap record; a stopped thread waits inside this C frame).
+JL_DLLEXPORT NOINLINE void jl_gc_safepoint_poll(size_t *signal_page)
+{
+    jl_signal_fence();
+    size_t v = *(volatile size_t*)signal_page;
+    jl_signal_fence();
+    (void)v;
+}

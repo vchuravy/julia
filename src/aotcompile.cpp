@@ -41,6 +41,10 @@
 #include <llvm/Bitcode/BitcodeWriterPass.h>
 #include <llvm/Bitcode/BitcodeReader.h>
 #include "llvm/Object/ArchiveWriter.h"
+#include "llvm/Object/Binary.h"
+#include "llvm/ObjCopy/ObjCopy.h"
+#include "llvm/ObjCopy/ConfigManager.h"
+#include "llvm/ObjCopy/CommonConfig.h"
 #include <llvm/IR/IRPrintingPasses.h>
 
 #include <llvm/IR/LegacyPassManagers.h>
@@ -1583,6 +1587,51 @@ struct AOTOutputs {
 }  // anonymous namespace
 
 // Perform the actual optimization and emission of the output files
+// Stackmap GC roots (--gc-roots=stackmap): every shard object defines the
+// global `__LLVM_StackMaps` at the start of its `.llvm_stackmaps` section, and
+// that section is read-only although it holds absolute function addresses. The
+// image is linked into a shared object with lld, which rejects relocations in
+// read-only sections and duplicate globals across shards. Localize the symbol
+// and make the section writable data so the linker emits ordinary relative
+// relocations; the runtime locates the section by name (stackmaps.cpp).
+static void fixupStackmapSection(SmallVectorImpl<char> &obj) JL_NOTSAFEPOINT
+{
+    MemoryBufferRef ref(StringRef(obj.data(), obj.size()), "julia-shard.o");
+    auto bin = object::createBinary(ref);
+    if (!bin) {
+        consumeError(bin.takeError());
+        return;
+    }
+    auto *objfile = dyn_cast<object::ObjectFile>(bin->get());
+    if (!objfile)
+        return;
+    bool has_stackmaps = false;
+    for (const object::SectionRef &sec : objfile->sections()) {
+        auto name = sec.getName();
+        if (name && *name == ".llvm_stackmaps")
+            has_stackmaps = true;
+    }
+    if (!has_stackmaps)
+        return;
+    objcopy::ConfigManager CM;
+    auto onError = [](Error E) JL_NOTSAFEPOINT -> Error { return E; };
+    if (Error E = CM.Common.SymbolsToLocalize.addMatcher(
+            objcopy::NameOrPattern::create("__LLVM_StackMaps", objcopy::MatchStyle::Literal, onError))) {
+        consumeError(std::move(E));
+        return;
+    }
+    CM.Common.SetSectionFlags[".llvm_stackmaps"] =
+        objcopy::SectionFlagsUpdate{".llvm_stackmaps", objcopy::SecAlloc | objcopy::SecData};
+    SmallVector<char, 0> out;
+    raw_svector_ostream OS(out);
+    if (Error E = objcopy::executeObjcopyOnBinary(CM, *objfile, OS)) {
+        jl_safe_printf("WARNING: could not post-process the stackmap section of an image shard\n");
+        consumeError(std::move(E));
+        return;
+    }
+    obj.swap(out);
+}
+
 static AOTOutputs add_output_impl(Module &M, TargetMachine &SourceTM, ShardTimers &timers,
         bool unopt, bool opt, bool obj, bool asm_) {
     assert((unopt || opt || obj || asm_) && "no output requested");
@@ -1637,6 +1686,8 @@ static AOTOutputs add_output_impl(Module &M, TargetMachine &SourceTM, ShardTimer
         options.sanitize_memory = jl_options.target_sanitize_memory;
         options.sanitize_thread = jl_options.target_sanitize_thread;
         options.sanitize_address = jl_options.target_sanitize_address;
+        options.gc_stackmaps = jl_options.gc_roots != JL_GC_ROOTS_SHADOWSTACK;
+        options.gc_shadowstack = jl_options.gc_roots != JL_GC_ROOTS_STACKMAP;
         NewPM optimizer{std::move(PMTM), getOptLevel(jl_options.opt_level), options};
         {
             TimeTraceScope OptimizeScope("AOT Optimize", M.getModuleIdentifier());
@@ -1717,6 +1768,8 @@ static AOTOutputs add_output_impl(Module &M, TargetMachine &SourceTM, ShardTimer
 #endif
             jl_safe_printf("ERROR: target does not support generation of object files\n");
         emitter.run(M);
+        if (jl_options.gc_roots != JL_GC_ROOTS_SHADOWSTACK && TM->getTargetTriple().isOSBinFormatELF())
+            fixupStackmapSection(out.obj);
         timers.obj.stopTimer();
     }
 
@@ -2719,6 +2772,8 @@ void jl_get_llvmf_defn_impl(jl_llvmf_dump_t *dump, jl_method_instance_t *mi, jl_
                     opts.sanitize_memory = params.sanitize_memory;
                     opts.sanitize_thread = params.sanitize_thread;
                     opts.sanitize_address = params.sanitize_address;
+                    opts.gc_stackmaps = params.gc_roots != JL_GC_ROOTS_SHADOWSTACK;
+                    opts.gc_shadowstack = params.gc_roots != JL_GC_ROOTS_STACKMAP;
                     PrintOptions print_opts;
                     std::string pass_output_buffer;
                     raw_string_ostream pass_output_stream(pass_output_buffer);

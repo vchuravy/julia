@@ -266,6 +266,7 @@ JL_DLLEXPORT void jl_enter_handler(jl_task_t *ct, jl_handler_t *eh)
     // Must have no safepoint
     eh->prev = ct->eh;
     eh->gcstack = ct->gcstack;
+    eh->gc_anchor_top = ct->gc_anchors ? ct->gc_anchors->top : 0;
     eh->scope = ct->scope;
     eh->reset_ctx = jl_atomic_load_relaxed(&ct->reset_ctx);
     eh->bound_cancel_token = jl_atomic_load_relaxed(&ct->bound_cancel_token);
@@ -322,6 +323,11 @@ JL_DLLEXPORT void jl_eh_restore_state(jl_task_t *ct, jl_handler_t *eh) JL_NO_SAF
         jl_atomic_store_release(&ptls->gc_state, eh->gc_state);
     if (!old_gc_state || !eh->gc_state) // it was or is unsafe now
         jl_gc_safepoint_(ptls);
+    // Frames abandoned by a non-local exit may have left frame anchors behind
+    // (a gc-safe ccall whose callback threw). Now that no GC can be scanning
+    // this task, drop them.
+    if (ct->gc_anchors && ct->gc_anchors->top > eh->gc_anchor_top)
+        ct->gc_anchors->top = eh->gc_anchor_top;
     jl_value_t *exception = ptls->sig_exception;
     JL_GC_PROMISE_ROOTED(exception);
     if (exception) {
@@ -346,6 +352,7 @@ JL_DLLEXPORT void jl_eh_restore_state(jl_task_t *ct, jl_handler_t *eh) JL_NO_SAF
 JL_DLLEXPORT void jl_eh_restore_state_noexcept(jl_task_t *ct, jl_handler_t *eh)
 {
     assert(ct->gcstack == eh->gcstack && "Incorrect GC usage under try catch");
+    assert((ct->gc_anchors ? ct->gc_anchors->top : 0) == eh->gc_anchor_top && "unbalanced gc-safe region under try catch");
     jl_gc_wb_current_task(ct, eh->scope);
     ct->scope = eh->scope;
     ct->eh = eh->prev;

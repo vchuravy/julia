@@ -493,6 +493,10 @@ JL_NO_ASAN static void ctx_switch(jl_task_t *lastt) JL_CANSAFEPOINT
                 sanitizer_finish_switch_fiber(&ptls->previous_task->ctx, &lastt->ctx);
                 return;
             }
+            if (jl_gc_stackmaps_enabled) {
+                jl_safe_printf("FATAL: copy-stack task switch is not supported with --gc-roots=stackmap\n");
+                abort();
+            }
             save_stack(ptls, lastt, pt); // allocates (gc-safepoint, and can also fail)
             lastt->ctx.copy_ctx = &lasttstate.copy_ctx;
 #else
@@ -1084,6 +1088,8 @@ JL_DLLEXPORT jl_task_t *jl_new_task(jl_value_t *start, jl_value_t *completion_fu
     if (ssize == 0) {
         // stack size unspecified; use default
         if (always_copy_stacks) {
+            if (jl_gc_stackmaps_enabled)
+                jl_error("copy-stack tasks are not supported with --gc-roots=stackmap");
             t->ctx.copy_stack = 1;
             t->ctx.bufsz = 0;
         }
@@ -1125,6 +1131,7 @@ JL_DLLEXPORT jl_task_t *jl_new_task(jl_value_t *start, jl_value_t *completion_fu
     t->sticky = 1;
     t->gcstack = NULL;
     t->excstack = NULL;
+    t->gc_anchors = NULL;
     t->ctx.started = 0;
     t->priority = 0;
     jl_atomic_store_relaxed(&t->tid, -1);
@@ -1598,6 +1605,7 @@ jl_task_t *jl_init_root_task(jl_ptls_t ptls, void *stack_lo, void *stack_hi)
     ct->eh = NULL;
     ct->gcstack = NULL;
     ct->excstack = NULL;
+    ct->gc_anchors = NULL;
     jl_atomic_store_relaxed(&ct->tid, ptls->tid);
     ct->threadpoolid = jl_threadpoolid(ptls->tid);
     ct->sticky = 1;
@@ -1720,6 +1728,7 @@ JL_NORETURN void jl_abandon_task_cb(void) JL_CANSAFEPOINT
     // An exception retained from the victim's active catch would otherwise
     // shadow the abandonment result when the failure is displayed.
     ct->excstack = NULL;
+    ct->gc_anchors = NULL;
     jl_atomic_store_relaxed(&ct->_isexception, 1);
     // The observable task state is published here - with the result already
     // in place - not at commit: a failed context redirect (mach, windows)

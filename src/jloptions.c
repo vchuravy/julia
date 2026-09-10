@@ -166,6 +166,7 @@ JL_DLLEXPORT void jl_init_options(void) JL_NOTSAFEPOINT
                         0, // target_sanitize_memory
                         0, // target_sanitize_thread
                         0, // target_sanitize_address
+                        JL_GC_ROOTS_SHADOWSTACK, // gc_roots
     };
     jl_options_initialized = 1;
 }
@@ -356,6 +357,10 @@ static const char opts_hidden[] =
     "                                               With unsafe-warn warnings will be printed for\n"
     "                                               dynamic call sites that might lead to such errors.\n"
     "                                               In safe mode compile-time errors are given instead.\n"
+    " --gc-roots={shadowstack*|stackmap|both}       Select how compiled code exposes GC roots: the\n"
+    "                                               shadow stack (default), LLVM stackmaps found by\n"
+    "                                               unwinding the machine stack, or both (verification\n"
+    "                                               mode). Requires --experimental.\n"
     " --trace-eval={loc|full|no*}                   Show the expression being evaluated before eval.\n"
     " --hard-heap-limit=<size>[<unit>]              Set a hard limit on the heap size: if we ever\n"
     "                                               go above this limit, we will abort. The value\n"
@@ -434,6 +439,7 @@ JL_DLLEXPORT void jl_parse_opts(int *argcp, char ***argvp)
            opt_gc_threads,
            opt_permalloc_pkgimg,
            opt_trim,
+           opt_gc_roots,
            opt_trace_eval,
            opt_experimental_features,
            opt_compress_sysimage,
@@ -509,6 +515,7 @@ JL_DLLEXPORT void jl_parse_opts(int *argcp, char ***argvp)
         { "heap-target-increment", required_argument, 0, opt_heap_target_increment },
         { "gc-sweep-always-full", no_argument, 0, opt_gc_sweep_always_full },
         { "trim",  optional_argument, 0, opt_trim },
+        { "gc-roots", required_argument, 0, opt_gc_roots },
         { "compress-sysimage", required_argument, 0, opt_compress_sysimage },
         { "trace-eval",       optional_argument, 0, opt_trace_eval },
         { "target-sanitize", required_argument, 0, opt_target_sanitize },
@@ -1106,6 +1113,16 @@ restart_switch:
             else
                 jl_errorf("julia: invalid argument to --trim={safe|no|unsafe|unsafe-warn} (%s)", optarg);
             break;
+        case opt_gc_roots:
+            if (!strcmp(optarg,"shadowstack"))
+                jl_options.gc_roots = JL_GC_ROOTS_SHADOWSTACK;
+            else if (!strcmp(optarg,"stackmap"))
+                jl_options.gc_roots = JL_GC_ROOTS_STACKMAP;
+            else if (!strcmp(optarg,"both"))
+                jl_options.gc_roots = JL_GC_ROOTS_BOTH;
+            else
+                jl_errorf("julia: invalid argument to --gc-roots={shadowstack|stackmap|both} (%s)", optarg);
+            break;
         case opt_trace_eval:
             if (optarg == NULL || !strcmp(optarg,"loc"))
                 jl_options.trace_eval = 1;
@@ -1150,7 +1167,13 @@ restart_switch:
     if (!jl_options.use_experimental_features) {
         if (jl_options.trim != JL_TRIM_NO)
             jl_errorf("julia: --trim is an experimental feature, you must enable it with --experimental");
+        if (jl_options.gc_roots != JL_GC_ROOTS_SHADOWSTACK)
+            jl_errorf("julia: --gc-roots is an experimental feature, you must enable it with --experimental");
     }
+#if !(defined(_CPU_X86_64_) && defined(_OS_LINUX_)) || defined(MMTK_PLAN)
+    if (jl_options.gc_roots != JL_GC_ROOTS_SHADOWSTACK)
+        jl_errorf("julia: --gc-roots=stackmap is only supported on x86-64 Linux with the stock GC");
+#endif
     jl_options.code_coverage = codecov;
     jl_options.malloc_log = malloclog;
     bool_t emit_native = jl_options.outputo || jl_options.outputbc ||

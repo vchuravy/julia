@@ -295,8 +295,12 @@ struct State {
     std::map<Instruction *, SmallVector<int, 0>> GCPreserves;
 
     // The assignment of numbers to safepoints. These have the same ordering as
-    // LiveSets, LiveIfLiveOut, and CalleeRoots.
+    // LiveSets, LiveIfLiveOut, and CalleeRoots. Entries become nullptr when
+    // CleanupIR erases the safepoint instruction.
     SmallVector<Instruction*, 0> SafepointNumbering;
+    // Reverse of SafepointNumbering, kept up to date by UpdatePtrNumbering so
+    // that the safepoint list survives the call rewrites done in CleanupIR.
+    DenseMap<Instruction *, int> SafepointIndex;
 
     // Safepoint number of instructions that can return twice. For now, all
     // values live at these instructions will get their own, dedicated GC frame
@@ -322,7 +326,8 @@ struct State {
 
 struct LateLowerGCFrame:  private JuliaPassContext {
     function_ref<DominatorTree &()> GetDT;
-    LateLowerGCFrame(function_ref<DominatorTree &()> GetDT) : GetDT(GetDT) {}
+    GCRootMode Mode;
+    LateLowerGCFrame(function_ref<DominatorTree &()> GetDT, GCRootMode Mode = GCRootMode()) : GetDT(GetDT), Mode(Mode) {}
 
 public:
     bool runOnFunction(Function &F, bool *CFGModified = nullptr);
@@ -357,8 +362,17 @@ private:
     void ComputeLiveSets(State &S);
     std::pair<SmallVector<int, 0>, int> ColorRoots(const State &S);
     void PlaceGCFrameStore(State &S, unsigned R, unsigned MinColorRoot, ArrayRef<int> Colors, Value *GCFrame, Instruction *InsertBefore);
-    void PlaceGCFrameStores(State &S, unsigned MinColorRoot, ArrayRef<int> Colors, int PreAssignedColors, Value *GCFrame);
+    void PlaceGCFrameStores(State &S, unsigned MinColorRoot, ArrayRef<int> Colors, int PreAssignedColors, Value *GCFrame, bool OnlyPreAssigned);
+    // Stackmap mode: expand `gc-transition` operand bundles into calls to the
+    // anchor-recording runtime helpers before LocalScan, so the helpers are
+    // themselves safepoints with records.
+    void LowerGCTransitions(Function &F);
+    static bool isStatepointable(CallInst *CI);
+    // Stackmap mode: attach a `julia.gcroots` operand bundle listing the live,
+    // register-resident roots to every safepoint call (after CleanupIR).
+    void AttachGCRootBundles(State &S, ArrayRef<int> Colors, int PreAssignedColors);
     void PlaceGCFrameReset(State &S, unsigned R, unsigned MinColorRoot, ArrayRef<int> Colors, Value *GCFrame, Instruction *InsertBefore);
+    void PlaceGCFrameResetSlot(unsigned Slot, Value *GCFrame, Instruction *InsertBefore);
     void PlaceRootsAndUpdateCalls(ArrayRef<int> Colors, int PreAssignedColors, State &S, std::map<Value *, std::pair<int, int>>);
     void CleanupWriteBarriers(Function &F, State *S, const SmallVector<CallInst*, 0> &WriteBarriers, bool *CFGModified);
     bool CleanupIR(Function &F, State *S, bool *CFGModified);
@@ -378,9 +392,12 @@ private:
 // their own lowering pass.
 
 struct FinalLowerGC: private JuliaPassContext {
+    GCRootMode Mode;
+    FinalLowerGC(GCRootMode Mode = GCRootMode()) : Mode(Mode) {}
     bool runOnFunction(Function &F);
 
 private:
+    Function *safepointPollFunc;
     Function *queueRootFunc;
     Function *smallAllocFunc;
     Function *bigAllocFunc;

@@ -72,3 +72,44 @@ The GC determines the heap size by adding the number of bytes in-use by pool-all
 Julia's GC heuristics are based on `MemBalancer` (https://dl.acm.org/doi/10.1145/3563323). They decide when to trigger a collection and which (quick or full) collection to trigger. The heuristics adjust the number of bytes the mutator can allocate before triggering a collection cycle by measuring metrics such as allocation rate, freeing rate, and current heap size.
 
 Independently of allocation rates, freeing rates, or GC times, Julia will always trigger full collections if the heap size exceeds 80% of a memory upper bound specified through `--heap-size-hint` or determined by reading system information.
+
+## Stackmap GC Roots (experimental)
+
+By default compiled code exposes its GC roots through a *shadow stack*: each function with live
+roots allocates a `jl_gcframe_t` on entry, links it into `task->gcstack`, stores every root into it
+around safepoints and unlinks it on return (`LateLowerGCFrame`/`FinalLowerGC`). The collector then
+walks that chain (`gc_mark_stack`).
+
+`--experimental --gc-roots=stackmap` (x86-64 Linux, stock GC) replaces this with LLVM stackmaps:
+
+* `LateLowerGCFrame` keeps its liveness analysis, but instead of storing register-resident roots
+  into a frame it attaches them to every safepoint call as a `julia.gcroots` operand bundle. The
+  `EmitGCStatepoints` pass turns each such call into an `llvm.experimental.gc.statepoint` with the
+  roots as deopt operands, so the backend records where they live at the call's return address
+  (a callee-saved register or a spill slot) without any extra store.
+* Roots that must stay in memory (sret buffers and values live across a `returns_twice` handler
+  setup) remain in a null-initialized frame alloca described by one whole-frame stackmap record
+  (id 0), valid at any pc of the function. Safepoint polls become calls to `jl_gc_safepoint_poll`
+  so that they have exact records too.
+* `.llvm_stackmaps` sections are registered by `src/stackmaps.cpp` (JIT objects via
+  `debuginfo.cpp`, images by reading their ELF section table at load), which resolves the roots of
+  a frame from its pc and an unwind cursor.
+* The GC unwinds every task with libunwind (`jl_gc_scan_task_frames` in `stackwalk.c`): from the
+  signal context of a thread stopped at a poll, the context captured in `jl_gc_collect`, or the
+  saved `jmp_buf` of a suspended task. Frames of foreign code without unwind information end a
+  walk; it is restarted from the task's *frame anchors*, recorded on every transition to the
+  gc-safe state (`jl_gc_safe_enter_anchor`, `jl_task_t.gc_anchors`), which hold the pc, stack and
+  frame pointers and callee-saved registers of the frame that entered it.
+
+The shadow stack keeps working for C runtime code (`JL_GC_PUSH*`), the interpreter and code compiled
+in the default mode; the GC scans both, so images and JIT code of either mode may be mixed.
+`--gc-roots=both` emits both mechanisms for the same code and aborts on any root that the shadow
+stack holds but the stackmap does not report, which is the intended way to validate changes to
+this mode. Images compiled in stackmap mode require the runtime to be started in it. Copy-stack
+tasks are not supported.
+
+Two LLVM limitations shape the lowering: `gc.statepoint` cannot wrap a variadic call that returns
+a value, so the roots live across such calls are kept in the memory frame like those of a
+`returns_twice` call; and stackmap operands must be addressed from the frame pointer, so functions
+in this mode carry `no-realign-stack` and over-aligned allocas are clamped to the ABI stack
+alignment (vector code uses unaligned stack accesses).

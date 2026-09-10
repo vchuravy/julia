@@ -2583,6 +2583,9 @@ struct _jl_handler_t {
     // Saved `bound_cancel_default` flag, restored with `bound_cancel_token`
     // (the pair is only coherent together; see julia_threads.h).
     uint8_t bound_cancel_default;
+    // Stackmap GC roots: depth of the task's frame-anchor stack at handler
+    // entry, restored like `gcstack` on (non-local) exit.
+    size_t gc_anchor_top;
 };
 
 #define JL_TASK_STATE_RUNNABLE  0
@@ -2890,6 +2893,10 @@ JL_DLLEXPORT int jl_generating_output(void) JL_NOTSAFEPOINT;
 #define JL_TRIM_UNSAFE 2
 #define JL_TRIM_UNSAFE_WARN 3
 
+#define JL_GC_ROOTS_SHADOWSTACK 0
+#define JL_GC_ROOTS_STACKMAP 1
+#define JL_GC_ROOTS_BOTH 2
+
 #define JL_OPTIONS_TASK_METRICS_OFF 0
 #define JL_OPTIONS_TASK_METRICS_ON 1
 
@@ -2951,6 +2958,10 @@ typedef struct {
     int sanitize_address;
 
     int unique_names;   // Emit globally unique names
+
+    // GC root tracking: 0 = shadow stack (jl_gcframe_t chain), 1 = LLVM stackmaps/statepoints,
+    // 2 = both (verification mode). See JL_GC_ROOTS_*.
+    int gc_roots;
 } jl_cgparams_t;
 extern JL_DLLEXPORT int jl_default_debug_info_kind;
 extern JL_DLLEXPORT jl_cgparams_t jl_default_cgparams;
