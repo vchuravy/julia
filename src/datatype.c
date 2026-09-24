@@ -95,6 +95,10 @@ JL_DLLEXPORT jl_typename_t *jl_new_typename_in(jl_sym_t *name, jl_module_t *modu
     tn->constprop_heustic = 0;
     tn->concrete_only = 0;
     tn->n_inherited = 0;
+    tn->has_multiple_supers = 0;
+    tn->parents = NULL;
+    tn->linearization = NULL;
+    jl_atomic_store_relaxed(&tn->may_join, 0);
     return tn;
 }
 
@@ -127,6 +131,8 @@ jl_datatype_t *jl_new_uninitialized_datatype(void)
     t->layout = NULL;
     t->types = NULL;
     t->instance = NULL;
+    t->supers = NULL;
+    t->ancestors = NULL;
     return t;
 }
 
@@ -2792,19 +2798,377 @@ void jl_check_field_types(jl_svec_t *ftypes, jl_sym_t *type_name)
     }
 }
 
+// Multiple supertypes ----------------------------------------------------------
+//
+// `struct C <: (A, B) end` declares several (abstract) supertypes. The first
+// is the primary one (`super`); the list order is the local precedence order.
+// The ancestry of such a typename is linearized with the C3 algorithm
+// (Barrett et al., "A Monotonic Superclass Linearization for Dylan", 1996):
+// the merge of the parents' linearizations and the parents list, taking at
+// each step the head of the earliest list that occurs in no tail. The result
+// respects the local precedence order and is monotonic (it extends every
+// parent's linearization without reordering it), which is what lets method
+// dispatch decide between the parents once, at the join, for all subtypes.
+
+// [tn, ancestors..., Any's typename]: the stored linearization, or the
+// `super` chain of the primary datatype for single-parent typenames. NULL
+// while the definition is in progress.
+JL_DLLEXPORT jl_svec_t *jl_typename_linearization(jl_typename_t *tn)
+{
+    if (tn->linearization != NULL)
+        return tn->linearization;
+    if (tn->wrapper == NULL)
+        return NULL;
+    jl_datatype_t *dt = (jl_datatype_t*)jl_unwrap_unionall(tn->wrapper);
+    arraylist_t chain;
+    arraylist_new(&chain, 0);
+    arraylist_push(&chain, tn);
+    while (dt != jl_any_type) {
+        dt = jl_datatype_compute_super(dt);
+        if (dt == NULL) {
+            arraylist_free(&chain);
+            return NULL;
+        }
+        arraylist_push(&chain, dt->name);
+    }
+    jl_svec_t *lin = jl_alloc_svec(chain.len);
+    for (size_t i = 0; i < chain.len; i++)
+        jl_svecset(lin, i, (jl_value_t*)chain.items[i]);
+    arraylist_free(&chain);
+    return lin;
+}
+
+static int typename_in_list(arraylist_t *l, size_t from, jl_typename_t *tn) JL_NOTSAFEPOINT
+{
+    for (size_t i = from; i < l->len; i++)
+        if (l->items[i] == (void*)tn)
+            return 1;
+    return 0;
+}
+
+// C3 merge of the parents' linearizations (`parents` holds their typenames in
+// local precedence order). Throws for an inconsistent precedence graph.
+static jl_svec_t *c3_linearize(jl_typename_t *tn, jl_svec_t *parents) JL_CANSAFEPOINT
+{
+    size_t k = jl_svec_len(parents), i, j;
+    arraylist_t *lists = (arraylist_t*)alloca((k + 1) * sizeof(arraylist_t));
+    size_t *heads = (size_t*)alloca((k + 1) * sizeof(size_t));
+    for (i = 0; i <= k; i++) {
+        arraylist_new(&lists[i], 0);
+        heads[i] = 0;
+    }
+    arraylist_t result;
+    arraylist_new(&result, 0);
+    arraylist_push(&result, tn);
+    int ok = 1;
+    for (i = 0; i < k; i++) {
+        jl_typename_t *p = (jl_typename_t*)jl_svecref(parents, i);
+        jl_svec_t *lin = jl_typename_linearization(p);
+        if (lin == NULL) {
+            ok = 0;
+            break;
+        }
+        // the elements stay reachable through the parents' typenames while we
+        // work on plain pointers
+        for (j = 0; j < jl_svec_len(lin); j++)
+            arraylist_push(&lists[i], jl_svecref(lin, j));
+        arraylist_push(&lists[k], p);
+    }
+    const char *bad = NULL;
+    while (ok) {
+        int all_empty = 1;
+        jl_typename_t *next = NULL;
+        for (i = 0; i <= k && next == NULL; i++) {
+            if (heads[i] >= lists[i].len)
+                continue;
+            all_empty = 0;
+            jl_typename_t *cand = (jl_typename_t*)lists[i].items[heads[i]];
+            int in_tail = 0;
+            for (j = 0; j <= k && !in_tail; j++)
+                in_tail = typename_in_list(&lists[j], heads[j] + 1, cand);
+            if (!in_tail)
+                next = cand;
+        }
+        if (all_empty)
+            break;
+        if (next == NULL) {
+            bad = "inconsistent precedence graph";
+            break;
+        }
+        arraylist_push(&result, next);
+        for (i = 0; i <= k; i++)
+            if (heads[i] < lists[i].len && lists[i].items[heads[i]] == (void*)next)
+                heads[i]++;
+    }
+    jl_svec_t *res = NULL;
+    if (ok && bad == NULL) {
+        res = jl_alloc_svec(result.len);
+        for (i = 0; i < result.len; i++)
+            jl_svecset(res, i, (jl_value_t*)result.items[i]);
+    }
+    for (i = 0; i <= k; i++)
+        arraylist_free(&lists[i]);
+    arraylist_free(&result);
+    if (!ok)
+        jl_errorf("invalid subtyping in definition of %s: a supertype is not defined yet (type definition in progress)",
+                  jl_symbol_name(tn->name));
+    if (bad != NULL) {
+        ios_t buf;
+        ios_mem(&buf, 64);
+        for (i = 0; i < k; i++) {
+            if (i > 0)
+                ios_write(&buf, ", ", 2);
+            const char *pn = jl_symbol_name(((jl_typename_t*)jl_svecref(parents, i))->name);
+            ios_write(&buf, pn, strlen(pn));
+        }
+        ios_putc('\0', &buf);
+        jl_errorf("invalid subtyping in definition of %s: %s, cannot linearize supertypes (%s); reorder or drop a supertype",
+                  jl_symbol_name(tn->name), bad, buf.buf);
+    }
+    return res;
+}
+
+// Join registry: the typenames that declare several supertypes. Two typenames
+// that are not ancestors of each other may still share a subtype (a "join"),
+// so their intersection is not empty; `may_join` on both is the cheap
+// pre-test, and `jl_typename_joins` lists the maximal joins.
+jl_array_t *jl_join_registry JL_GLOBALLY_ROOTED;
+static jl_mutex_t join_registry_lock;
+
+int jl_typenames_may_join(jl_typename_t *a, jl_typename_t *b) JL_NOTSAFEPOINT
+{
+    return jl_atomic_load_relaxed(&a->may_join) && jl_atomic_load_relaxed(&b->may_join);
+}
+
+static int typename_is_ancestor(jl_typename_t *tn, jl_typename_t *anc) JL_NOTSAFEPOINT
+{
+    if (tn == anc)
+        return 1;
+    jl_svec_t *lin = tn->linearization;
+    if (lin != NULL) {
+        for (size_t i = 1; i < jl_svec_len(lin); i++)
+            if (jl_svecref(lin, i) == (jl_value_t*)anc)
+                return 1;
+        return 0;
+    }
+    if (tn->wrapper == NULL)
+        return 0;
+    jl_datatype_t *dt = (jl_datatype_t*)jl_unwrap_unionall(tn->wrapper);
+    while (dt != NULL && dt != jl_any_type) {
+        dt = jl_atomic_load_relaxed((_Atomic(jl_datatype_t*)*)&dt->super);
+        if (dt != NULL && dt->name == anc)
+            return 1;
+    }
+    return anc == jl_any_type->name;
+}
+
+JL_DLLEXPORT int jl_typename_is_ancestor(jl_typename_t *tn, jl_typename_t *anc) JL_NOTSAFEPOINT
+{
+    return typename_is_ancestor(tn, anc);
+}
+
+// The maximal join typenames below both `a` and `b` (neither an ancestor of
+// the other), as an svec, or NULL if there are none.
+JL_DLLEXPORT jl_svec_t *jl_typename_joins(jl_typename_t *a, jl_typename_t *b)
+{
+    if (!jl_typenames_may_join(a, b))
+        return NULL;
+    arraylist_t found;
+    arraylist_new(&found, 0);
+    JL_LOCK(&join_registry_lock);
+    size_t n = jl_array_nrows(jl_join_registry);
+    for (size_t i = 0; i < n; i++) {
+        jl_typename_t *J = (jl_typename_t*)jl_array_ptr_ref(jl_join_registry, i);
+        if (typename_is_ancestor(J, a) && typename_is_ancestor(J, b))
+            arraylist_push(&found, J);
+    }
+    JL_UNLOCK(&join_registry_lock);
+    // keep only the maximal ones: drop a join that has another one among its ancestors
+    size_t nmax = 0;
+    for (size_t i = 0; i < found.len; i++) {
+        jl_typename_t *J = (jl_typename_t*)found.items[i];
+        int maximal = 1;
+        for (size_t j = 0; j < found.len && maximal; j++)
+            if (i != j && typename_is_ancestor(J, (jl_typename_t*)found.items[j]))
+                maximal = 0;
+        if (maximal)
+            found.items[nmax++] = J;
+    }
+    jl_svec_t *res = NULL;
+    if (nmax > 0) {
+        res = jl_alloc_svec(nmax);
+        for (size_t i = 0; i < nmax; i++)
+            jl_svecset(res, i, (jl_value_t*)found.items[i]);
+    }
+    arraylist_free(&found);
+    return res;
+}
+
+// Record `J` (a typename with several supertypes) as a join, and mark every
+// ancestor typename as possibly joined. Idempotent; called once the
+// definition is kept (see `jl_activate_type`).
+JL_DLLEXPORT void jl_register_join_typename(jl_typename_t *J)
+{
+    jl_svec_t *lin = J->linearization;
+    if (J->parents == NULL || lin == NULL)
+        return;
+    JL_LOCK(&join_registry_lock);
+    size_t n = jl_array_nrows(jl_join_registry), i;
+    int present = 0;
+    for (i = 0; i < n && !present; i++)
+        present = jl_array_ptr_ref(jl_join_registry, i) == (jl_value_t*)J;
+    if (!present)
+        jl_array_ptr_1d_push(jl_join_registry, (jl_value_t*)J);
+    JL_UNLOCK(&join_registry_lock);
+    for (i = 0; i < jl_svec_len(lin); i++)
+        jl_atomic_store_release(&((jl_typename_t*)jl_svecref(lin, i))->may_join, 1);
+}
+
+JL_DLLEXPORT void jl_unregister_join_typename(jl_typename_t *J)
+{
+    JL_LOCK(&join_registry_lock);
+    size_t n = jl_array_nrows(jl_join_registry), i;
+    for (i = 0; i < n; i++) {
+        if (jl_array_ptr_ref(jl_join_registry, i) == (jl_value_t*)J) {
+            jl_array_ptr_set(jl_join_registry, i, jl_array_ptr_ref(jl_join_registry, n - 1));
+            jl_array_del_end(jl_join_registry, 1);
+            break;
+        }
+    }
+    JL_UNLOCK(&join_registry_lock);
+}
+
+// Called once a type definition is kept (not discarded as an equivalent
+// redefinition): publishes what depends on the whole type graph.
+JL_DLLEXPORT void jl_activate_type(jl_datatype_t *dt)
+{
+    if (dt->name->parents != NULL)
+        jl_register_join_typename(dt->name);
+}
+
+// For the Serialization stdlib: restore the multiple-supertypes state of a
+// deserialized type definition (`supers` is a Tuple of the declared
+// supertypes; the first one is already installed as `super`).
+JL_DLLEXPORT void jl_deserialize_typename_extras(jl_datatype_t *dt, jl_value_t *supers, int32_t n_inherited) JL_CANSAFEPOINT
+{
+    dt->name->n_inherited = n_inherited;
+    size_t n = jl_nfields(supers);
+    if (n > 1) {
+        jl_svec_t *sv = jl_alloc_svec(n);
+        JL_GC_PUSH1(&sv);
+        for (size_t i = 0; i < n; i++)
+            jl_svecset(sv, i, jl_fieldref(supers, i));
+        dt->super = NULL;
+        jl_datatype_set_supers(dt, sv);
+        JL_GC_POP();
+    }
+    jl_activate_type(dt);
+}
+
+// Install the declared supertypes of `dt` (an svec of DataTypes with the
+// definition's type variables free, in local precedence order): validate them,
+// set `super`, the typename's `parents` and its linearization, and check the
+// unique-ancestor invariant (an ancestor typename may be reached with only
+// one instantiation).
+void jl_datatype_set_supers(jl_datatype_t *dt, jl_svec_t *supers)
+{
+    jl_typename_t *tn = dt->name;
+    const char *type_name = jl_symbol_name(tn->name);
+    size_t n = jl_svec_len(supers), i, j;
+    if (n == 0)
+        jl_errorf("invalid subtyping in definition of %s: empty supertype list.", type_name);
+    for (i = 0; i < n; i++) {
+        jl_value_t *s = jl_svecref(supers, i);
+        if (jl_is_datatype(s) && tn == ((jl_datatype_t*)s)->name)
+            jl_errorf("invalid subtyping in definition of %s: a type cannot subtype itself.", type_name);
+        jl_check_valid_supertype(s, type_name);
+        for (j = 0; j < i; j++) {
+            if (((jl_datatype_t*)jl_svecref(supers, j))->name == ((jl_datatype_t*)s)->name)
+                jl_errorf("invalid subtyping in definition of %s: duplicate supertype %s.",
+                          type_name, jl_symbol_name(((jl_datatype_t*)s)->name->name));
+        }
+    }
+    int need_lin = n > 1;
+    for (i = 0; i < n && !need_lin; i++)
+        need_lin = ((jl_datatype_t*)jl_svecref(supers, i))->name->has_multiple_supers;
+    jl_svec_t *parents = NULL, *lin = NULL;
+    JL_GC_PUSH3(&supers, &parents, &lin);
+    if (need_lin) {
+        parents = jl_alloc_svec(n);
+        for (i = 0; i < n; i++)
+            jl_svecset(parents, i, (jl_value_t*)((jl_datatype_t*)jl_svecref(supers, i))->name);
+        lin = c3_linearize(tn, parents);
+    }
+    jl_gc_write(dt, dt->super, jl_datatype_t, (jl_datatype_t*)jl_svecref(supers, 0));
+    if (n > 1) {
+        jl_gc_write(tn, tn->parents, jl_svec_t, supers);
+        jl_gc_write(dt, dt->supers, jl_svec_t, supers);
+    }
+    if (need_lin) {
+        jl_gc_write(tn, tn->linearization, jl_svec_t, lin);
+        tn->has_multiple_supers = 1;
+    }
+    if (n > 1) {
+        // unique-ancestor invariant
+        size_t nlin = jl_svec_len(lin);
+        for (size_t k = 1; k < nlin; k++) {
+            jl_typename_t *N = (jl_typename_t*)jl_svecref(lin, k);
+            if (N == jl_any_type->name)
+                continue;
+            jl_datatype_t *seen = NULL;
+            for (i = 0; i < n; i++) {
+                int pending = 0;
+                jl_datatype_t *a = jl_datatype_ancestor((jl_datatype_t*)jl_svecref(supers, i), N, &pending);
+                if (a == NULL)
+                    continue;
+                if (seen == NULL)
+                    seen = a;
+                else if (a != seen && !jl_types_equal((jl_value_t*)seen, (jl_value_t*)a)) {
+                    ios_t buf;
+                    ios_mem(&buf, 64);
+                    jl_static_show((JL_STREAM*)&buf, (jl_value_t*)seen);
+                    ios_write(&buf, " and ", 5);
+                    jl_static_show((JL_STREAM*)&buf, (jl_value_t*)a);
+                    ios_putc('\0', &buf);
+                    jl_errorf("invalid subtyping in definition of %s: inherits %s with conflicting parameters.",
+                              type_name, buf.buf);
+                }
+            }
+        }
+    }
+    JL_GC_POP();
+}
+
 // Field inheritance from abstract ancestors ----------------------------------
 
-// The ancestors of `dt` that declare fields of their own, root-most first.
-// Every `names` list is `[inherited..., own...]`, so an ancestor contributes
-// exactly the slice `names[n_inherited:end]`.
+// The ancestors of `dt` that declare fields of their own, root-most first
+// (the reversed linearization; the `super` chain for single-parent
+// typenames). Every `names` list is `[inherited..., own...]`, so an ancestor
+// contributes exactly the slice `names[n_inherited:end]`.
 static void collect_field_ancestors(jl_datatype_t *dt, arraylist_t *out) JL_CANSAFEPOINT
 {
-    jl_datatype_t *s = jl_datatype_compute_super(dt);
-    while (s != NULL && s != jl_any_type) {
-        jl_typename_t *stn = s->name;
-        if (stn->names != NULL && jl_svec_len(stn->names) > (size_t)stn->n_inherited)
-            arraylist_push(out, s);
-        s = jl_datatype_compute_super(s);
+    jl_svec_t *lin = dt->name->linearization;
+    if (lin != NULL) {
+        for (size_t i = 1; i < jl_svec_len(lin); i++) {
+            jl_typename_t *stn = (jl_typename_t*)jl_svecref(lin, i);
+            if (stn->names != NULL && jl_svec_len(stn->names) > (size_t)stn->n_inherited) {
+                int pending = 0;
+                jl_datatype_t *s = jl_datatype_ancestor(dt, stn, &pending);
+                if (s == NULL)
+                    jl_errorf("invalid field declaration in definition of %s: supertype %s is not defined yet",
+                              jl_symbol_name(dt->name->name), jl_symbol_name(stn->name));
+                arraylist_push(out, s);
+            }
+        }
+    }
+    else {
+        jl_datatype_t *s = jl_datatype_compute_super(dt);
+        while (s != NULL && s != jl_any_type) {
+            jl_typename_t *stn = s->name;
+            if (stn->names != NULL && jl_svec_len(stn->names) > (size_t)stn->n_inherited)
+                arraylist_push(out, s);
+            s = jl_datatype_compute_super(s);
+        }
     }
     for (size_t i = 0, j = out->len; i + 1 < j; i++, j--) {
         void *tmp = out->items[i];
@@ -3144,23 +3508,24 @@ JL_DLLEXPORT jl_value_t *jl_resolve_typegroup(jl_module_t *module, jl_svec_t *ty
             JL_GC_POP();
         }
 
-        // Step 3: Resolve supertypes (after wrapper UnionAlls are set up)
+        // Step 3: Resolve supertypes (after wrapper UnionAlls are set up).
+        // Info slot 5 is a type, or an svec of types for multiple supertypes.
         for (size_t i = 0; i < n; i++) {
             jl_tvar_t *tv = (jl_tvar_t*)jl_svecref(typevars, i);
             jl_svec_t *info = (jl_svec_t*)jl_svecref(struct_infos, i);
             jl_value_t *super = jl_svecref(info, 5);
             if (super != jl_nothing && super != NULL) {
-                const char *type_name = jl_symbol_name(tv->name);
-                jl_value_t *resolved_super = NULL;
-                JL_GC_PUSH3(&tv, &super, &resolved_super);
-                resolved_super = resolve_type_refs(super, &subst_map, &dcache);
-                // Check self-subtyping before jl_check_valid_supertype, which
-                // calls jl_subtype and would crash on types with super == NULL.
-                if (jl_is_datatype(resolved_super) &&
-                    datatypes[i]->name == ((jl_datatype_t*)resolved_super)->name)
-                    jl_errorf("invalid subtyping in definition of %s: a type cannot subtype itself.", type_name);
-                jl_check_valid_supertype(resolved_super, type_name);
-                jl_gc_write(datatypes[i], datatypes[i]->super, jl_datatype_t, (jl_datatype_t*)resolved_super);
+                jl_svec_t *supers = NULL;
+                JL_GC_PUSH3(&tv, &super, &supers);
+                size_t ns = jl_is_svec(super) ? jl_svec_len((jl_svec_t*)super) : 1;
+                supers = jl_alloc_svec(ns);
+                for (size_t j = 0; j < ns; j++) {
+                    jl_value_t *s = jl_is_svec(super) ? jl_svecref((jl_svec_t*)super, j) : super;
+                    jl_svecset(supers, j, resolve_type_refs(s, &subst_map, &dcache));
+                }
+                // the placeholder `super` set in step 1 is replaced here
+                datatypes[i]->super = NULL;
+                jl_datatype_set_supers(datatypes[i], supers);
                 JL_GC_POP();
             }
         }
@@ -3357,6 +3722,16 @@ JL_DLLEXPORT jl_value_t *jl_resolve_typegroup(jl_module_t *module, jl_svec_t *ty
     }
     htable_free(&dcache.set);
     htable_free(&dcache.group);
+
+    // Step 9: activate the new (kept) definitions
+    for (size_t i = 0; i < n; i++) {
+        jl_datatype_t *dt = unwrap_to_datatype(results[i]);
+        if (dt == datatypes[i]) {
+            JL_GC_PUSH1(&dt);
+            jl_activate_type(dt);
+            JL_GC_POP();
+        }
+    }
 
     // Build result tuple
     jl_value_t *result = jl_f_tuple(NULL, results, n);

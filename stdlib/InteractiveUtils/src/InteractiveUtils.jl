@@ -265,6 +265,13 @@ function methodswith(@nospecialize(t::Type); supertypes::Bool=false, world::UInt
 end
 
 # subtypes
+function _has_direct_supertype_named(dt::DataType, name::Core.TypeName)
+    for st in Base.direct_supertypes(dt)
+        st.name == name && return true
+    end
+    return false
+end
+
 function _subtypes_in!(mods::Array, @nospecialize(x::Type), world::UInt)
     xt = unwrap_unionall(x)
     if !isabstracttype(x) || !isa(xt, DataType)
@@ -280,7 +287,7 @@ function _subtypes_in!(mods::Array, @nospecialize(x::Type), world::UInt)
                 t = Base.invoke_in_world(world, getglobal, m, s)
                 dt = isa(t, UnionAll) ? unwrap_unionall(t) : t
                 if isa(dt, DataType)
-                    if dt.name.name === s && dt.name.module == m && supertype(dt).name == xt.name
+                    if dt.name.name === s && dt.name.module == m && _has_direct_supertype_named(dt, xt.name)
                         ti = typeintersect(t, x)
                         ti != Bottom && push!(sts, ti)
                     end
@@ -319,7 +326,9 @@ subtypes(x::Type; world::UInt=Base.get_world_counter()) = _subtypes_in!(Base.loa
 
 Return a tuple `(T, ..., Any)` of `T` and all its supertypes, as determined by
 successive calls to the [`supertype`](@ref) function, listed in order of `<:`
-and terminated by `Any`.
+and terminated by `Any`. For a type declaring several supertypes
+(`struct C <: (A, B) end`) the tuple lists every supertype, in the order
+used to resolve dispatch between them (see [`Base.ancestors`](@ref)).
 
 See also [`subtypes`](@ref).
 
@@ -330,10 +339,10 @@ julia> supertypes(Int)
 ```
 """
 function supertypes(T::Type)
-    S = supertype(T)
     # note: we return a tuple here, not an Array as for subtypes, because in
     #       the future we could evaluate this function statically if desired.
-    return S === T ? (T,) : (T, supertypes(S)...)
+    T === Any && return (Any,)
+    return (T, Base.ancestors(T)...)
 end
 
 # TODO: @deprecate peakflops to LinearAlgebra

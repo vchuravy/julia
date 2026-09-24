@@ -2835,9 +2835,12 @@ static jl_value_t *inst_datatype_inner(jl_datatype_t *dt, jl_svec_t *p, jl_value
     // so ordinary recursive types are unaffected. Field types stay eager: a
     // concrete type must publish with its layout, and only the supertype
     // declaration can force an infinite graph through abstract levels.
+    // (Secondary supertypes are always instantiated lazily, by
+    // `jl_datatype_compute_supers`.)
     int defer_super = check && !istuple && !isnamedtuple && dt->super != NULL &&
         typename_on_stack(top.prev, tn) &&
-        typename_occurs_in((jl_value_t*)primarydt->super, tn);
+        (typename_occurs_in((jl_value_t*)primarydt->super, tn) ||
+         (tn->parents != NULL && typename_occurs_in((jl_value_t*)tn->parents, tn)));
     if (istuple || isnamedtuple) {
         ndt->super = jl_any_type;
     }
@@ -3470,6 +3473,196 @@ JL_DLLEXPORT jl_value_t *jl_datatype_super(jl_datatype_t *dt)
     return (jl_value_t*)super;
 }
 
+// Multiple supertypes ----------------------------------------------------------
+
+// Every direct supertype of `ndt`, instantiated at its parameters (the
+// typename's `parents` templates under `ndt`'s parameters), computed on first
+// demand and cached in `ndt->supers`. Returns NULL for a single-parent typename
+// (use `jl_datatype_compute_super`) or while the definition is in progress.
+JL_DLLEXPORT jl_svec_t *jl_datatype_compute_supers(jl_datatype_t *ndt JL_PROPAGATES_ROOT)
+{
+    _Atomic(jl_svec_t*) *supersp = (_Atomic(jl_svec_t*)*)&ndt->supers;
+    jl_svec_t *supers = jl_atomic_load_acquire(supersp);
+    if (supers != NULL)
+        return supers;
+    jl_typename_t *tn = ndt->name;
+    jl_svec_t *parents = tn->parents;
+    if (parents == NULL || tn->wrapper == NULL)
+        return NULL;
+    if (jl_datatype_compute_super(ndt) == NULL)
+        return NULL; // definition in progress
+    jl_datatype_t *primarydt = (jl_datatype_t*)jl_unwrap_unionall(tn->wrapper);
+    jl_svec_t *res = NULL;
+    if (primarydt == ndt) {
+        res = parents;
+    }
+    else {
+        size_t n = jl_svec_len(parents), nparams = jl_svec_len(ndt->parameters), pi;
+        jl_typeenv_t *penv = (jl_typeenv_t*)alloca(nparams * sizeof(jl_typeenv_t));
+        for (pi = 0; pi < nparams; pi++) {
+            penv[pi].var = (jl_tvar_t*)jl_svecref(primarydt->parameters, pi);
+            penv[pi].val = jl_svecref(ndt->parameters, pi);
+            penv[pi].prev = pi == 0 ? NULL : &penv[pi - 1];
+        }
+        jl_typestack_t stop = { ndt, NULL };
+        JL_GC_PUSH1(&res);
+        res = jl_alloc_svec(n);
+        for (size_t i = 0; i < n; i++) {
+            jl_value_t *s = inst_type_w_(jl_svecref(parents, i),
+                                         nparams == 0 ? NULL : &penv[nparams - 1],
+                                         &stop, 1, 0, NULL);
+            jl_svecset(res, i, s);
+        }
+        JL_GC_POP();
+    }
+    // concurrent first queries compute equal values; the compare-and-swap
+    // keeps a single winner
+    supers = NULL;
+    jl_gc_wb(ndt, (void*)supersp, res);
+    if (jl_atomic_cmpswap(supersp, &supers, res))
+        supers = res;
+    return supers;
+}
+
+// The unique ancestor of `dt` whose typename is `tn` (`dt` itself when the
+// names match), or NULL if there is none. A definition in progress makes the
+// answer unknown: NULL is returned and `*pending` (if given) is set.
+// Single-parent typenames walk the `super` chain; the others fill the
+// `ancestors` cache, parallel to the typename's linearization.
+JL_DLLEXPORT jl_datatype_t *jl_datatype_ancestor(jl_datatype_t *dt JL_PROPAGATES_ROOT, jl_typename_t *tn, int *pending)
+{
+    if (dt->name == tn)
+        return dt;
+    if (!dt->name->has_multiple_supers) {
+        jl_datatype_t *s = dt;
+        while (s != jl_any_type) {
+            s = jl_datatype_compute_super(s);
+            if (s == NULL) {
+                if (pending)
+                    *pending = 1;
+                return NULL;
+            }
+            if (s->name == tn)
+                return s;
+        }
+        return NULL;
+    }
+    jl_svec_t *lin = dt->name->linearization;
+    assert(lin != NULL);
+    size_t n = jl_svec_len(lin), i;
+    _Atomic(jl_svec_t*) *ancp = (_Atomic(jl_svec_t*)*)&dt->ancestors;
+    jl_svec_t *anc = jl_atomic_load_acquire(ancp);
+    if (anc == NULL) {
+        jl_svec_t *sup = jl_datatype_compute_supers(dt);
+        jl_datatype_t *super1 = NULL;
+        size_t nsup;
+        if (sup == NULL) {
+            // a single direct parent, inherited from a multi-parent ancestor
+            super1 = jl_datatype_compute_super(dt);
+            if (super1 == NULL) {
+                if (pending)
+                    *pending = 1;
+                return NULL;
+            }
+            nsup = 1;
+        }
+        else {
+            nsup = jl_svec_len(sup);
+        }
+        JL_GC_PUSH3(&sup, &super1, &anc);
+        anc = jl_alloc_svec(n);
+        jl_svecset(anc, 0, dt);
+        for (i = 1; i < n; i++) {
+            jl_typename_t *N = (jl_typename_t*)jl_svecref(lin, i);
+            jl_datatype_t *found = NULL;
+            for (size_t k = 0; k < nsup && found == NULL; k++) {
+                jl_datatype_t *p = sup ? (jl_datatype_t*)jl_svecref(sup, k) : super1;
+                int subpending = 0;
+                found = jl_datatype_ancestor(p, N, &subpending);
+                if (found == NULL && subpending) {
+                    JL_GC_POP();
+                    if (pending)
+                        *pending = 1;
+                    return NULL;
+                }
+            }
+            // by the unique-ancestor invariant any hit is the unique one, and
+            // every linearized typename is an ancestor of some direct parent
+            assert(found != NULL);
+            jl_svecset(anc, i, found);
+        }
+        JL_GC_POP();
+        jl_svec_t *prev = NULL;
+        jl_gc_wb(dt, (void*)ancp, anc);
+        if (!jl_atomic_cmpswap(ancp, &prev, anc))
+            anc = prev;
+    }
+    for (i = 0; i < n; i++) {
+        if (jl_svecref(lin, i) == (jl_value_t*)tn)
+            return (jl_datatype_t*)jl_svecref(anc, i);
+    }
+    return NULL;
+}
+
+// Like `jl_datatype_ancestor`, but reads only already published state and
+// never reaches a safepoint: an unfilled `super`/`ancestors` slot makes the
+// answer unknown (NULL with `*pending` set) instead of computing it.
+jl_datatype_t *jl_datatype_ancestor_raw(jl_datatype_t *dt, jl_typename_t *tn, int *pending) JL_NOTSAFEPOINT
+{
+    if (dt->name == tn)
+        return dt;
+    if (!dt->name->has_multiple_supers) {
+        jl_datatype_t *s = dt;
+        while (s != jl_any_type) {
+            s = jl_atomic_load_relaxed((_Atomic(jl_datatype_t*)*)&s->super);
+            if (s == NULL) {
+                *pending = 1;
+                return NULL;
+            }
+            if (s->name == tn)
+                return s;
+        }
+        return NULL;
+    }
+    jl_svec_t *anc = jl_atomic_load_acquire((_Atomic(jl_svec_t*)*)&dt->ancestors);
+    if (anc == NULL) {
+        *pending = 1;
+        return NULL;
+    }
+    jl_svec_t *lin = dt->name->linearization;
+    size_t n = jl_svec_len(lin), i;
+    for (i = 0; i < n; i++) {
+        if (jl_svecref(lin, i) == (jl_value_t*)tn)
+            return (jl_datatype_t*)jl_svecref(anc, i);
+    }
+    return NULL;
+}
+
+// Julia-visible accessors: `nothing` instead of NULL
+JL_DLLEXPORT jl_value_t *jl_datatype_supers(jl_datatype_t *dt) JL_CANSAFEPOINT
+{
+    jl_svec_t *s = jl_datatype_compute_supers(dt);
+    return s == NULL ? jl_nothing : (jl_value_t*)s;
+}
+
+JL_DLLEXPORT jl_value_t *jl_get_typename_linearization(jl_typename_t *tn) JL_CANSAFEPOINT
+{
+    jl_svec_t *lin = jl_typename_linearization(tn);
+    return lin == NULL ? jl_nothing : (jl_value_t*)lin;
+}
+
+// forcing accessor for Julia-visible reads: the ancestor of `dt` named `tn`,
+// or `nothing`
+JL_DLLEXPORT jl_value_t *jl_datatype_ancestor_force(jl_datatype_t *dt, jl_typename_t *tn)
+{
+    int pending = 0;
+    jl_datatype_t *a = jl_datatype_ancestor(dt, tn, &pending);
+    if (a == NULL && pending)
+        jl_errorf("supertypes of %s are not defined yet (type definition in progress)",
+                  jl_symbol_name(dt->name->name));
+    return a == NULL ? jl_nothing : (jl_value_t*)a;
+}
+
 void jl_reinstantiate_inner_types(jl_datatype_t *t, jl_deferred_typecache_t *dcache) // can throw!
 {
     assert(jl_is_datatype(t));
@@ -3612,8 +3805,8 @@ void jl_init_types(void) JL_GC_DISABLED
     // self-referential instantiation stays NULL until
     // `jl_datatype_compute_super` fills it (reads then see an undefined
     // field, matching the interpreter), and `types`/`layout` are lazy too
-    jl_datatype_type->name->n_uninitialized = 8 - 1;
-    jl_datatype_type->name->names = jl_perm_symsvec(8,
+    jl_datatype_type->name->n_uninitialized = 10 - 1;
+    jl_datatype_type->name->names = jl_perm_symsvec(10,
             "name",
             "super",
             "parameters",
@@ -3621,8 +3814,10 @@ void jl_init_types(void) JL_GC_DISABLED
             "instance",
             "layout",
             "hash",
-            "flags"); // "hasfreetypevars", "isconcretetype", "isdispatchtuple", "isbitstype", "zeroinit", "has_concrete_subtype", "maybe_subtype_of_cache"
-    jl_datatype_type->types = jl_svec(8,
+            "flags", // "hasfreetypevars", "isconcretetype", "isdispatchtuple", "isbitstype", "zeroinit", "has_concrete_subtype", "maybe_subtype_of_cache"
+            "supers",
+            "ancestors");
+    jl_datatype_type->types = jl_svec(10,
             jl_typename_type,
             jl_datatype_type,
             jl_simplevector_type,
@@ -3630,9 +3825,11 @@ void jl_init_types(void) JL_GC_DISABLED
             jl_any_type, // instance
             jl_any_type /*jl_voidpointer_type*/,
             jl_any_type /*jl_int32_type*/,
-            jl_any_type /*jl_uint16_type*/);
+            jl_any_type /*jl_uint16_type*/,
+            jl_simplevector_type,
+            jl_simplevector_type);
     const static uint32_t datatype_constfields[1] = { 0x00000055 }; // (1<<0)|(1<<2)|(1<<4)|(1<<6)
-    const static uint32_t datatype_atomicfields[1] = { 0x0000002a }; // (1<<1)|(1<<3)|(1<<5)
+    const static uint32_t datatype_atomicfields[1] = { 0x0000032a }; // (1<<1)|(1<<3)|(1<<5)|(1<<8)|(1<<9)
     jl_datatype_type->name->constfields = datatype_constfields;
     jl_datatype_type->name->atomicfields = datatype_atomicfields;
     jl_precompute_memoized_dt(jl_datatype_type, 1);
@@ -3641,20 +3838,21 @@ void jl_init_types(void) JL_GC_DISABLED
     jl_typename_type->name->wrapper = (jl_value_t*)jl_typename_type;
     jl_typename_type->super = jl_any_type;
     jl_typename_type->parameters = jl_emptysvec;
-    jl_typename_type->name->n_uninitialized = 20 - 2;
-    jl_typename_type->name->names = jl_perm_symsvec(20, "name", "module", "singletonname",
+    jl_typename_type->name->n_uninitialized = 23 - 2;
+    jl_typename_type->name->names = jl_perm_symsvec(23, "name", "module", "singletonname",
                                                     "names", "atomicfields", "constfields",
                                                     "wrapper", "Typeofwrapper", "cache", "linearcache",
                                                     "partial", "hash", "max_args", "n_uninitialized",
-                                                    "flags", // "abstract", "mutable", "mayinlinealloc",
+                                                    "flags", // "abstract", "mutable", "mayinlinealloc", "has_multiple_supers"
                                                     "cache_entry_count", "max_methods", "constprop_heuristic",
-                                                    "concrete_only", "n_inherited");
-    const static uint32_t typename_constfields[1]  = { 0b10000110100001001011 }; // TODO: put back atomicfields and constfields in this list
-    const static uint32_t typename_atomicfields[1] = { 0b00001001001110000000 };
+                                                    "concrete_only", "n_inherited",
+                                                    "parents", "linearization", "may_join");
+    const static uint32_t typename_constfields[1]  = { 0b01110000110100001001011 }; // TODO: put back atomicfields and constfields in this list
+    const static uint32_t typename_atomicfields[1] = { 0b10000001001001110000000 };
     jl_typename_type->name->constfields = typename_constfields;
     jl_typename_type->name->atomicfields = typename_atomicfields;
     jl_precompute_memoized_dt(jl_typename_type, 1);
-    jl_typename_type->types = jl_svec(20, jl_symbol_type, jl_any_type /*jl_module_type*/, jl_symbol_type,
+    jl_typename_type->types = jl_svec(23, jl_symbol_type, jl_any_type /*jl_module_type*/, jl_symbol_type,
                                       jl_simplevector_type,
                                       jl_any_type/*jl_voidpointer_type*/, jl_any_type/*jl_voidpointer_type*/,
                                       jl_type_type, jl_simplevector_type, jl_simplevector_type,
@@ -3667,7 +3865,10 @@ void jl_init_types(void) JL_GC_DISABLED
                                       jl_any_type /*jl_uint8_type*/,
                                       jl_any_type /*jl_uint8_type*/,
                                       jl_any_type /*jl_bool_type*/,
-                                      jl_any_type /*jl_int32_type*/);
+                                      jl_any_type /*jl_int32_type*/,
+                                      jl_simplevector_type,
+                                      jl_simplevector_type,
+                                      jl_any_type /*jl_uint8_type*/);
 
     jl_methcache_type->name = jl_new_typename_in(jl_symbol("MethodCache"), core, 0, 1);
     jl_methcache_type->name->wrapper = (jl_value_t*)jl_methcache_type;
@@ -4592,6 +4793,7 @@ void jl_init_types(void) JL_GC_DISABLED
     jl_svecset(jl_typename_type->types, 17, jl_uint8_type);
     jl_svecset(jl_typename_type->types, 18, jl_bool_type);
     jl_svecset(jl_typename_type->types, 19, jl_int32_type);
+    jl_svecset(jl_typename_type->types, 22, jl_uint8_type);
     jl_svecset(jl_methcache_type->types, 2, jl_long_type); // voidpointer
     jl_svecset(jl_methcache_type->types, 3, jl_long_type); // uint32_t plus alignment
     jl_svecset(jl_methtable_type->types, 3, jl_module_type);

@@ -455,8 +455,41 @@ exit:
     }
 }
 
+// Iterate the typenames of a datatype and its ancestors (self first, Any's
+// last): the linearization when the ancestry is not a chain (multiple
+// supertypes), else the `super` chain. `next` returns NULL at the end, or when
+// a definition in progress cuts the walk short.
+typedef struct {
+    jl_datatype_t *dt;
+    jl_svec_t *lin;
+    size_t i;
+} ancestor_iter_t;
+
+static inline void ancestor_iter_init(ancestor_iter_t *it, jl_datatype_t *dt) JL_NOTSAFEPOINT
+{
+    it->dt = dt;
+    it->lin = dt->name->linearization;
+    it->i = 0;
+}
+
+static inline jl_typename_t *ancestor_iter_next(ancestor_iter_t *it) JL_CANSAFEPOINT
+{
+    if (it->lin != NULL) {
+        if (it->i >= jl_svec_len(it->lin))
+            return NULL;
+        return (jl_typename_t*)jl_svecref(it->lin, it->i++);
+    }
+    jl_datatype_t *dt = it->dt;
+    if (dt == NULL)
+        return NULL;
+    it->dt = dt == jl_any_type ? NULL : jl_datatype_compute_super(dt);
+    return dt->name;
+}
+
 static unsigned jl_supertype_height(jl_datatype_t *dt) JL_CANSAFEPOINT
 {
+    if (dt->name->linearization != NULL)
+        return jl_svec_len(dt->name->linearization) + 1;
     unsigned height = 1;
     while (dt != NULL && dt != jl_any_type) {
         height++;
@@ -470,6 +503,12 @@ static int tname_intersection_dt(jl_datatype_t *a, jl_typename_t *bname, unsigne
 {
     if (a == jl_any_type)
         return 1;
+    jl_typename_t *aname = a->name;
+    if (aname->linearization != NULL || bname->linearization != NULL) {
+        // not chains: membership in the linearizations, or a common join
+        return jl_typename_is_ancestor(aname, bname) || jl_typename_is_ancestor(bname, aname) ||
+               jl_typenames_may_join(aname, bname);
+    }
     jl_datatype_t *b = (jl_datatype_t*)jl_unwrap_unionall(bname->wrapper);
     unsigned hb = 1;
     while (b != NULL && b != jl_any_type) {
@@ -484,7 +523,8 @@ static int tname_intersection_dt(jl_datatype_t *a, jl_typename_t *bname, unsigne
         if (a == NULL)
             return 1; // definition in progress: conservatively may intersect
     }
-    return a->name == bname;
+    // unrelated names may still share a subtype declaring both (a join)
+    return a->name == bname || jl_typenames_may_join(aname, bname);
 }
 
 static int tname_intersection(jl_value_t *a, jl_typename_t *bname, int8_t tparam) JL_CANSAFEPOINT
@@ -851,17 +891,15 @@ int jl_typemap_intersection_visitor(jl_typemap_t *map, int offs,
                     jl_datatype_t *super = (jl_datatype_t*)jl_unwrap_unionall(((jl_typename_t*)name)->wrapper);
                     if (super->name == jl_typeofbottom_type->name)
                         super = super->super; // this was handled above
-                    while (1) {
+                    ancestor_iter_t it;
+                    ancestor_iter_init(&it, super);
+                    jl_typename_t *stn;
+                    while ((stn = ancestor_iter_next(&it)) != NULL) {
                         tname = jl_atomic_load_relaxed(&cache->tname); // reload after callback
-                        jl_typemap_t *ml = mtcache_hash_lookup(tname, (jl_value_t*)super->name);
+                        jl_typemap_t *ml = mtcache_hash_lookup(tname, (jl_value_t*)stn);
                         if (ml != jl_nothing) {
                             if (!jl_typemap_intersection_visitor(ml, offs+1, closure)) { JL_GC_POP(); return 0; }
                         }
-                        if (super == jl_any_type)
-                            break;
-                        super = jl_datatype_compute_super(super);
-                        if (super == NULL)
-                            break; // definition in progress
                     }
                 }
                 else {
@@ -876,17 +914,15 @@ int jl_typemap_intersection_visitor(jl_typemap_t *map, int offs,
                 if (name && jl_type_extract_name_precise(ty, 0)) {
                     jl_datatype_t *super = (jl_datatype_t*)jl_unwrap_unionall(((jl_typename_t*)name)->wrapper);
                     // direct lookup of concrete types
-                    while (1) {
+                    ancestor_iter_t it;
+                    ancestor_iter_init(&it, super);
+                    jl_typename_t *stn;
+                    while ((stn = ancestor_iter_next(&it)) != NULL) {
                         name1 = jl_atomic_load_relaxed(&cache->name1); // reload after callback
-                        jl_typemap_t *ml = mtcache_hash_lookup(name1, (jl_value_t*)super->name);
+                        jl_typemap_t *ml = mtcache_hash_lookup(name1, (jl_value_t*)stn);
                         if (ml != jl_nothing) {
                             if (!jl_typemap_intersection_visitor(ml, offs+1, closure)) { JL_GC_POP(); return 0; }
                         }
-                        if (super == jl_any_type)
-                            break;
-                        super = jl_datatype_compute_super(super);
-                        if (super == NULL)
-                            break; // definition in progress
                     }
                 }
                 else {
@@ -1095,18 +1131,18 @@ jl_typemap_entry_t *jl_typemap_assoc_by_type(
                 jl_value_t *a0 = ty && jl_is_some_Type(ty) ? jl_type_extract_name(jl_some_Type_T(ty), 1) : NULL;
                 if (a0) { // TODO: if we start analyzing Union types in jl_type_extract_name, then a0 might be over-approximated here, leading us to miss possible subtypes
                     jl_datatype_t *super = (jl_datatype_t*)jl_unwrap_unionall(((jl_typename_t*)a0)->wrapper);
-                    while (1) {
+                    ancestor_iter_t it;
+                    ancestor_iter_init(&it, super);
+                    jl_typename_t *stn;
+                    while ((stn = ancestor_iter_next(&it)) != NULL) {
                         tname = jl_atomic_load_relaxed(&cache->tname); // reload after tree descent (which may hit safepoints)
-                        jl_typemap_t *ml = mtcache_hash_lookup(tname, (jl_value_t*)super->name);
+                        jl_typemap_t *ml = mtcache_hash_lookup(tname, (jl_value_t*)stn);
                         if (ml != (void*)jl_nothing) {
                             jl_typemap_entry_t *li = jl_typemap_assoc_by_type(ml, search, offs + 1, subtype);
                             if (li) return li;
                         }
-                        if (super == jl_any_type || !subtype)
+                        if (!subtype)
                             break;
-                        super = jl_datatype_compute_super(super);
-                        if (super == NULL)
-                            break; // definition in progress
                     }
                 }
                 else {
@@ -1136,19 +1172,19 @@ jl_typemap_entry_t *jl_typemap_assoc_by_type(
                     jl_value_t *a0 = jl_type_extract_name(ty, 0);
                     if (a0) { // TODO: if we start analyzing Union types in jl_type_extract_name, then a0 might be over-approximated here, leading us to miss possible subtypes
                         jl_datatype_t *super = (jl_datatype_t*)jl_unwrap_unionall(((jl_typename_t*)a0)->wrapper);
-                        while (1) {
+                        ancestor_iter_t it;
+                        ancestor_iter_init(&it, super);
+                        jl_typename_t *stn;
+                        while ((stn = ancestor_iter_next(&it)) != NULL) {
                             name1 = jl_atomic_load_relaxed(&cache->name1); // reload after tree descent (which may hit safepoints)
-                            jl_typemap_t *ml = mtcache_hash_lookup(name1, (jl_value_t*)super->name);
+                            jl_typemap_t *ml = mtcache_hash_lookup(name1, (jl_value_t*)stn);
                             if (ml != (void*)jl_nothing) {
                                 jl_typemap_entry_t *li =
                                     jl_typemap_assoc_by_type(ml, search, offs + 1, subtype);
                                 if (li) return li;
                             }
-                            if (super == jl_any_type || !subtype)
+                            if (!subtype)
                                 break;
-                            super = jl_datatype_compute_super(super);
-                            if (super == NULL)
-                                break; // definition in progress
                         }
                     }
                 }
@@ -1297,17 +1333,14 @@ jl_typemap_entry_t *jl_typemap_level_assoc_exact(jl_typemap_level_t *cache, jl_v
             if (name) {
                 if (ty != (jl_value_t*)jl_datatype_type)
                     a1 = jl_unwrap_unionall(((jl_typename_t*)name)->wrapper);
-                while (1) {
+                ancestor_iter_t it;
+                ancestor_iter_init(&it, (jl_datatype_t*)a1);
+                jl_typename_t *stn;
+                while ((stn = ancestor_iter_next(&it)) != NULL) {
                     tname = jl_atomic_load_relaxed(&cache->tname); // reload after tree descent (which may hit safepoints)
-                    jl_typemap_t *ml_or_cache = mtcache_hash_lookup(
-                            tname, (jl_value_t*)((jl_datatype_t*)a1)->name);
+                    jl_typemap_t *ml_or_cache = mtcache_hash_lookup(tname, (jl_value_t*)stn);
                     jl_typemap_entry_t *ml = jl_typemap_assoc_exact(ml_or_cache, arg1, args, n, offs+1, world);
                     if (ml) return ml;
-                    if (a1 == (jl_value_t*)jl_any_type)
-                        break;
-                    a1 = (jl_value_t*)jl_datatype_compute_super((jl_datatype_t*)a1);
-                    if (a1 == NULL)
-                        break; // definition in progress
                 }
             }
             else {
@@ -1330,17 +1363,14 @@ jl_typemap_entry_t *jl_typemap_level_assoc_exact(jl_typemap_level_t *cache, jl_v
         }
         jl_genericmemory_t *name1 = jl_atomic_load_relaxed(&cache->name1);
         if (name1 != (jl_genericmemory_t*)jl_an_empty_memory_any) {
-            while (1) {
+            ancestor_iter_t it;
+            ancestor_iter_init(&it, (jl_datatype_t*)ty);
+            jl_typename_t *stn;
+            while ((stn = ancestor_iter_next(&it)) != NULL) {
                 name1 = jl_atomic_load_relaxed(&cache->name1); // reload after tree descent (which may hit safepoints)
-                jl_typemap_t *ml_or_cache = mtcache_hash_lookup(
-                        name1, (jl_value_t*)((jl_datatype_t*)ty)->name);
+                jl_typemap_t *ml_or_cache = mtcache_hash_lookup(name1, (jl_value_t*)stn);
                 jl_typemap_entry_t *ml = jl_typemap_assoc_exact(ml_or_cache, arg1, args, n, offs+1, world);
                 if (ml) return ml;
-                if (ty == (jl_value_t*)jl_any_type)
-                    break;
-                ty = (jl_value_t*)jl_datatype_compute_super((jl_datatype_t*)ty);
-                if (ty == NULL)
-                    break; // definition in progress
             }
         }
     }

@@ -187,6 +187,8 @@ Base.WeakRef
 
 ```@docs
 Base.supertype
+Base.direct_supertypes
+Base.ancestors
 Core.Type
 Core.DataType
 Core.:(<:)

@@ -89,7 +89,7 @@ const TAGS = Any[
 const NTAGS = length(TAGS)
 @assert NTAGS == 255
 
-const ser_version = 31 # do not make changes without bumping the version #!
+const ser_version = 32 # do not make changes without bumping the version #!
 
 format_version(::AbstractSerializer) = ser_version
 format_version(s::Serializer) = s.version
@@ -715,6 +715,8 @@ function serialize_typename(s::AbstractSerializer, t::Core.TypeName)
     serialize(s, t.flags & 0x2 == 0x2) # .mutable
     serialize(s, Int32(length(primary.types) - t.n_uninitialized))
     serialize(s, t.max_methods)
+    serialize(s, Int32(t.n_inherited))
+    serialize(s, Base.direct_supertypes(primary)) # all declared supertypes (one for ordinary types)
     ms = Base.matches_to_methods(Base._methods_by_ftype(Tuple{t.wrapper, Vararg}, -1, Base.get_world_counter()), t, nothing).ms
     if t.singletonname !== t.name || !isempty(ms)
         serialize(s, t.singletonname)
@@ -1696,6 +1698,8 @@ function deserialize_typename(s::AbstractSerializer, number)
     mutabl = deserialize(s)::Bool
     ninitialized = deserialize(s)::Int32
     maxm = format_version(s) >= 18 ? deserialize(s)::UInt8 : UInt8(0)
+    ninherited = format_version(s) >= 32 ? deserialize(s)::Int32 : Int32(0)
+    supers = format_version(s) >= 32 ? deserialize(s)::Tuple : (super,)
 
     if makenew
         # TODO: there's an unhanded cycle in the dependency graph at this point:
@@ -1705,6 +1709,9 @@ function deserialize_typename(s::AbstractSerializer, number)
                     tn, tn.module, super, parameters, names, types, attrs,
                     abstr, mutabl, ninitialized)
         @assert tn == ndt.name
+        # inherited-field count and the remaining declared supertypes (the
+        # first one is `super` already)
+        ccall(:jl_deserialize_typename_extras, Cvoid, (Any, Any, Int32), ndt, supers, ninherited)
         ccall(:jl_set_const, Cvoid, (Any, Any, Any), tn.module, tn.name, tn.wrapper)
         ty = tn.wrapper
         tn.max_methods = maxm

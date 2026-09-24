@@ -1129,7 +1129,9 @@
         (if (&& (call (core isdefinedglobal) (thismodule) (inert ,name) (false))
                 (call (core _equiv_typedef) (globalref (thismodule) ,name) ,name))
             (null)
-            (const (globalref (thismodule) ,name) ,name))
+            (block
+             (const (globalref (thismodule) ,name) ,name)
+             (call (core _activate_type!) ,name)))
         (latestworld)
         (null)))
       ,@(if (null? defs)
@@ -1158,20 +1160,29 @@
        (if (&& (call (core isdefinedglobal) (thismodule) (inert ,name) (false))
                (call (core _equiv_typedef) (globalref (thismodule) ,name) ,name))
            (null)
-           (const (globalref (thismodule) ,name) ,name))
+           (block
+            (const (globalref (thismodule) ,name) ,name)
+            (call (core _activate_type!) ,name)))
        (latestworld)
        (null))))))
 
-;; take apart a type signature, e.g. T{X} <: S{Y}
+;; take apart a type signature, e.g. T{X} <: S{Y}, or T <: (S, U) for
+;; multiple supertypes (the supertype becomes an svec of types)
 (define (analyze-type-sig ex)
+  (define (supers-expr super)
+    (if (and (pair? super) (eq? (car super) 'tuple))
+        (if (null? (cdr super))
+            (error "invalid type signature: empty supertype list")
+            `(call (core svec) ,@(cdr super)))
+        super))
   (or ((pattern-lambda (-- name (-s))
                        (values name '() '(core Any))) ex)
       ((pattern-lambda (curly (-- name (-s)) . params)
                        (values name params '(core Any))) ex)
       ((pattern-lambda (|<:| (-- name (-s)) super)
-                       (values name '() super)) ex)
+                       (values name '() (supers-expr super))) ex)
       ((pattern-lambda (|<:| (curly (-- name (-s)) . params) super)
-                       (values name params super)) ex)
+                       (values name params (supers-expr super))) ex)
       (error "invalid type signature")))
 
 ;; normalize ccall first argument to tuple form with basic error checking

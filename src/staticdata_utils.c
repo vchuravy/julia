@@ -71,6 +71,27 @@ int must_be_new_dt(jl_value_t *t, htable_t *news, char *image_base, size_t sizeo
             // for example while handling `Type{Mask{4, U} where U}`, if we have `Mask{4, U} <: AbstractSIMDVector{4}`
             super = super->super;
         }
+        // secondary supertypes (multiple supertypes) are checked the same way,
+        // from the already computed cache (always present on the primary
+        // datatype; a lazily filled instantiation without it is covered by
+        // the parameter check below)
+        if (dt->name->parents != NULL) {
+            jl_svec_t *supers = jl_atomic_load_relaxed((_Atomic(jl_svec_t*)*)&dt->supers);
+            for (size_t k = 1; supers != NULL && k < jl_svec_len(supers); k++) {
+                jl_datatype_t *s2 = (jl_datatype_t*)jl_svecref(supers, k);
+                while (s2 != NULL && s2 != jl_any_type) {
+                    void *entry = ptrhash_get(news, (void*)s2);
+                    if (entry != HT_NOTFOUND) {
+                        if (entry != (void*)s2)
+                            return 1;
+                        break;
+                    }
+                    if (!(image_base < (char*)s2 && (char*)s2 <= image_base + sizeof_sysimg))
+                        break;
+                    s2 = s2->super;
+                }
+            }
+        }
         jl_svec_t *tt = dt->parameters;
         size_t i, l = jl_svec_len(tt);
         for (i = 0; i < l; i++)

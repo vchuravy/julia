@@ -3194,6 +3194,13 @@ function analyze_type_sig(ctx, ex)
             type_params = ex[1][2:end]
             supertype = ex[2]
         end
+        if @isdefined(supertype) && kind(supertype) == K"tuple"
+            # multiple supertypes: `T <: (A, B)` becomes an svec of types
+            if numchildren(supertype) == 0
+                throw(LoweringError(supertype, "invalid type signature: empty supertype list"))
+            end
+            supertype = @ast ctx supertype [K"call" "svec"::K"core" children(supertype)...]
+        end
     end
     @isdefined(name) || throw(LoweringError(ex, "invalid type signature"))
     @isdefined(type_params) || throw(LoweringError(ex, "invalid type signature"))
@@ -3321,7 +3328,10 @@ function expand_abstract_or_primitive_type(ctx, ex)
                 [K"call" "_equiv_typedef"::K"core" name newtype_var]
             ]
             nothing_(ctx, ex)
-            [K"constdecl" name newtype_var]
+            [K"block"
+                [K"constdecl" name newtype_var]
+                [K"call" "_activate_type!"::K"core" newtype_var]
+            ]
         ]
         fdef_stmts...
         nothing_(ctx, ex)

@@ -644,7 +644,8 @@ typedef struct {
     uint8_t abstract:1;
     uint8_t mutabl:1;
     uint8_t mayinlinealloc:1;
-    uint8_t _unused:5;
+    uint8_t has_multiple_supers:1; // this typename or an ancestor declares more than one supertype (the ancestry is not a chain)
+    uint8_t _unused:4;
     _Atomic(uint8_t) cache_entry_count; // (approximate counter of TypeMapEntry for heuristics)
     uint8_t max_methods; // override for inference's max_methods setting (0 = no additional limit or relaxation)
     uint8_t constprop_heustic; // override for inference's constprop heuristic
@@ -653,6 +654,18 @@ typedef struct {
     // `n_inherited` fields are inherited from abstract ancestors that declare
     // fields; the rest are this type's own declarations.
     int32_t n_inherited;
+    // Multiple supertypes (`struct C <: (A, B) end`): the declared supertypes
+    // (with the definition's type variables free, like `wrapper`), in local
+    // precedence order, or NULL when there is exactly one. `parents[0]` is the
+    // primary supertype, i.e. the `super` of the primary DataType.
+    jl_svec_t *parents;
+    // C3 linearization of the ancestor typenames, self first and Any's last;
+    // NULL when the ancestry is a chain (implied by `super`).
+    jl_svec_t *linearization;
+    // set once some descendant typename declares multiple supertypes: two
+    // typenames with this bit may have a common subtype ("join") even though
+    // neither is an ancestor of the other
+    _Atomic(uint8_t) may_join;
 } jl_typename_t;
 
 typedef struct {
@@ -755,6 +768,13 @@ typedef struct _jl_datatype_t {
     uint16_t ismutationfree:1; // whether any mutable memory is reachable through this type (in the type or via fields)
     uint16_t isidentityfree:1; // whether this type or any object reachable through its fields has non-content-based identity
     uint16_t smalltag:6; // whether this type has a small-tag optimization
+    // Caches for multiple supertypes, filled lazily (like a deferred `super`)
+    // and dropped from system images: `supers` holds every direct supertype
+    // instantiated at this type's parameters (`supers[0] == super`), and
+    // `ancestors` the instantiated ancestors parallel to
+    // `name->linearization`. Both stay NULL for single-parent typenames.
+    jl_svec_t *supers;
+    jl_svec_t *ancestors;
 } jl_datatype_t;
 
 typedef struct _jl_vararg_t {

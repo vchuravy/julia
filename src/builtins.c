@@ -2580,6 +2580,7 @@ JL_CALLABLE(jl_f__primitivetype)
     return dt->name->wrapper;
 }
 
+// super: a type, or an svec of types for multiple supertypes (local precedence order)
 static void jl_set_datatype_super(jl_datatype_t *tt, jl_value_t *super) JL_CANSAFEPOINT
 {
     // Check context-specific conditions first, before jl_check_valid_supertype
@@ -2588,13 +2589,20 @@ static void jl_set_datatype_super(jl_datatype_t *tt, jl_value_t *super) JL_CANSA
     const char *type_name = jl_symbol_name(tt->name->name);
     if (tt->super != NULL)
         jl_errorf("invalid subtyping in definition of %s: type already has a supertype.", type_name);
-    if (jl_is_datatype(super) && tt->name == ((jl_datatype_t*)super)->name)
-        jl_errorf("invalid subtyping in definition of %s: a type cannot subtype itself.", type_name);
-    jl_check_valid_supertype(super, type_name);
-    if (tt->isprimitivetype && jl_is_datatype(super) && jl_svec_len(jl_field_names((jl_datatype_t*)super)) > 0)
-        jl_errorf("invalid subtyping in definition of %s: a primitive type cannot subtype %s, which declares fields.",
-                  type_name, jl_symbol_name(((jl_datatype_t*)super)->name->name));
-    jl_gc_write(tt, tt->super, jl_datatype_t, (jl_datatype_t*)super);
+    jl_svec_t *supers = NULL;
+    JL_GC_PUSH1(&supers);
+    supers = jl_is_svec(super) ? (jl_svec_t*)super : jl_svec1(super);
+    for (size_t i = 0; i < jl_svec_len(supers); i++) {
+        jl_value_t *s = jl_svecref(supers, i);
+        if (jl_is_datatype(s) && tt->name == ((jl_datatype_t*)s)->name)
+            jl_errorf("invalid subtyping in definition of %s: a type cannot subtype itself.", type_name);
+        jl_check_valid_supertype(s, type_name);
+        if (tt->isprimitivetype && jl_svec_len(jl_field_names((jl_datatype_t*)s)) > 0)
+            jl_errorf("invalid subtyping in definition of %s: a primitive type cannot subtype %s, which declares fields.",
+                      type_name, jl_symbol_name(((jl_datatype_t*)s)->name->name));
+    }
+    jl_datatype_set_supers(tt, supers);
+    JL_GC_POP();
 }
 
 JL_CALLABLE(jl_f__setsuper)
@@ -2603,6 +2611,17 @@ JL_CALLABLE(jl_f__setsuper)
     jl_datatype_t *dt = (jl_datatype_t*)jl_unwrap_unionall(args[0]);
     JL_TYPECHK(_setsuper!, datatype, (jl_value_t*)dt);
     jl_set_datatype_super(dt, args[1]);
+    return jl_nothing;
+}
+
+// _activate_type!(T): T's definition is kept (it was not an equivalent
+// redefinition); publish what depends on the whole type graph.
+JL_CALLABLE(jl_f__activate_type)
+{
+    JL_NARGS(_activate_type!, 1, 1);
+    jl_datatype_t *dt = (jl_datatype_t*)jl_unwrap_unionall(args[0]);
+    JL_TYPECHK(_activate_type!, datatype, (jl_value_t*)dt);
+    jl_activate_type(dt);
     return jl_nothing;
 }
 

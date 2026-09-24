@@ -29,6 +29,11 @@ New language features
   with `new(; x = 1, y = 2)`, and an abstract type may declare constructors returning a
   `NamedTuple` of its own fields for use as `new(; A(...)..., y)`. `fieldnames`, `fieldtypes`,
   `fieldtype` and `hasfield` now report the declared fields of an abstract type.
+* A type may declare several abstract supertypes, `struct C <: (A, B) end`. The first is the primary
+  supertype returned by `supertype`; `Base.direct_supertypes` returns all of them and `Base.ancestors`
+  all supertypes in C3 linearization order (Dylan's rule), which `InteractiveUtils.supertypes` now
+  follows too. Two abstract types that are not subtypes of each other may therefore intersect:
+  `typeintersect` returns the union of the types declaring both as supertypes.
 * Introduced explicitly wrapping arithmetic operators `+%`, `-%`, `*%` to annotate arithmetic operations
   that are semantically safe to wrap/overflow. Their behavior is currently identical to the default `+`, `-`, `*`
   operators. However, in a future version, there may be opt-in support to detect unannotated wrapping

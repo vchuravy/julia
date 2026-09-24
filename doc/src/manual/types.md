@@ -324,6 +324,62 @@ julia> Point(0, 0).name
 The keyword form converts each value to the field's declared type, accepts the fields in any
 order, and throws an `ArgumentError` for an unknown name or a missing inherited field.
 
+### [Multiple supertypes](@id man-multiple-supertypes)
+
+A type may declare several abstract supertypes, listed in parentheses:
+
+```jldoctest multisupers
+julia> abstract type Iterable end
+
+julia> abstract type Printable end
+
+julia> struct Both <: (Iterable, Printable) end
+
+julia> Both <: Iterable, Both <: Printable
+(true, true)
+
+julia> supertype(Both)
+Iterable
+
+julia> Base.direct_supertypes(Both)
+(Iterable, Printable)
+```
+
+The first supertype is the *primary* one, returned by [`supertype`](@ref); the list order is
+the type's *local precedence order*. [`Base.ancestors`](@ref) lists all supertypes in the
+order used to compare methods defined on different ones: the C3 linearization of the
+declared supertypes, which extends every supertype's own order without reordering it
+(Barrett et al., *A Monotonic Superclass Linearization for Dylan*, 1996). A hierarchy whose
+orders contradict each other is rejected when the type is defined:
+
+```jldoctest multisupers
+julia> abstract type IP <: (Iterable, Printable) end
+
+julia> abstract type PI <: (Printable, Iterable) end
+
+julia> Base.ancestors(IP)
+(Iterable, Printable, Any)
+
+julia> abstract type Confused <: (IP, PI) end
+ERROR: invalid subtyping in definition of Confused: inconsistent precedence graph, cannot linearize supertypes (IP, PI); reorder or drop a supertype
+[...]
+```
+
+The rules are:
+
+  * Every supertype must be an abstract type, listed at most once. An ancestor reached through
+    several supertypes must be reached with the same type parameters
+    (`struct S{T} <: (A{T}, B{Int})` is an error when both `A` and `B` are subtypes of `C{T}`,
+    since `S` would inherit `C{T}` and `C{Int}`).
+  * Fields declared by the supertypes (see [Abstract types with fields](@ref man-abstract-fields))
+    are all inherited, ordered from the most distant ancestor to the nearest; an ancestor
+    reached several times contributes its fields once. A field name declared by two unrelated
+    supertypes is an error.
+  * Two abstract types that are not subtypes of each other are no longer disjoint once a type
+    declares both as supertypes: `typeintersect(Iterable, Printable)` is `Both` above, and a
+    method `f(::Iterable)` and a method `f(::Printable)` are both applicable to a `Both`. The
+    linearization decides between such methods: see [Methods](@ref).
+
 ## Primitive Types
 
 !!! warning

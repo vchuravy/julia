@@ -1149,6 +1149,19 @@ JL_DLLEXPORT jl_value_t *jl_nth_slot_type(jl_value_t *sig JL_PROPAGATES_ROOT, si
 void jl_compute_field_offsets(jl_datatype_t *st) JL_CANSAFEPOINT;
 void jl_check_valid_supertype(jl_value_t *super, const char *type_name) JL_CANSAFEPOINT;
 void jl_check_field_types(jl_svec_t *ftypes, jl_sym_t *type_name);
+void jl_datatype_set_supers(jl_datatype_t *dt, jl_svec_t *supers) JL_CANSAFEPOINT;
+JL_DLLEXPORT jl_svec_t *jl_typename_linearization(jl_typename_t *tn) JL_CANSAFEPOINT;
+JL_DLLEXPORT jl_svec_t *jl_datatype_compute_supers(jl_datatype_t *ndt JL_PROPAGATES_ROOT) JL_CANSAFEPOINT;
+JL_DLLEXPORT jl_datatype_t *jl_datatype_ancestor(jl_datatype_t *dt JL_PROPAGATES_ROOT, jl_typename_t *tn, int *pending) JL_CANSAFEPOINT;
+jl_datatype_t *jl_datatype_ancestor_raw(jl_datatype_t *dt JL_PROPAGATES_ROOT, jl_typename_t *tn, int *pending) JL_NOTSAFEPOINT;
+JL_DLLEXPORT jl_value_t *jl_datatype_ancestor_force(jl_datatype_t *dt, jl_typename_t *tn) JL_CANSAFEPOINT;
+int jl_typenames_may_join(jl_typename_t *a, jl_typename_t *b) JL_NOTSAFEPOINT;
+JL_DLLEXPORT int jl_typename_is_ancestor(jl_typename_t *tn, jl_typename_t *anc) JL_NOTSAFEPOINT;
+JL_DLLEXPORT jl_svec_t *jl_typename_joins(jl_typename_t *a, jl_typename_t *b) JL_CANSAFEPOINT;
+JL_DLLEXPORT void jl_register_join_typename(jl_typename_t *J) JL_CANSAFEPOINT;
+JL_DLLEXPORT void jl_unregister_join_typename(jl_typename_t *J) JL_CANSAFEPOINT;
+JL_DLLEXPORT void jl_activate_type(jl_datatype_t *dt) JL_CANSAFEPOINT;
+extern jl_array_t *jl_join_registry JL_GLOBALLY_ROOTED;
 void jl_check_inherited_fields(jl_datatype_t *dt, jl_svec_t *own_names, int min_init) JL_CANSAFEPOINT;
 jl_svec_t *jl_inherit_fields(jl_datatype_t *dt, jl_svec_t *own_names, jl_svec_t *own_types,
                              const uint32_t *own_atomic, const uint32_t *own_const, int min_init,

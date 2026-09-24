@@ -97,9 +97,63 @@ function getproperty(T::DataType, s::Symbol)
     # fill the deferred supertype cache on access, so raw `.super` reads keep
     # working for instantiations of self-referential definitions (#61347)
     s === :super && return supertype(T)
+    s === :supers && return _datatype_supers(T)
     return getfield(T, s)
 end
 supertype(T::UnionAll) = (@_foldable_meta; UnionAll(T.var, supertype(T.body)))
+
+# the `supers` cache (all direct supertypes), filled on access; `nothing` for
+# single-parent typenames
+function _datatype_supers(T::DataType)
+    @_foldable_meta
+    r = ccall(:jl_datatype_supers, Any, (Any,), T)
+    return r === nothing ? nothing : (r::Core.SimpleVector)
+end
+
+"""
+    direct_supertypes(T::Union{DataType, UnionAll})::Tuple
+
+Return the direct supertypes of type `T`, in the order they were declared.
+A type declared with `struct C <: (A, B) end` has two; the first is its
+primary supertype, [`supertype`](@ref)`(C)`. See also [`ancestors`](@ref).
+
+# Examples
+```jldoctest
+julia> Base.direct_supertypes(Int)
+(Signed,)
+```
+"""
+function direct_supertypes(T::DataType)
+    @_foldable_meta
+    s = _datatype_supers(T)
+    s === nothing && return (supertype(T),)
+    return (s...,)
+end
+direct_supertypes(T::UnionAll) = (@_foldable_meta; map(s -> UnionAll(T.var, s), direct_supertypes(T.body)))
+
+"""
+    ancestors(T::Union{DataType, UnionAll})::Tuple
+
+Return all supertypes of `T`, nearest first and ending with `Any`, in the
+order used to resolve dispatch between methods on different supertypes (the
+C3 linearization of the declared supertypes; the chain of
+[`supertype`](@ref) calls for a type with a single supertype).
+
+# Examples
+```jldoctest
+julia> Base.ancestors(Int)
+(Signed, Integer, Real, Number, Any)
+```
+"""
+function ancestors(T::DataType)
+    @_foldable_meta
+    lin0 = ccall(:jl_get_typename_linearization, Any, (Any,), T.name)
+    lin0 === nothing && error("supertypes of $T are not defined yet (type definition in progress)")
+    lin = lin0::Core.SimpleVector
+    n = length(lin)
+    return ntupleany(i -> ccall(:jl_datatype_ancestor_force, Any, (Any, Any), T, lin[i + 1]), n - 1)
+end
+ancestors(T::UnionAll) = (@_foldable_meta; map(s -> UnionAll(T.var, s), ancestors(T.body)))
 
 ## generic comparison ##
 

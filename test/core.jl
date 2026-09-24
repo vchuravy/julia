@@ -23,7 +23,7 @@ for (T, c) in (
         (Core.MethodCache, []),
         (Core.TypeMapEntry, [:sig, :simplesig, :guardsigs, :func, :isleafsig, :issimplesig, :va]),
         (Core.TypeMapLevel, []),
-        (Core.TypeName, [:name, :module, :names, :wrapper, :hash, :n_uninitialized, :flags, :n_inherited]),
+        (Core.TypeName, [:name, :module, :names, :wrapper, :hash, :n_uninitialized, :flags, :n_inherited, :parents, :linearization]),
         # `super` is filled lazily for instantiations of self-referential
         # definitions (issue #61347), so it is deliberately non-const (and atomic)
         (DataType, [:name, :parameters, :instance, :hash]),
@@ -46,8 +46,8 @@ for (T, c) in (
         (Core.MethodCache, [:leafcache, :cache, :var""]),
         (Core.TypeMapEntry, [:next, :min_world, :max_world]),
         (Core.TypeMapLevel, [:arg1, :targ, :name1, :tname, :list, :any]),
-        (Core.TypeName, [:cache, :linearcache, :Typeofwrapper, :max_args, :cache_entry_count]),
-        (DataType, [:super, :types, :layout]),
+        (Core.TypeName, [:cache, :linearcache, :Typeofwrapper, :max_args, :cache_entry_count, :may_join]),
+        (DataType, [:super, :types, :layout, :supers, :ancestors]),
         (Core.Memory, []),
         (Core.GenericMemoryRef, []),
         (Task, [:_state, :preempt_request, :running_time_ns, :finished_at, :first_enqueued_at, :last_started_running_at, :waiting_on, :bound_cancel_token]),

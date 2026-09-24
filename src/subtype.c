@@ -748,23 +748,22 @@ int obviously_disjoint(jl_value_t *a, jl_value_t *b, int specificity) JL_NOTSAFE
     if (jl_is_datatype(a) && jl_is_datatype(b)) {
         jl_datatype_t *ad = (jl_datatype_t*)a, *bd = (jl_datatype_t*)b;
         if (ad->name != bd->name) {
-            jl_datatype_t *temp = ad;
-            while (temp != jl_any_type && temp->name != bd->name) {
-                // raw read: this heuristic must not reach a safepoint, so a
-                // deferred (unset) supertype conservatively proves nothing
-                temp = temp->super;
-                if (temp == NULL)
+            // raw reads: this heuristic must not reach a safepoint, so an
+            // unfilled supertype slot conservatively proves nothing
+            int pending = 0;
+            jl_datatype_t *temp = jl_datatype_ancestor_raw(ad, bd->name, &pending);
+            if (pending)
+                return 0;
+            if (temp == NULL) {
+                temp = jl_datatype_ancestor_raw(bd, ad->name, &pending);
+                if (pending)
                     return 0;
-            }
-            if (temp == jl_any_type) {
-                temp = bd;
-                while (temp != jl_any_type && temp->name != ad->name) {
-                    temp = temp->super;
-                    if (temp == NULL)
-                        return 0;
+                if (temp == NULL) {
+                    // unrelated names are disjoint unless a type joins them
+                    // (`struct C <: (A, B)`); for specificity, siblings stay
+                    // unordered (declared subtypes take priority, #21710)
+                    return specificity || !jl_typenames_may_join(ad->name, bd->name);
                 }
-                if (temp == jl_any_type)
-                    return 1;
                 bd = temp;
             }
             else {
@@ -2954,10 +2953,8 @@ static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, jl_param_pos_t p
         if (uy == (jl_value_t*)jl_any_type)
             return 1;
         jl_datatype_t *xd = (jl_datatype_t*)ux, *yd = (jl_datatype_t*)uy;
-        while (xd != NULL && xd != jl_any_type && xd->name != yd->name) {
-            xd = jl_datatype_compute_super(xd);
-        }
-        if (xd == jl_any_type)
+        int pending = 0;
+        if (jl_datatype_ancestor(xd, yd->name, &pending) == NULL && !pending)
             return 0;
     }
     // handle forall ("left") vars first
@@ -3080,15 +3077,18 @@ static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, jl_param_pos_t p
         if (x == y) return 1;
         if (y == (jl_value_t*)jl_any_type) return 1;
         jl_datatype_t *xd = (jl_datatype_t*)x, *yd = (jl_datatype_t*)y;
-        while (xd != jl_any_type && xd->name != yd->name) {
-            jl_datatype_t *xsuper = jl_datatype_compute_super(xd);
-            if (xsuper == NULL) {
+        // the ancestor of x named like y is unique (also with multiple
+        // supertypes, by the unique-ancestor invariant checked at definition)
+        int pending = 0;
+        jl_datatype_t *xa = jl_datatype_ancestor(xd, yd->name, &pending);
+        if (xa == NULL) {
+            if (pending) {
                 assert(xd->parameters && jl_is_typename(xd->name));
                 jl_errorf("circular type parameter constraint in definition of %s", jl_symbol_name(xd->name->name));
             }
-            xd = xsuper;
+            return 0;
         }
-        if (xd == jl_any_type) return 0;
+        xd = xa;
         if (xd->name == jl_tuple_typename)
             return subtype_tuple(xd, yd, e, param);
         size_t i, np = jl_nparams(xd);
@@ -3652,18 +3652,16 @@ static int obvious_subtype(jl_value_t *x, jl_value_t *y, jl_value_t *y0, int *su
             //}
             int uncertain = 0;
             if (((jl_datatype_t*)x)->name != ((jl_datatype_t*)y)->name) {
-                jl_datatype_t *temp = (jl_datatype_t*)x;
-                while (temp->name != ((jl_datatype_t*)y)->name) {
-                    // raw read: this heuristic must not reach a safepoint, so
-                    // a deferred (unset) supertype stays undecided and the
-                    // full algorithm resolves it
-                    temp = temp->super;
-                    if (temp == NULL)
-                        return 0;
-                    if (temp == jl_any_type) {
-                        *subtype = 0;
-                        return 1;
-                    }
+                // raw read: this heuristic must not reach a safepoint, so an
+                // unfilled supertype slot stays undecided and the full
+                // algorithm resolves it
+                int pending = 0;
+                jl_datatype_t *temp = jl_datatype_ancestor_raw((jl_datatype_t*)x, ((jl_datatype_t*)y)->name, &pending);
+                if (pending)
+                    return 0;
+                if (temp == NULL) {
+                    *subtype = 0;
+                    return 1;
                 }
                 if (obvious_subtype((jl_value_t*)temp, y, y0, subtype) && *subtype)
                     return 1;
@@ -5494,21 +5492,43 @@ static void flip_vars(jl_stenv_t *e)
     }
 }
 
-// intersection where xd nominally inherits from yd
-static jl_value_t *intersect_sub_datatype(jl_datatype_t *xd, jl_datatype_t *yd, jl_stenv_t *e, int R, jl_param_pos_t param) JL_CANSAFEPOINT
+// intersection where xd nominally inherits from yd, through its (unique)
+// ancestor `xa` named like yd
+static jl_value_t *intersect_sub_datatype(jl_datatype_t *xd, jl_datatype_t *xa, jl_datatype_t *yd, jl_stenv_t *e, int R, jl_param_pos_t param) JL_CANSAFEPOINT
 {
     // attempt to populate additional constraints into `e`
     // if that attempt fails, then return bottom
     // otherwise return xd (finish_unionall will later handle propagating those constraints)
     assert(e->Loffset == 0);
-    jl_datatype_t *xdsuper = jl_datatype_compute_super(xd);
-    if (xdsuper == NULL)
-        return jl_bottom_type; // definition in progress
-    jl_value_t *isuper = R ? intersect((jl_value_t*)yd, (jl_value_t*)xdsuper, e, param) :
-                             intersect((jl_value_t*)xdsuper, (jl_value_t*)yd, e, param);
+    jl_value_t *isuper = R ? intersect((jl_value_t*)yd, (jl_value_t*)xa, e, param) :
+                             intersect((jl_value_t*)xa, (jl_value_t*)yd, e, param);
     if (isuper == jl_bottom_type)
         return jl_bottom_type;
     return (jl_value_t*)xd;
+}
+
+// intersection of two nominal types neither of which inherits from the other:
+// the union of the intersections through the types that declare both as
+// supertypes (`struct J <: (X, Y)`), if any
+static jl_value_t *intersect_via_joins(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, jl_param_pos_t param) JL_CANSAFEPOINT
+{
+    jl_svec_t *joins = jl_typename_joins(((jl_datatype_t*)x)->name, ((jl_datatype_t*)y)->name);
+    if (joins == NULL)
+        return jl_bottom_type;
+    jl_value_t *res = jl_bottom_type, *t = NULL;
+    JL_GC_PUSH3(&joins, &res, &t);
+    for (size_t i = 0; i < jl_svec_len(joins); i++) {
+        jl_typename_t *J = (jl_typename_t*)jl_svecref(joins, i);
+        // x and y are ancestors of J, so these recurse into the nominal
+        // inheritance case, never back into the joins
+        t = intersect(J->wrapper, x, e, param);
+        if (t != jl_bottom_type)
+            t = intersect(t, y, e, param);
+        if (t != jl_bottom_type)
+            res = res == jl_bottom_type ? t : simple_join(res, t);
+    }
+    JL_GC_POP();
+    return res;
 }
 
 static jl_value_t *intersect_invariant(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
@@ -6020,17 +6040,18 @@ static jl_value_t *intersect(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, jl_par
             return res;
         }
         if (param == PARAM_INVARIANT) return jl_bottom_type;
-        while (xd != NULL && xd != jl_any_type && xd->name != yd->name)
-            xd = jl_datatype_compute_super(xd);
-        if (xd == NULL || xd == jl_any_type) {
-            xd = (jl_datatype_t*)x;
-            while (yd != NULL && yd != jl_any_type && yd->name != xd->name)
-                yd = jl_datatype_compute_super(yd);
-            if (yd == NULL || yd == jl_any_type)
-                return jl_bottom_type;
-            return intersect_sub_datatype((jl_datatype_t*)y, xd, e, 1, param);
-        }
-        return intersect_sub_datatype((jl_datatype_t*)x, yd, e, 0, param);
+        int pending = 0;
+        jl_datatype_t *xa = jl_datatype_ancestor(xd, yd->name, &pending);
+        if (xa != NULL)
+            return intersect_sub_datatype(xd, xa, yd, e, 0, param);
+        jl_datatype_t *ya = jl_datatype_ancestor(yd, xd->name, &pending);
+        if (ya != NULL)
+            return intersect_sub_datatype(yd, ya, xd, e, 1, param);
+        if (pending)
+            return jl_bottom_type; // definition in progress
+        if (!jl_typenames_may_join(xd->name, yd->name))
+            return jl_bottom_type;
+        return intersect_via_joins(x, y, e, param);
     }
     if (jl_egal(x, y)) return y;
     return jl_bottom_type;
@@ -7253,8 +7274,12 @@ static int type_morespecific_(jl_value_t *a, jl_value_t *b, jl_value_t *a0, jl_v
         if (tta == jl_typeofbottom_type && (is_kind_or_anytype(b) || jl_is_typeeq(b)))
             return 1;
         int super = 0;
-        while (tta != jl_any_type) {
-            if (tta->name == ttb->name) {
+        int pending = 0;
+        jl_datatype_t *ttanc = tta == jl_any_type ? NULL : jl_datatype_ancestor(tta, ttb->name, &pending);
+        if (ttanc != NULL) {
+            super = (ttanc != tta);
+            tta = ttanc;
+            {
                 if (super) {
                     if (!jl_is_typeeq(b)) return 1;
                     jl_value_t *tp0 = jl_typeeq_T(b);
@@ -7307,11 +7332,8 @@ static int type_morespecific_(jl_value_t *a, jl_value_t *b, jl_value_t *a0, jl_v
                     return 0;
                 return ascore > bscore || adiag > bdiag;
             }
-            tta = jl_datatype_compute_super(tta); super = 1;
-            if (tta == NULL)
-                return 0; // definition in progress
         }
-        return 0;
+        return 0; // unrelated (or definition in progress): siblings stay unordered
     }
 
     if (jl_is_typevar(a)) {

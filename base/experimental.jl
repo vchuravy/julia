@@ -341,8 +341,9 @@ the handler for that type.
 """
 function show_error_hints(io, ex, args...)
     @nospecialize
-    ex_supertype = typeof(ex)
-    while ex_supertype != Any
+    ex_type = typeof(ex)
+    for ex_supertype in (ex_type, Base.ancestors(ex_type)...)
+        ex_supertype === Any && break
         hinters = get(_hint_handlers, Core.typename(ex_supertype), Any[])
         for (exct, handler) in hinters
             ex isa exct || continue
@@ -354,7 +355,6 @@ function show_error_hints(io, ex, args...)
                 @error "Hint-handler $handler for $(ex_supertype) in $(tn.module) caused an error" exception=current_exceptions()
             end
         end
-        ex_supertype = supertype(ex_supertype)
     end
 end
 

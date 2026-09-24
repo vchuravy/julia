@@ -19,6 +19,7 @@ extern "C" {
     XX(_new_cancel_source,"_new_cancel_source") \
     XX(_primitivetype,"_primitivetype") \
     XX(_setsuper,"_setsuper!") \
+    XX(_activate_type,"_activate_type!") \
     XX(_structtype,"_structtype") \
     XX(_svec_len,"_svec_len") \
     XX(_svec_ref,"_svec_ref") \

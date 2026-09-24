@@ -5,6 +5,23 @@
 # plain field read on such an instantiation would see an undefined field
 datatype_super(x::DataType) = ccall(:jl_datatype_super, Any, (Any,), x)::DataType
 
+# the ancestor of `x` with typename `tn` (`nothing` if none); handles types
+# declaring multiple supertypes, whose ancestry is not the `super` chain
+datatype_ancestor(x::DataType, tn::Core.TypeName) = ccall(:jl_datatype_ancestor_force, Any, (Any, Any), x, tn)
+
+# all supertypes of `x`, nearest first and ending with Any (the C3
+# linearization when `x` declares multiple supertypes)
+function datatype_ancestors(x::DataType)
+    lin = ccall(:jl_get_typename_linearization, Any, (Any,), x.name)
+    lin === nothing && return Any[Any] # definition in progress
+    lin = lin::Core.SimpleVector
+    res = Vector{Any}(undef, length(lin) - 1)
+    for i = 2:length(lin)
+        res[i - 1] = datatype_ancestor(x, lin[i]::Core.TypeName)::DataType
+    end
+    return res
+end
+
 ###########
 # generic #
 ###########

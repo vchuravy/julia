@@ -851,3 +851,27 @@ end
     @test a === b && Base._nslots(a) == 4
     GC.gc(true)
 end
+
+@testset "abstract fields and multiple supertypes" begin
+    # types owned by `__deserialized_types__` are sent whole, and come back as
+    # fresh copies (the name is taken): the declared supertypes, the
+    # inherited-field count and the join must round-trip
+    M = Serialization.__deserialized_types__
+    Core.eval(M, :(abstract type SerA; a::Int; end))
+    Core.eval(M, :(abstract type SerB end))
+    Core.eval(M, :(struct SerC <: (SerA, SerB); c::Int; end))
+    C = M.SerC
+    buf = IOBuffer()
+    serialize(buf, C(1, 2))
+    seekstart(buf)
+    x = deserialize(buf)
+    C2 = typeof(x)
+    @test C2 !== C && nameof(C2) !== :SerC
+    @test x.a == 1 && x.c == 2
+    @test fieldnames(C2) == (:a, :c) && C2.name.n_inherited == 1
+    A2, B2 = Base.direct_supertypes(C2)
+    @test A2 !== M.SerA && B2 !== M.SerB
+    @test fieldnames(A2) == (:a,) && isabstracttype(B2)
+    @test Base.ancestors(C2) === (A2, B2, Any)
+    @test typeintersect(A2, B2) === C2
+end

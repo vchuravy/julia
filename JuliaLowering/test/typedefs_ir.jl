@@ -184,10 +184,11 @@ abstract type A end
 13  TestMod.A
 14  (call core._equiv_typedef %₁₃ %₄)
 15  (gotoifnot %₁₄ label₁₇)
-16  (goto label₁₉)
+16  (goto label₂₀)
 17  (call core.declare_const TestMod :A %₄)
 18  latestworld
-19  (return core.nothing)
+19  (call core._activate_type! %₄)
+20  (return core.nothing)
 
 ########################################
 # Abstract type definition with supertype
@@ -209,10 +210,11 @@ abstract type A <: B end
 14  TestMod.A
 15  (call core._equiv_typedef %₁₄ %₄)
 16  (gotoifnot %₁₅ label₁₈)
-17  (goto label₂₀)
+17  (goto label₂₁)
 18  (call core.declare_const TestMod :A %₄)
 19  latestworld
-20  (return core.nothing)
+20  (call core._activate_type! %₄)
+21  (return core.nothing)
 
 ########################################
 # Abstract type definition with multiple typevars
@@ -238,10 +240,11 @@ abstract type A{X, Y <: X} end
 18  TestMod.A
 19  (call core._equiv_typedef %₁₈ %₉)
 20  (gotoifnot %₁₉ label₂₂)
-21  (goto label₂₄)
+21  (goto label₂₅)
 22  (call core.declare_const TestMod :A %₉)
 23  latestworld
-24  (return core.nothing)
+24  (call core._activate_type! %₉)
+25  (return core.nothing)
 
 ########################################
 # Error: Abstract type definition with bad signature
@@ -295,10 +298,11 @@ primitive type P 8 end
 10  TestMod.P
 11  (call core._equiv_typedef %₁₀ %₂)
 12  (gotoifnot %₁₁ label₁₄)
-13  (goto label₁₆)
+13  (goto label₁₇)
 14  (call core.declare_const TestMod :P %₂)
 15  latestworld
-16  (return core.nothing)
+16  (call core._activate_type! %₂)
+17  (return core.nothing)
 
 ########################################
 # Complex primitive type definition
@@ -321,10 +325,11 @@ primitive type P{X,Y} <: Z 32 end
 15  TestMod.P
 16  (call core._equiv_typedef %₁₅ %₆)
 17  (gotoifnot %₁₆ label₁₉)
-18  (goto label₂₁)
+18  (goto label₂₂)
 19  (call core.declare_const TestMod :P %₆)
 20  latestworld
-21  (return core.nothing)
+21  (call core._activate_type! %₆)
+22  (return core.nothing)
 
 ########################################
 # Primitive type definition with computed size (should this be allowed??)
@@ -344,10 +349,11 @@ primitive type P P_nbits() end
 12  TestMod.P
 13  (call core._equiv_typedef %₁₂ %₄)
 14  (gotoifnot %₁₃ label₁₆)
-15  (goto label₁₈)
+15  (goto label₁₉)
 16  (call core.declare_const TestMod :P %₄)
 17  latestworld
-18  (return core.nothing)
+18  (call core._activate_type! %₄)
+19  (return core.nothing)
 
 ########################################
 # Empty struct

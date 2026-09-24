@@ -1355,9 +1355,8 @@ end
 
 function show_supertypes(io::IO, typ::DataType)
     print(io, typ)
-    while typ != Any
-        typ = supertype(typ)
-        print(io, " <: ", typ)
+    for s in ancestors(typ)
+        print(io, " <: ", s)
     end
 end
 
@@ -3074,7 +3073,14 @@ function dump(io::IOContext, x::DataType, n::Int, indent)
     isabstracttype(x) && print(io, "abstract type ")
     print(io, x)
     if x !== Any
-        print(io, " <: ", supertype(x))
+        supers = direct_supertypes(x)
+        if length(supers) == 1
+            print(io, " <: ", supers[1])
+        else
+            print(io, " <: (")
+            join(io, supers, ", ")
+            print(io, ")")
+        end
     end
     is_abstract = isabstracttype(x)
     if n > 0 && !(x <: Tuple) && (!is_abstract || (!isType(x) && !isempty(x.name.names)))

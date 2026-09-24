@@ -771,6 +771,13 @@ static void jl_insert_into_serialization_queue(jl_serializer_state *s, jl_value_
             assert(!jl_object_in_image((jl_value_t*)tn->wrapper));
         }
     }
+    if (jl_is_datatype(v)) {
+        // per-instantiation caches of the multiple-supertypes support, recomputed
+        // on demand after loading (see jl_datatype_compute_supers)
+        jl_datatype_t *dt = (jl_datatype_t*)v;
+        record_field_change((jl_value_t**)&dt->supers, NULL);
+        record_field_change((jl_value_t**)&dt->ancestors, NULL);
+    }
     if (jl_is_mtable(v)) {
         jl_methtable_t *mt = (jl_methtable_t*)v;
         // Any back-edges will be re-validated and added by staticdata.jl, so
@@ -1034,6 +1041,11 @@ done_fields: ;
         // handled at load time by the uniquing_super/delay_list machinery.
         if (dt->super && jl_needs_serialization(s, (jl_value_t*)dt->super))
             arraylist_push(&deferred_supers, (void*)dt->super);
+        // the other declared supertypes (templates on the typename) reach back
+        // into the definition the same way; defer them alongside `super`
+        if (jl_unwrap_unionall(dt->name->wrapper) == v && dt->name->parents != NULL &&
+            jl_needs_serialization(s, (jl_value_t*)dt->name->parents))
+            arraylist_push(&deferred_supers, (void*)dt->name->parents);
         immediate = 0;
         char *data = (char*)jl_data_ptr(v);
         size_t i, np = layout->npointers;
@@ -2989,7 +3001,7 @@ static int jl_prune_internal_mtable(jl_methtable_t *mt, void *env)
 // In addition to the system image (where `worklist = NULL`), this can also save incremental images with external linkage
 static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
                                            jl_array_t *module_init_order, jl_array_t *worklist, jl_array_t *extext_methods,
-                                           jl_array_t *new_ext, jl_query_cache *query_cache) JL_CANSAFEPOINT
+                                           jl_array_t *new_ext, jl_array_t *join_typenames, jl_query_cache *query_cache) JL_CANSAFEPOINT
 {
     htable_new(&field_replace, 0);
     htable_new(&bits_replace, 0);
@@ -3196,6 +3208,11 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
             jl_queue_for_serialization(&s, extext_methods);
             // Queue the new specializations
             jl_queue_for_serialization(&s, new_ext);
+            // Queue the typenames declaring multiple supertypes (join registry replay)
+            jl_queue_for_serialization(&s, join_typenames);
+        }
+        else {
+            jl_queue_for_serialization(&s, jl_join_registry);
         }
         jl_serialize_reachable(&s);
         // step 1.2: ensure all gvars are part of the sysimage too
@@ -3368,6 +3385,7 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
 #undef XX
             jl_write_value(&s, global_roots_list);
             jl_write_value(&s, global_roots_keyset);
+            jl_write_value(&s, jl_join_registry);
             jl_write_value(&s, s.ptls->root_task->tls);
             write_uint32(f, jl_get_gs_ctr());
             size_t world = jl_atomic_load_acquire(&jl_world_counter);
@@ -3387,6 +3405,7 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
             jl_write_value(&s, extext_methods);
             jl_write_value(&s, new_ext);
             jl_write_value(&s, s.method_roots_list);
+            jl_write_value(&s, join_typenames);
         }
         write_uint32(f, jl_array_len(s.link_ids_gctags));
         ios_write(f, (char*)jl_array_data(s.link_ids_gctags, uint32_t), jl_array_len(s.link_ids_gctags) * sizeof(uint32_t));
@@ -3481,9 +3500,9 @@ JL_DLLEXPORT uint32_t jl_create_system_image(void **_native_data, jl_array_t *wo
     ios_t *f = (ios_t*)malloc_s(sizeof(ios_t));
     ios_mem(f, 0);
 
-    jl_array_t *mod_array = NULL, *extext_methods = NULL, *new_ext = NULL, *ext_foreign_cis = NULL;
+    jl_array_t *mod_array = NULL, *extext_methods = NULL, *new_ext = NULL, *ext_foreign_cis = NULL, *join_typenames = NULL;
     int64_t datastartpos = 0;
-    JL_GC_PUSH4(&mod_array, &extext_methods, &new_ext, &ext_foreign_cis);
+    JL_GC_PUSH5(&mod_array, &extext_methods, &new_ext, &ext_foreign_cis, &join_typenames);
 
     ext_foreign_cis = jl_alloc_vec_any(0);
 
@@ -3542,6 +3561,13 @@ JL_DLLEXPORT uint32_t jl_create_system_image(void **_native_data, jl_array_t *wo
         // extext_methods: [method1, ...], worklist-owned "extending external" methods added to functions owned by modules outside the worklist
         extext_methods = jl_alloc_vec_any(0);
         jl_collect_extext_methods(extext_methods, mod_array);
+        // join_typenames: the worklist-owned typenames declaring multiple supertypes
+        join_typenames = jl_alloc_vec_any(0);
+        for (size_t i = 0; i < jl_array_nrows(jl_join_registry); i++) {
+            jl_value_t *tn = jl_array_ptr_ref(jl_join_registry, i);
+            if (!jl_object_in_image(tn))
+                jl_array_ptr_1d_push(join_typenames, tn);
+        }
 
         if (emit_split) {
             jl_clone_targets_t targets = jl_get_llvm_clone_targets(jl_options.cpu_target);
@@ -3560,7 +3586,7 @@ JL_DLLEXPORT uint32_t jl_create_system_image(void **_native_data, jl_array_t *wo
     jl_query_cache query_cache;
     init_query_cache(&query_cache);
     jl_finalize_precompile_inferred(worklist != NULL && _native_data != NULL && jl_options.outputo != NULL);
-    jl_save_system_image_to_stream(f, mod_array, module_init_order, worklist, extext_methods, new_ext, &query_cache);
+    jl_save_system_image_to_stream(f, mod_array, module_init_order, worklist, extext_methods, new_ext, join_typenames, &query_cache);
     if (_native_data != NULL)
         native_functions = NULL;
     // make sure we don't run any Julia code concurrently before this point
@@ -4091,7 +4117,8 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
     ios_seek(f, LLT_ALIGN(ios_pos(f), 8));
     assert(!ios_eof(f));
     s.s = f;
-    uintptr_t offset_restored = 0, offset_init_order = 0, offset_extext_methods = 0, offset_new_ext = 0, offset_method_roots_list = 0;
+    uintptr_t offset_restored = 0, offset_init_order = 0, offset_extext_methods = 0, offset_new_ext = 0, offset_method_roots_list = 0, offset_join_typenames = 0;
+    jl_array_t *join_typenames = NULL;
     if (!s.incremental) {
         size_t i;
         for (i = 0; tags[i] != NULL; i++) {
@@ -4114,6 +4141,7 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
         export_jl_sysimg_globals();
         jl_global_roots_list = (jl_genericmemory_t*)jl_read_value(&s);
         jl_global_roots_keyset = (jl_genericmemory_t*)jl_read_value(&s);
+        jl_join_registry = (jl_array_t*)jl_read_value(&s);
         jl_gc_write(s.ptls->root_task, s.ptls->root_task->tls, jl_value_t, jl_read_value(&s));
 
         uint32_t gs_ctr = read_uint32(f);
@@ -4128,6 +4156,7 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
         offset_extext_methods = jl_read_offset(&s);
         offset_new_ext = jl_read_offset(&s);
         offset_method_roots_list = jl_read_offset(&s);
+        offset_join_typenames = jl_read_offset(&s);
     }
     s.buildid_depmods_idxs = depmod_to_imageidx(depmods);
     size_t nlinks_gctags = read_uint32(f);
@@ -4158,6 +4187,7 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
         *extext_methods = (jl_array_t*)jl_delayed_reloc(&s, offset_extext_methods);
         (void)(jl_array_t*)jl_delayed_reloc(&s, offset_new_ext);
         *method_roots_list = (jl_array_t*)jl_delayed_reloc(&s, offset_method_roots_list);
+        join_typenames = (jl_array_t*)jl_delayed_reloc(&s, offset_join_typenames);
         *internal_methods = jl_alloc_vec_any(0);
     }
     s.s = NULL;
@@ -4570,8 +4600,13 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
     // jl_printf(JL_STDOUT, "%ld blobs to link against\n", image_tree.nranges);
     jl_gc_enable(en);
 
-    if (s.incremental)
+    if (s.incremental) {
+        // replay the join registry for the image's typenames with multiple
+        // supertypes (marks their ancestors, possibly in other images)
+        for (size_t i = 0; i < jl_array_nrows(join_typenames); i++)
+            jl_register_join_typename((jl_typename_t*)jl_array_ptr_ref(join_typenames, i));
         jl_add_methods(*extext_methods);
+    }
 
 }
 

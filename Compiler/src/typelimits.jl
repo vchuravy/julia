@@ -61,10 +61,9 @@ function is_derived_type(@nospecialize(t), @nospecialize(c), mindepth::Int)
         end
         if isa(t, DataType)
             # see if it is one of the supertypes of a parameter
-            super = supertype(c)
-            while super !== Any
+            for super in datatype_ancestors(c)
+                super === Any && break
                 t === super && return true
-                super = supertype(super)
             end
         end
         # see if it was extracted from a type parameter
@@ -780,6 +779,12 @@ end
         return nothing # fast path
     end
     Any.name === aname && return aname
+    if aname.flags & 0x08 == 0x08 || bname.flags & 0x08 == 0x08
+        # multiple supertypes: the ancestries are not chains
+        ccall(:jl_typename_is_ancestor, Cint, (Any, Any), bname, aname) != 0 && return aname
+        ccall(:jl_typename_is_ancestor, Cint, (Any, Any), aname, bname) != 0 && return bname
+        return nothing
+    end
     a = unwrap_unionall(aname.wrapper)
     heighta = 0
     while a !== Any
@@ -863,14 +868,8 @@ end
                     else
                         wr = ijname.wrapper
                         uw = unwrap_unionall(wr)::DataType
-                        ui = unwrap_unionall(ti)::DataType
-                        while ui.name !== ijname
-                            ui = datatype_super(ui)
-                        end
-                        uj = unwrap_unionall(tj)::DataType
-                        while uj.name !== ijname
-                            uj = datatype_super(uj)
-                        end
+                        ui = datatype_ancestor(unwrap_unionall(ti)::DataType, ijname)::DataType
+                        uj = datatype_ancestor(unwrap_unionall(tj)::DataType, ijname)::DataType
                         p = Vector{Any}(undef, length(uw.parameters))
                         usep = true
                         widen = wr

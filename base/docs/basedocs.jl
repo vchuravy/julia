@@ -120,6 +120,9 @@ abstract type Real <: Number end
 ```
 [`Number`](@ref) has no supertype, whereas [`Real`](@ref) is an abstract subtype of `Number`.
 
+An abstract type may itself declare several supertypes, `abstract type T <: (A, B) end`;
+see the manual section on [Multiple supertypes](@ref man-multiple-supertypes).
+
 An abstract type may declare fields, which every subtype then has (before any
 field of its own), so that methods on the abstract type can access them directly:
 
@@ -1604,6 +1607,9 @@ end
 `struct`s are immutable by default; an instance of one of these types cannot
 be modified after construction. Use [`mutable struct`](@ref) instead to declare a
 type whose instances can be modified.
+
+A struct may declare several abstract supertypes, `struct Point <: (Shape, Printable) end`;
+see the manual section on [Multiple supertypes](@ref man-multiple-supertypes).
 
 See the manual section on [Composite Types](@ref) for more details,
 such as how to define constructors.

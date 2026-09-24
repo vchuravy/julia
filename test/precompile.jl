@@ -1241,6 +1241,60 @@ precompile_test_harness("dispatch edge") do dir
     end
 end
 
+precompile_test_harness("multiple supertypes") do dir
+    # A package declaring a type with several supertypes from other images must
+    # replay its join into the registry when loaded: the parents (owned by
+    # other packages) become intersecting, and methods on the join dispatch.
+    MSX = :MSX_0x2b1f0a7c
+    MSY = :MSY_0x2b1f0a7c
+    MSZ = :MSZ_0x2b1f0a7c
+    write(joinpath(dir, "$MSX.jl"),
+        """
+        module $MSX
+            abstract type A; a::Int; end
+            f(::A) = :a
+        end
+        """)
+    write(joinpath(dir, "$MSY.jl"),
+        """
+        module $MSY
+            abstract type B end
+            g(::B) = :b
+        end
+        """)
+    write(joinpath(dir, "$MSZ.jl"),
+        """
+        module $MSZ
+            using $MSX, $MSY
+            struct C <: ($MSX.A, $MSY.B)
+                c::Int
+            end
+            const c = C(1, 2)
+            precompile($MSX.f, (C,))
+        end
+        """)
+    Base.compilecache(Base.PkgId(string(MSX)))
+    Base.compilecache(Base.PkgId(string(MSY)))
+    Base.compilecache(Base.PkgId(string(MSZ)))
+    @eval using $MSX, $MSY
+    X = invokelatest(getglobal, @__MODULE__, MSX)
+    Y = invokelatest(getglobal, @__MODULE__, MSY)
+    @test invokelatest(typeintersect, X.A, Y.B) === Union{}
+    @test X.A.name.may_join == 0x00
+    @eval using $MSZ
+    Z = invokelatest(getglobal, @__MODULE__, MSZ)
+    invokelatest() do
+        @test Base.direct_supertypes(Z.C) === (X.A, Y.B)
+        @test Base.ancestors(Z.C) === (X.A, Y.B, Any)
+        @test Z.C.name.parents === Core.svec(X.A, Y.B)
+        @test X.A.name.may_join == 0x01 && Y.B.name.may_join == 0x01
+        @test typeintersect(X.A, Y.B) === Z.C
+        @test fieldnames(Z.C) == (:a, :c) && Z.c.a == 1
+        @test X.f(Z.c) === :a && Y.g(Z.c) === :b
+        @test Z.c isa Y.B
+    end
+end
+
 precompile_test_harness("invoke") do dir
     InvokeModule = :Invoke0x030e7e97c2365aad
     CallerModule = :Caller0x030e7e97c2365aad

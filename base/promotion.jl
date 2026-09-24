@@ -27,11 +27,29 @@ function _has_ancestor_typename(@nospecialize(a), name::Core.TypeName)
     @_nothrow_meta
     @_nospecializeinfer_meta
     a = a::DataType
+    if a.name.flags & 0x08 == 0x08
+        # multiple supertypes: the ancestry is not a chain
+        return ccall(:jl_typename_is_ancestor, Cint, (Any, Any), a.name, name) != 0
+    end
     while true
         a.name === name && return true
         a === Any && return false
         a = supertype(a)::DataType
     end
+end
+
+# the ancestor of `a` named `name`, assuming `_has_ancestor_typename(a, name)`
+function _ancestor_named(@nospecialize(a), name::Core.TypeName)
+    @_foldable_meta
+    @_nospecializeinfer_meta
+    a = a::DataType
+    if a.name.flags & 0x08 == 0x08
+        return ccall(:jl_datatype_ancestor_force, Any, (Any, Any), a, name)::DataType
+    end
+    while !(a.name === name)
+        a = supertype(a)::DataType
+    end
+    return a
 end
 
 function typejoin(@nospecialize(a), @nospecialize(b))
@@ -125,11 +143,31 @@ function typejoin(@nospecialize(a), @nospecialize(b))
     elseif b.name === Tuple.name
         return Any
     end
+    if b.name.flags & 0x08 == 0x08
+        # b has several supertype chains: join at the unique nearest common
+        # ancestor typename, if there is exactly one
+        lin = ccall(:jl_get_typename_linearization, Any, (Any,), b.name)::Core.SimpleVector
+        common = nothing
+        for i = 1:length(lin)
+            N = lin[i]::Core.TypeName
+            N === Any.name && break
+            _has_ancestor_typename(a, N) || continue
+            # a common ancestor below an already found one is not minimal
+            if common === nothing
+                common = N
+            elseif ccall(:jl_typename_is_ancestor, Cint, (Any, Any), N, common) == 0 &&
+                   ccall(:jl_typename_is_ancestor, Cint, (Any, Any), common, N) == 0
+                return Any # two minimal common ancestors
+            elseif ccall(:jl_typename_is_ancestor, Cint, (Any, Any), common, N) == 0
+                common = N
+            end
+        end
+        common === nothing && return Any
+        b = _ancestor_named(b, common)
+    end
     while !(b === Any)
         if _has_ancestor_typename(a, b.name)
-            while !(a.name === b.name)
-                a = supertype(a)::DataType
-            end
+            a = _ancestor_named(a, b.name)
             aprimary = a.name.wrapper
             # join on parameters
             n = length(a.parameters)

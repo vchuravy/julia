@@ -895,6 +895,23 @@ static void foreach_top_nth_typename(void (*f)(jl_typename_t*, int, void*) JL_CA
                     else
                         *facts |= HAVE_KWCALL;
                 }
+                else if (dt->name->linearization != NULL) {
+                    // multiple supertypes: key under every root of the
+                    // ancestry (the typenames directly below Any or Function)
+                    jl_svec_t *lin = dt->name->linearization;
+                    for (size_t i = 0; i + 1 < jl_svec_len(lin); i++) {
+                        jl_typename_t *tn = (jl_typename_t*)jl_svecref(lin, i);
+                        if (tn == jl_function_type->name)
+                            continue;
+                        jl_datatype_t *w = (jl_datatype_t*)jl_unwrap_unionall(tn->wrapper);
+                        jl_datatype_t *super = jl_datatype_compute_super(w);
+                        if (super == jl_function_type)
+                            *facts |= HAVE_FUNCTION;
+                        else if (super != jl_any_type)
+                            continue;
+                        f(tn, 1, env);
+                    }
+                }
                 else {
                     while (1) {
                         jl_datatype_t *super = jl_datatype_compute_super(dt);
