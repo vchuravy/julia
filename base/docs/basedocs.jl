@@ -119,6 +119,32 @@ abstract type Number end
 abstract type Real <: Number end
 ```
 [`Number`](@ref) has no supertype, whereas [`Real`](@ref) is an abstract subtype of `Number`.
+
+An abstract type may declare fields, which every subtype then has (before any
+field of its own), so that methods on the abstract type can access them directly:
+
+```julia
+abstract type Shape
+    name::String
+    Shape(name) = (name = name,)
+end
+
+struct Circle <: Shape
+    r::Float64
+    Circle(name, r) = new(; Shape(name)..., r)
+end
+
+describe(s::Shape) = s.name
+```
+
+The declared fields are stored in every subtype, ordered from the most distant
+ancestor to the type itself. `const` marks a field that cannot be reassigned in
+mutable subtypes; `@atomic` requires every concrete subtype to be mutable.
+Constructors declared in the body return a `NamedTuple` of the type's own fields,
+which subtypes splat into the keyword form of `new`. [`fieldnames`](@ref),
+[`fieldtypes`](@ref) and [`hasfield`](@ref) report the declared fields; the
+position of a declared field varies between subtypes, so [`fieldindex`](@ref)
+and [`fieldcount`](@ref) throw for abstract types.
 """
 kw"abstract type", kw"abstract"
 

@@ -587,3 +587,71 @@ end
     names_front, names_last_n = split_rest(names, n, st...)
     return NamedTuple{names_front}(t), NamedTuple{names_last_n}(t)
 end
+
+# `new(; kw...)` and `new(args...)` in a type with an explicit supertype: the
+# fields inherited from abstract supertypes are unknown to lowering, so the
+# field order, the arity checks and the conversions are resolved here at run
+# time (and folded by inference once the type and the argument types are known).
+
+# Returns how many leading fields of `T` the keyword names initialize.
+function _new_kw_check(@nospecialize(T::DataType), kwnames::Tuple{Vararg{Symbol}})
+    @_foldable_meta
+    names = T.name.names::Core.SimpleVector
+    nf = length(names)
+    n = 0
+    for i = 1:nf
+        found = false
+        for k in kwnames
+            if k === names[i]
+                found = true
+                break
+            end
+        end
+        if found
+            n == i - 1 || throw(ArgumentError(LazyString("new: field `", names[i], "` of ", T,
+                " cannot be initialized while field `", names[n+1], "` is left uninitialized")))
+            n = i
+        end
+    end
+    n >= Int(T.name.n_inherited) || throw(ArgumentError(LazyString("new: field `", names[n+1],
+        "` of ", T, " is inherited from an abstract supertype and must be initialized")))
+    if length(kwnames) != n
+        for k in kwnames
+            found = false
+            for i = 1:nf
+                if k === names[i]
+                    found = true
+                    break
+                end
+            end
+            found || throw(ArgumentError(LazyString("new: type ", T, " has no field `", k, "`")))
+        end
+    end
+    return n
+end
+
+@inline function _new_kw_args(::Type{T}, nt::NamedTuple{kwnames}) where {T, kwnames}
+    n = _new_kw_check(T, kwnames)
+    return ntuple(Val(n)) do i
+        @inline
+        convert(fieldtype(T, i), getfield(nt, fieldname(T, i)))
+    end
+end
+
+function _new_check_nargs(@nospecialize(T::DataType), n::Int)
+    @_foldable_meta
+    nf = length(T.name.names::Core.SimpleVector)
+    n > nf && throw(ArgumentError(LazyString("new: too many arguments (expected ", nf, ")")))
+    ninit = nf - Int(T.name.n_uninitialized)
+    n < ninit && throw(ArgumentError(LazyString("new: too few arguments (expected ", ninit, ")")))
+    return nothing
+end
+
+@inline function _new_convert_args(::Type{T}, args::Tuple) where {T}
+    n = nfields(args)
+    _new_check_nargs(T, n)
+    return ntuple(Val(n)) do i
+        @inline
+        convert(fieldtype(T, i), getfield(args, i))
+    end
+end

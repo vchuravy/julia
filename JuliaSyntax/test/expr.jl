@@ -781,6 +781,14 @@
             Expr(:struct, false, :A, Expr(:block, LineNumberNode(2), "doc", :a))
     end
 
+    @testset "abstract type with fields" begin
+        @test parsestmt("abstract type A end") == Expr(:abstract, :A)
+        @test parsestmt("abstract type A \n a::X \n end") ==
+            Expr(:abstract, :A, Expr(:block, LineNumberNode(2), Expr(:(::), :a, :X)))
+        @test parsestmt("abstract type A \n \"doc\" \n a end") ==
+            Expr(:abstract, :A, Expr(:block, LineNumberNode(2), "doc", :a))
+    end
+
     @testset "typegroup" begin
         @test parsestmt("typegroup\nstruct A\nend\nend", version=v"1.14") ==
             Expr(:typegroup, Expr(:block, LineNumberNode(2),

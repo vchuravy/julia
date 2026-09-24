@@ -364,12 +364,12 @@ function metadata(__source__, __module__, expr, ismodule)
     else
         push!(args, Pair(:module, __module__))
     end
-    if isexpr(expr, :struct)
-        # Field docs for concrete types.
+    if isexpr(expr, :struct) || (isexpr(expr, :abstract) && length(expr.args) == 2)
+        # Field docs for concrete types, and for abstract types declaring fields.
         P = Pair{Symbol,Any}
         fields = P[]
         last_docstr = nothing
-        for each in (expr.args[3]::Expr).args
+        for each in (expr.args[end]::Expr).args
             eachex = unescape(each)
             if isa(eachex, Symbol) || isexpr(eachex, :(::))
                 # a field declaration

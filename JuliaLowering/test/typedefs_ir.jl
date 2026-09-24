@@ -170,43 +170,49 @@ X{S, T=w}
 abstract type A end
 #---------------------
 1   (call core.svec)
-2   (call core._abstracttype TestMod :A %₁)
-3   (= slot₁/A %₂)
-4   (call core._setsuper! %₂ core.Any)
-5   (call core._typebody! slot₁/A)
-6   (call core.declare_global TestMod :A false)
-7   latestworld
-8   (call core.isdefinedglobal TestMod :A false)
-9   (gotoifnot %₈ label₁₄)
-10  TestMod.A
-11  (call core._equiv_typedef %₁₀ %₂)
-12  (gotoifnot %₁₁ label₁₄)
-13  (goto label₁₆)
-14  (call core.declare_const TestMod :A %₂)
-15  latestworld
-16  (return core.nothing)
+2   (call core.svec)
+3   (call core.svec)
+4   (call core._abstracttype TestMod :A %₁ %₂ %₃)
+5   (= slot₁/A %₄)
+6   (call core._setsuper! %₄ core.Any)
+7   (call core.svec)
+8   (call core._typebody! slot₁/A %₇)
+9   (call core.declare_global TestMod :A false)
+10  latestworld
+11  (call core.isdefinedglobal TestMod :A false)
+12  (gotoifnot %₁₁ label₁₇)
+13  TestMod.A
+14  (call core._equiv_typedef %₁₃ %₄)
+15  (gotoifnot %₁₄ label₁₇)
+16  (goto label₁₉)
+17  (call core.declare_const TestMod :A %₄)
+18  latestworld
+19  (return core.nothing)
 
 ########################################
 # Abstract type definition with supertype
 abstract type A <: B end
 #---------------------
 1   (call core.svec)
-2   (call core._abstracttype TestMod :A %₁)
-3   (= slot₁/A %₂)
-4   TestMod.B
-5   (call core._setsuper! %₂ %₄)
-6   (call core._typebody! slot₁/A)
-7   (call core.declare_global TestMod :A false)
-8   latestworld
-9   (call core.isdefinedglobal TestMod :A false)
-10  (gotoifnot %₉ label₁₅)
-11  TestMod.A
-12  (call core._equiv_typedef %₁₁ %₂)
-13  (gotoifnot %₁₂ label₁₅)
-14  (goto label₁₇)
-15  (call core.declare_const TestMod :A %₂)
-16  latestworld
-17  (return core.nothing)
+2   (call core.svec)
+3   (call core.svec)
+4   (call core._abstracttype TestMod :A %₁ %₂ %₃)
+5   (= slot₁/A %₄)
+6   TestMod.B
+7   (call core._setsuper! %₄ %₆)
+8   (call core.svec)
+9   (call core._typebody! slot₁/A %₈)
+10  (call core.declare_global TestMod :A false)
+11  latestworld
+12  (call core.isdefinedglobal TestMod :A false)
+13  (gotoifnot %₁₂ label₁₈)
+14  TestMod.A
+15  (call core._equiv_typedef %₁₄ %₄)
+16  (gotoifnot %₁₅ label₁₈)
+17  (goto label₂₀)
+18  (call core.declare_const TestMod :A %₄)
+19  latestworld
+20  (return core.nothing)
 
 ########################################
 # Abstract type definition with multiple typevars
@@ -218,21 +224,24 @@ abstract type A{X, Y <: X} end
 4   slot₂/X
 5   slot₃/Y
 6   (call core.svec %₄ %₅)
-7   (call core._abstracttype TestMod :A %₆)
-8   (= slot₁/A %₇)
-9   (call core._setsuper! %₇ core.Any)
-10  (call core._typebody! slot₁/A)
-11  (call core.declare_global TestMod :A false)
-12  latestworld
-13  (call core.isdefinedglobal TestMod :A false)
-14  (gotoifnot %₁₃ label₁₉)
-15  TestMod.A
-16  (call core._equiv_typedef %₁₅ %₇)
-17  (gotoifnot %₁₆ label₁₉)
-18  (goto label₂₁)
-19  (call core.declare_const TestMod :A %₇)
-20  latestworld
-21  (return core.nothing)
+7   (call core.svec)
+8   (call core.svec)
+9   (call core._abstracttype TestMod :A %₆ %₇ %₈)
+10  (= slot₁/A %₉)
+11  (call core._setsuper! %₉ core.Any)
+12  (call core.svec)
+13  (call core._typebody! slot₁/A %₁₂)
+14  (call core.declare_global TestMod :A false)
+15  latestworld
+16  (call core.isdefinedglobal TestMod :A false)
+17  (gotoifnot %₁₆ label₂₂)
+18  TestMod.A
+19  (call core._equiv_typedef %₁₈ %₉)
+20  (gotoifnot %₁₉ label₂₂)
+21  (goto label₂₄)
+22  (call core.declare_const TestMod :A %₉)
+23  latestworld
+24  (return core.nothing)
 
 ########################################
 # Error: Abstract type definition with bad signature
@@ -352,7 +361,7 @@ end
 5   (call core.svec)
 6   (call core.svec)
 7   (call core.svec)
-8   (call core.svec %₄ %₅ %₆ false 0 core.Any %₇)
+8   (call core.svec %₄ %₅ %₆ false -1 core.Any %₇)
 9   (call core.isdefinedglobal TestMod :X false)
 10  (gotoifnot %₉ label₁₄)
 11  TestMod.X
@@ -436,7 +445,7 @@ end
 6   (call core.svec)
 7   TestMod.T
 8   (call core.svec core.Any %₇ core.Any)
-9   (call core.svec %₄ %₅ %₆ false 3 core.Any %₈)
+9   (call core.svec %₄ %₅ %₆ false -1 core.Any %₈)
 10  (call core.isdefinedglobal TestMod :X false)
 11  (gotoifnot %₁₀ label₁₅)
 12  TestMod.X
@@ -478,7 +487,7 @@ end
 12  (call core.svec)
 13  TestMod.Z
 14  (call core.svec)
-15  (call core.svec %₁₀ %₁₁ %₁₂ false 0 %₁₃ %₁₄)
+15  (call core.svec %₁₀ %₁₁ %₁₂ false -1 %₁₃ %₁₄)
 16  (call core.isdefinedglobal TestMod :X false)
 17  (gotoifnot %₁₆ label₂₁)
 18  TestMod.X
@@ -516,7 +525,7 @@ end
 5   (call core.svec :a :b :c)
 6   (call core.svec 1 :const 2 :atomic 3 :atomic 3 :const)
 7   (call core.svec core.Any core.Any core.Any)
-8   (call core.svec %₄ %₅ %₆ false 3 core.Any %₇)
+8   (call core.svec %₄ %₅ %₆ false -1 core.Any %₇)
 9   (call core.isdefinedglobal TestMod :X false)
 10  (gotoifnot %₉ label₁₄)
 11  TestMod.X
@@ -560,7 +569,7 @@ end
 7   (call core.svec :a :b)
 8   (call core.svec)
 9   (call core.svec core.Any core.Any)
-10  (call core.svec %₆ %₇ %₈ false 2 core.Any %₉)
+10  (call core.svec %₆ %₇ %₈ false -1 core.Any %₉)
 11  (call core.isdefinedglobal TestMod :X false)
 12  (gotoifnot %₁₁ label₁₆)
 13  TestMod.X
@@ -614,7 +623,7 @@ end
 8   (call core.svec)
 9   slot₂/U
 10  (call core.svec %₉)
-11  (call core.svec %₆ %₇ %₈ false 1 core.Any %₁₀)
+11  (call core.svec %₆ %₇ %₈ false -1 core.Any %₁₀)
 12  (call core.isdefinedglobal TestMod :X false)
 13  (gotoifnot %₁₂ label₁₇)
 14  TestMod.X
@@ -661,7 +670,7 @@ end
 15  slot₃/S
 16  (call core.apply_type_or_typeapp %₁₄ %₁₅)
 17  (call core.svec %₁₆)
-18  (call core.svec %₁₁ %₁₂ %₁₃ false 1 core.Any %₁₇)
+18  (call core.svec %₁₁ %₁₂ %₁₃ false -1 core.Any %₁₇)
 19  (call core.isdefinedglobal TestMod :X false)
 20  (gotoifnot %₁₉ label₂₄)
 21  TestMod.X
@@ -917,7 +926,7 @@ end
 5   (call core.svec :x :y)
 6   (call core.svec)
 7   (call core.svec core.Any core.Any)
-8   (call core.svec %₄ %₅ %₆ false 2 core.Any %₇)
+8   (call core.svec %₄ %₅ %₆ false -1 core.Any %₇)
 9   (call core.isdefinedglobal TestMod :X false)
 10  (gotoifnot %₉ label₁₄)
 11  TestMod.X
@@ -969,7 +978,7 @@ end
 9   slot₂/T
 10  TestMod.A
 11  (call core.svec %₉ %₁₀)
-12  (call core.svec %₆ %₇ %₈ false 2 core.Any %₁₁)
+12  (call core.svec %₆ %₇ %₈ false -1 core.Any %₁₁)
 13  (call core.isdefinedglobal TestMod :X false)
 14  (gotoifnot %₁₃ label₁₈)
 15  TestMod.X
@@ -1028,27 +1037,70 @@ end
 39  (return core.nothing)
 
 ########################################
-# Error: new doesn't accept keywords
+# new with keyword arguments initializes fields by name
 struct X
-    X() = new(a=1)
+    a
+    b
+    X() = new(; b=2, a=1)
 end
 #---------------------
-LoweringError:
-struct X
-    X() = new(a=1)
-#             └─┘ ── `new` does not accept keyword arguments
-end
+1   (call core.declare_global TestMod :X false)
+2   latestworld
+3   (= slot₁/X (call core.TypeVar :X))
+4   (call core.svec)
+5   (call core.svec :a :b)
+6   (call core.svec)
+7   (call core.svec core.Any core.Any)
+8   (call core.svec %₄ %₅ %₆ false -1 core.Any %₇)
+9   (call core.isdefinedglobal TestMod :X false)
+10  (gotoifnot %₉ label₁₄)
+11  TestMod.X
+12  (= slot₂/if_val %₁₁)
+13  (goto label₁₅)
+14  (= slot₂/if_val core.nothing)
+15  slot₂/if_val
+16  slot₁/X
+17  (call core.svec %₁₆)
+18  (call core.svec %₈)
+19  (call core.svec %₁₅)
+20  (call core.resolve_typegroup TestMod %₁₇ %₁₈ %₁₉)
+21  (= slot₁/X (call core.getfield %₂₀ 1))
+22  slot₁/X
+23  (call core.declare_const TestMod :X %₂₂)
+24  latestworld
+25  TestMod.X
+26  (call core.apply_type core.Type %₂₅)
+27  (call core.svec %₂₆)
+28  (call core.svec)
+29  SourceLocation::4:5
+30  (call core.svec %₂₇ %₂₈ %₂₉)
+31  (call core.define_method TestMod core.nothing %₃₀
+    --- code_info
+    slots: [slot₁/#ctor-self#]
+    1   slot₁/#ctor-self#
+    2   (call core.tuple :b :a)
+    3   (call core.apply_type core.NamedTuple %₂)
+    4   (call core.tuple 2 1)
+    5   (call %₃ %₄)
+    6   (call top._new_kw_args %₁ %₅)
+    7   (splatnew %₁ %₆)
+    8   (return %₇)
+32  latestworld
+33  (return core.nothing)
 
 ########################################
-# Error: new doesn't accept keywords (params block)
+# Error: new cannot mix positional and keyword arguments
 struct X
-    X() = new(; a=1)
+    a
+    b
+    X() = new(1; b=2)
 end
 #---------------------
 LoweringError:
-struct X
-    X() = new(; a=1)
-#             └───┘ ── `new` does not accept keyword arguments
+    a
+    b
+    X() = new(1; b=2)
+#         └─────────┘ ── `new` cannot mix positional and keyword arguments
 end
 
 ########################################
@@ -1225,13 +1277,13 @@ end
 9   (call core.svec)
 10  slot₂/B
 11  (call core.svec %₁₀)
-12  (call core.svec %₇ %₈ %₉ false 1 core.Any %₁₁)
+12  (call core.svec %₇ %₈ %₉ false -1 core.Any %₁₁)
 13  (call core.svec)
 14  (call core.svec :a)
 15  (call core.svec)
 16  slot₁/A
 17  (call core.svec %₁₆)
-18  (call core.svec %₁₃ %₁₄ %₁₅ false 1 core.Any %₁₇)
+18  (call core.svec %₁₃ %₁₄ %₁₅ false -1 core.Any %₁₇)
 19  (call core.isdefinedglobal TestMod :A false)
 20  (gotoifnot %₁₉ label₂₄)
 21  TestMod.A
@@ -1297,13 +1349,13 @@ end
 15  slot₂/B
 16  (call core.apply_type_or_typeapp %₁₃ %₁₄ %₁₅)
 17  (call core.svec %₁₆)
-18  (call core.svec %₇ %₈ %₉ false 1 %₁₂ %₁₇)
+18  (call core.svec %₇ %₈ %₉ false -1 %₁₂ %₁₇)
 19  (call core.svec)
 20  (call core.svec :a)
 21  (call core.svec)
 22  slot₁/A
 23  (call core.svec %₂₂)
-24  (call core.svec %₁₉ %₂₀ %₂₁ false 1 core.Any %₂₃)
+24  (call core.svec %₁₉ %₂₀ %₂₁ false -1 core.Any %₂₃)
 25  (call core.isdefinedglobal TestMod :A false)
 26  (gotoifnot %₂₅ label₃₀)
 27  TestMod.A

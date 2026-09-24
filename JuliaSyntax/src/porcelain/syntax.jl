@@ -1279,7 +1279,9 @@ function _green_to_est(parent::SyntaxTree, parent_i::Int,
             out = _green_to_est(st, 1, cs[1])
             return kind(out) in KSet"Identifier = ::" ? out :
                 mknode(st, SyntaxList(out))
-        elseif kind(parent) === K"struct" && parent_i === 3
+        elseif (kind(parent) === K"struct" && parent_i === 3) ||
+               (kind(parent) === K"abstract" && parent_i === 2)
+            # (abstract _ (block (doc "foo" field1))) => (abstract _ (block "foo" field1))
             cs_tmp = SyntaxList()
             for c in cs
                 kind(c) === K"doc" ?

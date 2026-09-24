@@ -94,6 +94,7 @@ JL_DLLEXPORT jl_typename_t *jl_new_typename_in(jl_sym_t *name, jl_module_t *modu
     jl_atomic_store_relaxed(&tn->cache_entry_count, 0);
     tn->constprop_heustic = 0;
     tn->concrete_only = 0;
+    tn->n_inherited = 0;
     return tn;
 }
 
@@ -993,7 +994,9 @@ JL_DLLEXPORT jl_datatype_t *jl_new_datatype(
 
     uint32_t *atomicfields = NULL;
     uint32_t *constfields = NULL;
-    jl_process_field_attrs(fattrs, fnames, mutabl, 1, &atomicfields, &constfields);
+    // an abstract type may declare `const`/`@atomic` fields on behalf of its
+    // (possibly mutable) subtypes
+    jl_process_field_attrs(fattrs, fnames, mutabl || abstract, 1, &atomicfields, &constfields);
     tn->atomicfields = atomicfields;
     tn->constfields = constfields;
 
@@ -1691,8 +1694,10 @@ JL_DLLEXPORT jl_value_t *jl_new_structv(jl_datatype_t *type, jl_value_t **args, 
         jl_type_error("new", (jl_value_t*)jl_datatype_type, (jl_value_t*)type);
     }
     size_t nf = jl_datatype_nfields(type);
-    if (nf - type->name->n_uninitialized > na || na > nf)
-        jl_error("invalid struct allocation");
+    if (na > nf)
+        jl_errorf("new: too many arguments (expected %d)", (int)nf);
+    if (nf - type->name->n_uninitialized > na)
+        jl_errorf("new: too few arguments (expected %d)", (int)(nf - type->name->n_uninitialized));
     for (size_t i = 0; i < na; i++) {
         jl_value_t *ft = jl_field_type_concrete(type, i);
         if (!jl_isa(args[i], ft))
@@ -2787,6 +2792,224 @@ void jl_check_field_types(jl_svec_t *ftypes, jl_sym_t *type_name)
     }
 }
 
+// Field inheritance from abstract ancestors ----------------------------------
+
+// The ancestors of `dt` that declare fields of their own, root-most first.
+// Every `names` list is `[inherited..., own...]`, so an ancestor contributes
+// exactly the slice `names[n_inherited:end]`.
+static void collect_field_ancestors(jl_datatype_t *dt, arraylist_t *out) JL_CANSAFEPOINT
+{
+    jl_datatype_t *s = jl_datatype_compute_super(dt);
+    while (s != NULL && s != jl_any_type) {
+        jl_typename_t *stn = s->name;
+        if (stn->names != NULL && jl_svec_len(stn->names) > (size_t)stn->n_inherited)
+            arraylist_push(out, s);
+        s = jl_datatype_compute_super(s);
+    }
+    for (size_t i = 0, j = out->len; i + 1 < j; i++, j--) {
+        void *tmp = out->items[i];
+        out->items[i] = out->items[j - 1];
+        out->items[j - 1] = tmp;
+    }
+}
+
+static int ancestor_field_isconst(jl_datatype_t *ad, size_t i) JL_NOTSAFEPOINT
+{
+    const uint32_t *constfields = ad->name->constfields;
+    return constfields != NULL && (constfields[i / 32] & (1 << (i % 32)));
+}
+
+// Validate that `dt` (whose supertype is already set) may inherit the fields
+// its ancestors declare, given its own field names and the smallest number of
+// arguments any of its `new` calls supplies (`min_init`, -1 when every field
+// is always initialized). Throws on a name clash, on an `@atomic` field
+// inherited by an immutable type, and on a `new` that could leave an inherited
+// field uninitialized. Does not allocate.
+void jl_check_inherited_fields(jl_datatype_t *dt, jl_svec_t *own_names, int min_init)
+{
+    jl_typename_t *tn = dt->name;
+    const char *type_name = jl_symbol_name(tn->name);
+    size_t n_own = jl_svec_len(own_names);
+    arraylist_t ancestors;
+    arraylist_new(&ancestors, 0);
+    collect_field_ancestors(dt, &ancestors);
+    size_t n_inh = 0;
+    for (size_t a = 0; a < ancestors.len; a++) {
+        jl_datatype_t *ad = (jl_datatype_t*)ancestors.items[a];
+        jl_typename_t *atn = ad->name;
+        size_t start = atn->n_inherited, end = jl_svec_len(atn->names);
+        for (size_t i = start; i < end; i++) {
+            jl_sym_t *fname = (jl_sym_t*)jl_svecref(atn->names, i);
+            for (size_t b = 0; b < a; b++) {
+                jl_typename_t *btn = ((jl_datatype_t*)ancestors.items[b])->name;
+                for (size_t k = btn->n_inherited; k < jl_svec_len(btn->names); k++) {
+                    if (jl_svecref(btn->names, k) == (jl_value_t*)fname) {
+                        arraylist_free(&ancestors);
+                        jl_errorf("invalid field declaration in definition of %s: field `%s` is declared by both %s and %s",
+                                  type_name, jl_symbol_name(fname), jl_symbol_name(btn->name), jl_symbol_name(atn->name));
+                    }
+                }
+            }
+            for (size_t k = 0; k < n_own; k++) {
+                if (jl_svecref(own_names, k) == (jl_value_t*)fname) {
+                    arraylist_free(&ancestors);
+                    jl_errorf("invalid field declaration in definition of %s: field `%s` is already declared by %s",
+                              type_name, jl_symbol_name(fname), jl_symbol_name(atn->name));
+                }
+            }
+            if (!tn->abstract && !tn->mutabl && jl_field_isatomic(ad, i)) {
+                arraylist_free(&ancestors);
+                jl_errorf("invalid field declaration in definition of %s: field `%s` of %s is declared @atomic, so %s must be a mutable struct",
+                          type_name, jl_symbol_name(fname), jl_symbol_name(atn->name), type_name);
+            }
+            n_inh++;
+        }
+    }
+    arraylist_free(&ancestors);
+    if (!tn->abstract && n_inh > 0 && min_init >= 0 && (size_t)min_init < n_inh) {
+        jl_errorf("invalid constructor in definition of %s: `new` may be called with %d arguments, but the %d fields inherited from abstract supertypes must all be initialized",
+                  type_name, min_init, (int)n_inh);
+    }
+}
+
+// Merge the fields inherited from `dt`'s abstract ancestors with its own field
+// declarations. Stores the merged names, `n_inherited` and `n_uninitialized`
+// on `dt->name`, returns the merged field types (inherited types instantiated
+// at each ancestor's actual parameters; NULL when `own_types` is NULL), and
+// returns fresh attribute bitmaps over the merged fields through
+// `atomic_out`/`const_out` (NULL when no bit is set). `own_atomic`/`own_const`
+// are bitmaps over the own fields only. `jl_check_inherited_fields` must have
+// accepted the same inputs first.
+jl_svec_t *jl_inherit_fields(jl_datatype_t *dt, jl_svec_t *own_names, jl_svec_t *own_types,
+                             const uint32_t *own_atomic, const uint32_t *own_const, int min_init,
+                             uint32_t **atomic_out, uint32_t **const_out)
+{
+    jl_typename_t *tn = dt->name;
+    size_t n_own = jl_svec_len(own_names);
+    assert(own_types == NULL || jl_svec_len(own_types) == n_own);
+    arraylist_t ancestors;
+    arraylist_new(&ancestors, 0);
+    collect_field_ancestors(dt, &ancestors);
+    size_t n_inh = 0;
+    for (size_t a = 0; a < ancestors.len; a++) {
+        jl_typename_t *atn = ((jl_datatype_t*)ancestors.items[a])->name;
+        n_inh += jl_svec_len(atn->names) - atn->n_inherited;
+    }
+    size_t ntotal = n_inh + n_own;
+    jl_svec_t *names = own_names, *types = own_types, *adtypes = NULL;
+    JL_GC_PUSH3(&names, &types, &adtypes);
+    if (n_inh > 0) {
+        names = jl_alloc_svec(ntotal);
+        if (own_types != NULL)
+            types = jl_alloc_svec(ntotal);
+        size_t pos = 0;
+        for (size_t a = 0; a < ancestors.len; a++) {
+            jl_datatype_t *ad = (jl_datatype_t*)ancestors.items[a];
+            jl_typename_t *atn = ad->name;
+            size_t start = atn->n_inherited, end = jl_svec_len(atn->names);
+            adtypes = own_types != NULL ? jl_get_fieldtypes(ad) : NULL;
+            for (size_t i = start; i < end; i++, pos++) {
+                jl_svecset(names, pos, jl_svecref(atn->names, i));
+                if (types != NULL)
+                    jl_svecset(types, pos, jl_svecref(adtypes, i));
+            }
+        }
+        assert(pos == n_inh);
+        for (size_t k = 0; k < n_own; k++) {
+            jl_svecset(names, n_inh + k, jl_svecref(own_names, k));
+            if (types != NULL)
+                jl_svecset(types, n_inh + k, jl_svecref(own_types, k));
+        }
+    }
+    // attribute bitmaps: an inherited `const` only matters for a mutable (or
+    // abstract) type; an inherited `@atomic` on an immutable concrete type was
+    // rejected by jl_check_inherited_fields
+    int keep_const = tn->mutabl || tn->abstract;
+    uint32_t *atomicfields = NULL, *constfields = NULL;
+    size_t nb = (ntotal + 31) / 32 * sizeof(uint32_t);
+    size_t pos = 0;
+    for (size_t a = 0; a < ancestors.len; a++) {
+        jl_datatype_t *ad = (jl_datatype_t*)ancestors.items[a];
+        jl_typename_t *atn = ad->name;
+        size_t start = atn->n_inherited, end = jl_svec_len(atn->names);
+        for (size_t i = start; i < end; i++, pos++) {
+            if (jl_field_isatomic(ad, i)) {
+                if (atomicfields == NULL)
+                    atomicfields = (uint32_t*)calloc_s(nb);
+                atomicfields[pos / 32] |= 1 << (pos % 32);
+            }
+            if (keep_const && ancestor_field_isconst(ad, i)) {
+                if (constfields == NULL)
+                    constfields = (uint32_t*)calloc_s(nb);
+                constfields[pos / 32] |= 1 << (pos % 32);
+            }
+        }
+    }
+    for (size_t k = 0; k < n_own; k++) {
+        size_t p = n_inh + k;
+        if (own_atomic != NULL && (own_atomic[k / 32] & (1 << (k % 32)))) {
+            if (atomicfields == NULL)
+                atomicfields = (uint32_t*)calloc_s(nb);
+            atomicfields[p / 32] |= 1 << (p % 32);
+        }
+        if (own_const != NULL && (own_const[k / 32] & (1 << (k % 32)))) {
+            if (constfields == NULL)
+                constfields = (uint32_t*)calloc_s(nb);
+            constfields[p / 32] |= 1 << (p % 32);
+        }
+    }
+    arraylist_free(&ancestors);
+    jl_gc_write(tn, tn->names, jl_svec_t, names);
+    tn->n_inherited = (int32_t)n_inh;
+    if (tn->abstract) {
+        tn->n_uninitialized = 0;
+    }
+    else {
+        size_t ninit = (min_init < 0 || (size_t)min_init > ntotal) ? ntotal : (size_t)min_init;
+        tn->n_uninitialized = (int32_t)(ntotal - ninit);
+    }
+    *atomic_out = atomicfields;
+    *const_out = constfields;
+    JL_GC_POP();
+    return types;
+}
+
+// Compare the field types of a redefinition `new_dt` against `old_dt` (both
+// with `types` set), mapping self-references and type parameters of the new
+// definition to the old one (issues #21816, #61789).
+int jl_equiv_field_types(jl_datatype_t *old_dt, jl_datatype_t *new_dt)
+{
+    size_t nf = jl_svec_len(new_dt->types);
+    if (jl_svec_len(old_dt->types) != nf)
+        return 0;
+    size_t np = jl_nparams(new_dt);
+    int fields_match = 1;
+    jl_value_t *new_ft = NULL;
+    JL_GC_PUSH1(&new_ft);
+    for (size_t j = 0; j < nf; j++) {
+        jl_value_t *old_ft = jl_svecref(old_dt->types, j);
+        new_ft = jl_svecref(new_dt->types, j);
+        new_ft = jl_substitute_datatype(new_ft, new_dt, old_dt);
+        for (size_t k = 0; k < np; k++) {
+            new_ft = jl_substitute_var(new_ft,
+                (jl_tvar_t*)jl_svecref(new_dt->parameters, k),
+                jl_svecref(old_dt->parameters, k));
+        }
+        if (jl_has_free_typevars(old_ft)) {
+            if (!jl_has_free_typevars(new_ft) || !jl_types_struct_equiv(old_ft, new_ft)) {
+                fields_match = 0;
+                break;
+            }
+        }
+        else if (jl_has_free_typevars(new_ft) || !jl_types_equal(old_ft, new_ft)) {
+            fields_match = 0;
+            break;
+        }
+    }
+    JL_GC_POP();
+    return fields_match;
+}
+
 // Resolve multiple typegroup types atomically into real DataTypes
 // Arguments: module, SimpleVector of TypeVars, SimpleVector of struct info SimpleVectors
 // Each struct info svec contains:
@@ -2832,7 +3055,6 @@ JL_DLLEXPORT jl_value_t *jl_resolve_typegroup(jl_module_t *module, jl_svec_t *ty
             // 0: parameters, 1: fieldnames, 2: fieldattrs, 3: mutabl, 4: min_initialized, 5: super, 6: fieldtypes
             jl_svec_t *fieldnames = (jl_svec_t*)jl_svecref(info, 1);
             int mutabl = jl_unbox_bool(jl_svecref(info, 3));
-            int min_initialized = (int)jl_unbox_long(jl_svecref(info, 4));
             int abstract = 0;  // typegroup structs are not abstract
 
             // Root tv, info, fieldnames across allocations
@@ -2841,11 +3063,13 @@ JL_DLLEXPORT jl_value_t *jl_resolve_typegroup(jl_module_t *module, jl_svec_t *ty
             datatypes[i] = jl_new_uninitialized_datatype();
             results[i] = (jl_value_t*)datatypes[i];
 
-            // Create typename
+            // Create typename. `names` holds the own fields until step 4
+            // merges in the fields inherited from abstract supertypes and
+            // computes `n_uninitialized` from `min_initialized`.
             jl_typename_t *tn = jl_new_typename_in(name, module, abstract, mutabl);
             jl_gc_write(datatypes[i], datatypes[i]->name, jl_typename_t, tn);
             jl_gc_write(tn, tn->names, jl_svec_t, fieldnames);
-            tn->n_uninitialized = (int32_t)(jl_svec_len(fieldnames) - min_initialized);
+            tn->n_uninitialized = 0;
 
             // Set up initial values
             datatypes[i]->super = jl_any_type;
@@ -2946,12 +3170,18 @@ JL_DLLEXPORT jl_value_t *jl_resolve_typegroup(jl_module_t *module, jl_svec_t *ty
         // types within the group can never be valid supertypes of each other.
         // Self-subtyping is already caught by the check above.
 
-        // Step 4: Resolve field types
+        // Step 4: Resolve field types, validate field attributes, and merge in
+        // the fields inherited from abstract supertypes (inherited first).
         for (size_t i = 0; i < n; i++) {
             jl_svec_t *info = (jl_svec_t*)jl_svecref(struct_infos, i);
             jl_svec_t *is_types = (jl_svec_t*)jl_svecref(info, 6);
-            jl_svec_t *ftypes = NULL;
-            JL_GC_PUSH2(&is_types, &ftypes);
+            jl_svec_t *fnames = (jl_svec_t*)jl_svecref(info, 1);
+            jl_svec_t *fattrs = (jl_svec_t*)jl_svecref(info, 2);
+            int mutabl = jl_unbox_bool(jl_svecref(info, 3));
+            int min_initialized = (int)jl_unbox_long(jl_svecref(info, 4));
+            jl_svec_t *ftypes = NULL, *merged = NULL;
+            jl_datatype_t *dt = NULL;
+            JL_GC_PUSH6(&is_types, &ftypes, &fnames, &fattrs, &merged, &dt);
             size_t nf = jl_svec_len(is_types);
             ftypes = jl_alloc_svec(nf);
             for (size_t j = 0; j < nf; j++) {
@@ -2961,8 +3191,19 @@ JL_DLLEXPORT jl_value_t *jl_resolve_typegroup(jl_module_t *module, jl_svec_t *ty
             }
             jl_tvar_t *tv = (jl_tvar_t*)jl_svecref(typevars, i);
             jl_check_field_types(ftypes, tv->name);
-            jl_datatype_t *dt = unwrap_to_datatype(results[i]);
-            jl_gc_write(dt, dt->types, jl_svec_t, ftypes);
+            dt = unwrap_to_datatype(results[i]);
+            // all checks that can throw come before the bitmap allocations
+            jl_check_inherited_fields(dt, fnames, min_initialized);
+            uint32_t *own_atomic = NULL, *own_const = NULL;
+            jl_process_field_attrs(fattrs, fnames, mutabl, 1, &own_atomic, &own_const);
+            uint32_t *atomicfields = NULL, *constfields = NULL;
+            merged = jl_inherit_fields(dt, fnames, ftypes, own_atomic, own_const, min_initialized,
+                                       &atomicfields, &constfields);
+            free(own_atomic);
+            free(own_const);
+            dt->name->atomicfields = atomicfields;
+            dt->name->constfields = constfields;
+            jl_gc_write(dt, dt->types, jl_svec_t, merged);
             JL_GC_POP();
         }
     }
@@ -3029,21 +3270,10 @@ JL_DLLEXPORT jl_value_t *jl_resolve_typegroup(jl_module_t *module, jl_svec_t *ty
             }
         }
 
-        // Step 5b: Process field attributes and compute layouts
+        // Step 5b: Compute layouts (field attributes were merged in step 4)
         for (size_t i = 0; i < n; i++) {
-            jl_svec_t *info = (jl_svec_t*)jl_svecref(struct_infos, i);
-            jl_svec_t *fattrs = (jl_svec_t*)jl_svecref(info, 2);
-            jl_svec_t *fnames = (jl_svec_t*)jl_svecref(info, 1);
-            int mutabl = jl_unbox_bool(jl_svecref(info, 3));
-
             jl_datatype_t *dt = unwrap_to_datatype(results[i]);
-            JL_GC_PUSH3(&dt, &fattrs, &fnames);
-
-            uint32_t *atomicfields = NULL;
-            uint32_t *constfields = NULL;
-            jl_process_field_attrs(fattrs, fnames, mutabl, 1, &atomicfields, &constfields);
-            dt->name->atomicfields = atomicfields;
-            dt->name->constfields = constfields;
+            JL_GC_PUSH1(&dt);
 
             if (dt->types != NULL) {
                 jl_compute_field_offsets(dt);
@@ -3095,40 +3325,7 @@ JL_DLLEXPORT jl_value_t *jl_resolve_typegroup(jl_module_t *module, jl_svec_t *ty
                 results[i] = old;
                 continue;
             }
-            size_t nf = jl_svec_len(new_dt->types);
-            if (jl_svec_len(old_dt->types) != nf)
-                continue;
-            // For parametric types, substitute new TypeVars → old TypeVars
-            // so field type comparison works correctly
-            size_t np = jl_nparams(new_dt);
-            int fields_match = 1;
-            jl_value_t *new_ft = NULL;
-            JL_GC_PUSH1(&new_ft);
-            for (size_t j = 0; j < nf; j++) {
-                jl_value_t *old_ft = jl_svecref(old_dt->types, j);
-                new_ft = jl_svecref(new_dt->types, j);
-                // Self-references in the new fields point at the new type; map
-                // them to the old type so an identical redefinition compares
-                // equal (issues #21816, #61789).
-                new_ft = jl_substitute_datatype(new_ft, new_dt, old_dt);
-                for (size_t k = 0; k < np; k++) {
-                    new_ft = jl_substitute_var(new_ft,
-                        (jl_tvar_t*)jl_svecref(new_dt->parameters, k),
-                        jl_svecref(old_dt->parameters, k));
-                }
-                if (jl_has_free_typevars(old_ft)) {
-                    if (!jl_has_free_typevars(new_ft) || !jl_types_struct_equiv(old_ft, new_ft)) {
-                        fields_match = 0;
-                        break;
-                    }
-                }
-                else if (jl_has_free_typevars(new_ft) || !jl_types_equal(old_ft, new_ft)) {
-                    fields_match = 0;
-                    break;
-                }
-            }
-            JL_GC_POP();
-            if (fields_match)
+            if (jl_equiv_field_types(old_dt, new_dt))
                 results[i] = old;
         }
     }

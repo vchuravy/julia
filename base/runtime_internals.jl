@@ -396,7 +396,8 @@ function fieldname(t::DataType, i::Integer)
     end
     throw_need_pos_int(i) = throw(ArgumentError("Field numbers must be positive integers. $i is invalid."))
 
-    isabstracttype(t) && throw_not_def_field()
+    # an abstract type has the fields it declares (inherited by every subtype)
+    isType(t) && throw_not_def_field()
     names = _fieldnames(t)
     n_fields = length(names)::Int
     i > n_fields && throw_field_access(t, i, n_fields)
@@ -430,8 +431,12 @@ julia> fieldnames(Tuple{String,Int})
 (1, 2)
 ```
 """
-fieldnames(t::DataType) = (fieldcount(t); # error check to make sure type is specific enough
-                           (_fieldnames(t)...,))::Tuple{Vararg{Symbol}}
+function fieldnames(t::DataType)
+    # an abstract type reports the fields it declares, which every subtype has
+    # (possibly among others); other types must be specific enough
+    (isabstracttype(t) && !isType(t)) || fieldcount(t)
+    return (_fieldnames(t)...,)::Tuple{Vararg{Symbol}}
+end
 fieldnames(t::UnionAll) = fieldnames(unwrap_unionall(t))
 fieldnames(::Core.TypeofBottom) =
     throw(ArgumentError("The empty type does not have field names since it does not have instances."))
@@ -440,7 +445,9 @@ fieldnames(t::Type{<:Tuple}) = ntuple(identity, fieldcount(t))
 """
     hasfield(T::Type, name::Symbol)
 
-Return a boolean indicating whether `T` has `name` as one of its own fields.
+Return a boolean indicating whether `T` has `name` as one of its fields. For an abstract type,
+this is whether `name` is a field declared by `T` (or an abstract supertype of `T`), which every
+subtype of `T` has.
 
 See also [`fieldnames`](@ref), [`fieldcount`](@ref), [`hasproperty`](@ref).
 
@@ -542,7 +549,8 @@ function isconst(@nospecialize(t::Type), s::Int)
     t = unwrap_unionall(t)
     # TODO: what to do for `Union`?
     isa(t, DataType) || return false # uncertain
-    ismutabletype(t) || return true # immutable structs are always const
+    # immutable structs are always const; an abstract type reports the declared bit
+    ismutabletype(t) || isabstracttype(t) || return true
     1 <= s <= length(t.name.names) || return true # OOB reads are "const" since they always throw
     constfields = t.name.constfields
     constfields === C_NULL && return false
@@ -566,7 +574,8 @@ function isfieldatomic(@nospecialize(t::Type), s::Int)
     t = unwrap_unionall(t)
     # TODO: what to do for `Union`?
     isa(t, DataType) || return false # uncertain
-    ismutabletype(t) || return false # immutable structs are never atomic
+    # immutable structs are never atomic; an abstract type reports the declared bit
+    ismutabletype(t) || isabstracttype(t) || return false
     1 <= s <= length(t.name.names) || return false # OOB reads are not atomic (they always throw)
     atomicfields = t.name.atomicfields
     atomicfields === C_NULL && return false
@@ -1296,6 +1305,10 @@ fieldtype
 Get the index of a named field, throwing an error if the field does not exist (when err==true)
 or returning 0 (when err==false).
 
+The position of a field declared by an abstract type differs between its subtypes, so
+`fieldindex` throws an `ArgumentError` for an abstract type when `err==true`; use
+[`hasfield`](@ref) or [`getfield`](@ref) with the field name instead.
+
 # Examples
 ```jldoctest
 julia> struct Foo
@@ -1325,6 +1338,13 @@ end
 function _fieldindex_maythrow(T::DataType, name::Symbol)
     @_foldable_meta
     @noinline
+    if isabstracttype(T) && !isType(T) &&
+            ccall(:jl_field_index, Cint, (Any, Any, Cint), T, name, false) != Cint(-1)
+        # the position of a declared field differs between subtypes
+        # (an undeclared name still throws the usual FieldError below)
+        throw(ArgumentError(LazyString("field indices of abstract type ", T,
+            " are not stable across its subtypes; use `getfield(x, name)` or `hasfield`")))
+    end
     return Int(ccall(:jl_field_index, Cint, (Any, Any, Cint), T, name, true)+1)
 end
 
@@ -1499,7 +1519,14 @@ julia> fieldtypes(Foo)
 (Int64, String)
 ```
 """
-fieldtypes(@nospecialize T::Type) = (@_foldable_meta; ntupleany(i -> fieldtype(T, i), fieldcount(T)))
+fieldtypes(@nospecialize T::Type) = (@_foldable_meta; ntupleany(i -> fieldtype(T, i), _fieldtypes_count(T)))
+function _fieldtypes_count(@nospecialize T::Type)
+    @_foldable_meta
+    t = unwrap_unionall(T)
+    # an abstract type has the declared fields
+    (t isa DataType && isabstracttype(t) && !isType(t)) && return length(t.name.names)
+    return fieldcount(T)
+end
 
 # return all instances, for types that can be enumerated
 

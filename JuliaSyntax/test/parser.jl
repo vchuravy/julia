@@ -666,6 +666,9 @@ tests = [
         "abstract type A <: B end"       =>  "(abstract (<: A B))"
         "abstract type A <: B{T,S} end"  =>  "(abstract (<: A (curly B T S)))"
         "abstract type A < B end"        =>  "(abstract (call-i A < B))"
+        "abstract type A \n x::Int \n end"  =>  "(abstract A (block (::-i x Int)))"
+        ((v=v"1.8",), "abstract type A; const x; end")  =>  "(abstract A (block (const x)))"
+        "abstract type A <: B\n x\n A(x) = (x = x,)\nend"  =>  "(abstract (<: A B) (block x (function-= (call A x) (tuple-p-, (= x x)))))"
         # primitive type
         "primitive type A 32 end"   =>  "(primitive A 32)"
         "primitive type A 32 ; end" =>  "(primitive A 32)"

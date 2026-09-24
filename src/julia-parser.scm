@@ -1503,9 +1503,14 @@
         (if (not (eq? (peek-token s) 'type))
             (parse-call-chain s word #f)
             (begin (take-token s)
-                   (let ((spec (parse-subtype-spec s)))
-                     (begin0 (list 'abstract spec)
-                             (expect-end (take-lineendings s) "abstract type"))))))
+                   (let* ((spec (parse-subtype-spec s))
+                          ;; an abstract type may declare fields (and constructors
+                          ;; returning them) in a struct-like body
+                          (body (parse-block s parse-struct-field)))
+                     (begin0 (if (every linenum? (cdr body))
+                                 (list 'abstract spec)
+                                 (list 'abstract spec body))
+                             (expect-end s "abstract type"))))))
        ((struct)
         (begin (take-token s)
                (parse-struct-def s #f word)))

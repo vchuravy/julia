@@ -545,8 +545,8 @@ tlayout = TLayout(5,7,11)
 @test_throws ArgumentError fieldname(NamedTuple{(:z,:a)}, 3)
 @test_throws ArgumentError fieldnames(NamedTuple)
 @test_throws ArgumentError fieldnames(NamedTuple{T,Tuple{Int,Int}} where T)
-@test_throws ArgumentError fieldnames(Real)
-@test_throws ArgumentError fieldnames(AbstractArray)
+@test fieldnames(Real) == ()   # abstract types report their declared fields
+@test fieldnames(AbstractArray) == ()
 
 # Common-field unions keep field-index queries structural without choosing a representative arm.
 @test fieldindex(Union{Base.RefValue{Int},Base.RefValue{Float64}}, :x) == 1

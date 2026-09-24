@@ -642,6 +642,20 @@ end
         end
         args[2] = fields
         pushfirst!(args, has_flags(nodehead, MUTABLE_FLAG))
+    elseif k == K"abstract" && length(args) == 2 && args[2] isa Expr && args[2].head == :block
+        # abstract types with fields: docstrings on fields are plain strings, as
+        # in structs
+        orig_fields = args[2].args
+        fields = Expr(:block)
+        for field in orig_fields
+            if @isexpr(field, :macrocall) && field.args[1] == GlobalRef(Core, Symbol("@doc"))
+                push!(fields.args, field.args[3])
+                push!(fields.args, field.args[4])
+            else
+                push!(fields.args, field)
+            end
+        end
+        args[2] = fields
     elseif k == K"importpath"
         retexpr.head = :.
         for i = 1:length(args)

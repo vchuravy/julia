@@ -426,6 +426,11 @@ end
     end
     arg1t = arg1 isa Const ? typeof(arg1.val) : isconstType(arg1) ? typeof(type_parameter(arg1)) : widenconst(arg1)
     a1 = unwrap_unionall(arg1t)
+    if isa(a1, DataType) && isabstracttype(a1) && !isType(a1) && isa(sym, Const) && isa(sym.val, Symbol)
+        # a field declared by an abstract type is present, and always
+        # initialized, in every instance of its subtypes
+        fieldindex(a1, sym.val, false) > 0 && return Const(true)
+    end
     if isa(a1, DataType) && !isabstracttype(a1)
         if a1 === Module
             hasintersect(widenconst(sym), Symbol) || return Bottom
@@ -1104,8 +1109,18 @@ end
         s = s0 = DataType
     end
     if isa(s, DataType)
-        # Can't say anything about abstract types
-        isabstracttype(s) && return false
+        if isabstracttype(s)
+            # only a field declared by the abstract type is known to exist (and
+            # to be initialized) in every subtype
+            isType(s) && return false
+            isa(name, Const) || return false
+            nv = name.val
+            isa(nv, Symbol) || return false
+            field = fieldindex(s, nv, false)
+            field == 0 && return false
+            isfieldatomic(s, field) && return false # TODO: currently we're only testing for ordering === :not_atomic
+            return true
+        end
         # If all fields are always initialized, and bounds check is disabled,
         # we can assume we don't throw
         if !boundscheck && s.name.n_uninitialized == 0
@@ -1279,7 +1294,18 @@ end
         end
     end
     isa(s, DataType) || return Any
-    isabstracttype(s) && return Any
+    if isabstracttype(s)
+        # a field declared by an abstract type has the declared type (an upper
+        # bound of the stored type) in every subtype; its position varies
+        isType(s) && return Any
+        (isa(name, Const) && isa(name.val, Symbol)) || return Any
+        fld = fieldindex(s, name.val, false)
+        fld == 0 && return Any
+        setfield && isconst(s, fld) && return Bottom
+        R = datatype_fieldtypes(s)[fld]
+        valid_as_lattice(R, true) || return Bottom
+        return isempty(s.parameters) ? R : rewrap_unionall(R, s00)
+    end
     if s <: Tuple && !hasintersect(widenconst(name), Int)
         return Bottom
     end
@@ -1681,12 +1707,28 @@ end
     end
     isType(u) && return Bottom # type objects have no fields
     u isa DataType || return Any
-    if isabstracttype(u)
-        # Abstract types have no fields
+    if isabstracttype(u) && (isType(u) || isempty(u.name.names))
+        # Abstract types without declared fields have no fields
         exact && return Bottom
         # Type{...} without free typevars has no subtypes, so it is actually
         # exact, even if `exact` is false.
         isType(u) && !has_free_typevars(type_parameter(u)) && return Bottom
+        return Any
+    end
+    if isabstracttype(u) && !exact
+        # a subtype has the declared fields (at unknown positions) and possibly
+        # more: only a declared symbol name says anything
+        if isa(name, Const) && isa(name.val, Symbol)
+            fld = fieldindex(u, name.val, false)
+            if fld > 0
+                ft = datatype_fieldtypes(u)[fld]
+                (isa(ft, Type) || isa(ft, TypeVar)) || return Bottom
+                exactft = !has_free_typevars(ft)
+                ft = rewrap_unionall(ft, s)
+                exactft && return egal ? Const(ft) : Type{ft}
+                return Type{ft1} where ft1<:ft
+            end
+        end
         return Any
     end
     if u.name === _NAMEDTUPLE_NAME && !isconcretetype(u)

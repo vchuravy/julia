@@ -5311,6 +5311,26 @@ static bool emit_builtin_call(jl_codectx_t &ctx, jl_cgval_t *ret, jl_value_t *f,
                     return true;
                 }
             }
+            else if (jl_is_datatype(utt) && utt->name->abstract && utt->name->names != NULL &&
+                     utt->types != NULL &&
+                     (order == jl_memory_order_unspecified || order == jl_memory_order_notatomic)) {
+                // A field declared by an abstract type exists in every instance, at a
+                // position that depends on the runtime type: look it up by name, and
+                // type the result with the declared field type.
+                ssize_t idx = jl_field_index(utt, name, 0);
+                if (idx != -1 && !jl_field_isatomic(utt, idx)) {
+                    Value *typ = emit_typeof(ctx, obj, false, false);
+                    Value *index = ctx.builder.CreateCall(prepare_call(jlfieldindex_func),
+                            {typ, boxed(ctx, fld), ConstantInt::get(getInt32Ty(ctx.builder.getContext()), 0)});
+                    Value *vidx = ctx.builder.CreateIntCast(index, ctx.types().T_size, false);
+                    Value *fld_val = ctx.builder.CreateCall(prepare_call(jlgetnthfieldchecked_func), { boxed(ctx, obj), vidx }, "getfield");
+                    jl_value_t *frt = jl_field_type(utt, idx);
+                    if (jl_has_free_typevars(frt))
+                        frt = (jl_value_t*)jl_any_type;
+                    *ret = mark_julia_type(ctx, fld_val, true, frt);
+                    return true;
+                }
+            }
         }
         else if (fld.typ == (jl_value_t*)jl_long_type) {
             if (ctx.vaSlot > 0) {
@@ -7533,11 +7553,14 @@ static jl_cgval_t emit_expr(jl_codectx_t &ctx, jl_value_t *expr, ssize_t ssaidx_
         jl_value_t *ty = argv[0].typ;
         // requires an egality-pinned type value: the constructed instance must
         // have exactly the runtime type object, not an `==`-equal rep (#61323)
+        // A type with inherited fields may receive more `new` arguments than it
+        // has fields (the front-end cannot count inherited fields), so leave
+        // that case to the runtime call, which throws.
         if (is_uniquerep_Type(ty) &&
                 jl_is_datatype(jl_some_Type_T(ty)) &&
-                jl_is_concrete_type(jl_some_Type_T(ty))) {
+                jl_is_concrete_type(jl_some_Type_T(ty)) &&
+                nargs <= jl_datatype_nfields(jl_some_Type_T(ty)) + 1) {
             jl_value_t *tp0 = jl_some_Type_T(ty);
-            assert(nargs <= jl_datatype_nfields(tp0) + 1);
             jl_cgval_t res = emit_new_struct(ctx, tp0, nargs - 1, ArrayRef<jl_cgval_t>(argv).drop_front(), is_promotable);
             if (is_promotable && res.promotion_point && res.promotion_ssa==-1)
                 res.promotion_ssa = ssaidx_0based;

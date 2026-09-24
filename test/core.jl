@@ -23,7 +23,7 @@ for (T, c) in (
         (Core.MethodCache, []),
         (Core.TypeMapEntry, [:sig, :simplesig, :guardsigs, :func, :isleafsig, :issimplesig, :va]),
         (Core.TypeMapLevel, []),
-        (Core.TypeName, [:name, :module, :names, :wrapper, :hash, :n_uninitialized, :flags]),
+        (Core.TypeName, [:name, :module, :names, :wrapper, :hash, :n_uninitialized, :flags, :n_inherited]),
         # `super` is filled lazily for instantiations of self-referential
         # definitions (issue #61347), so it is deliberately non-const (and atomic)
         (DataType, [:name, :parameters, :instance, :hash]),
@@ -4241,8 +4241,8 @@ end
 
 # some tests for handling of malformed syntax--these cases should not be possible in normal code
 @test eval(Expr(:new, B, A())) == B(A())
-@test_throws ErrorException("invalid struct allocation") eval(Expr(:new, B))
-@test_throws ErrorException("invalid struct allocation") eval(Expr(:new, B, A(), A()))
+@test_throws ErrorException("new: too few arguments (expected 1)") eval(Expr(:new, B))
+@test_throws ErrorException("new: too many arguments (expected 1)") eval(Expr(:new, B, A(), A()))
 @test_throws TypeError("new", DataType, Complex) eval(Expr(:new, Complex))
 @test_throws TypeError("new", DataType, Complex.body) eval(Expr(:new, Complex.body))
 @test_throws TypeError("new", DataType, Complex) eval(Expr(:splatnew, Complex, ()))

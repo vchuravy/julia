@@ -777,9 +777,12 @@
 
 ;; selftype?: tells us whether the called object is the type being constructed,
 ;; i.e. `new()` and not `new{...}()`.
-(define (new-call Tname type-params sparams params args field-names field-types selftype?)
-  (if (any kwarg? args)
-      (error "\"new\" does not accept keyword arguments"))
+;; inherit-unknown?: the struct declares a supertype, so it may inherit fields
+;; from abstract ancestors that lowering cannot see. Then `field-names` and
+;; `field-types` describe only the own fields, which follow the inherited ones:
+;; every argument is converted through `fieldtype`, arity is checked at run time,
+;; and the keyword form `new(; name=value, ...)` initializes fields by name.
+(define (new-call Tname type-params sparams params args field-names field-types selftype? inherit-unknown?)
   (let ((nnv (num-non-varargs type-params)))
     (if (and (not (any vararg? type-params)) (length> params nnv))
         (error "too few type parameters specified in \"new{...}\""))
@@ -792,6 +795,10 @@
                         `(curly (globalref (thismodule) ,Tname)
                                 ,@type-params))))
          (tn (if (symbol? Texpr) Texpr (make-ssavalue)))
+         (kws (append (if (has-parameters? args) (cdar args) '())
+                      (filter kwarg? (if (has-parameters? args) (cdr args) args))))
+         (args (filter (lambda (a) (not (kwarg? a)))
+                       (if (has-parameters? args) (cdr args) args)))
          (field-convert (lambda (fld fty val)
                           (if (equal? fty '(core Any))
                               val
@@ -803,7 +810,30 @@
                                                       `(call (core fieldtype) ,tn ,(+ fld 1)))
                                                       #f
                                                       #f)))))
-    (cond ((> (num-non-varargs args) (length field-names))
+    (cond ((pair? kws)
+           (if (pair? args)
+               (error "\"new\" cannot mix positional and keyword arguments"))
+           ;; new(; a=1, nt..., b)  =>  splatnew(T, _new_kw_args(T, (; a=1, nt..., b)))
+           (let ((nt (lower-named-tuple
+                      (map (lambda (a) (if (kwarg? a) `(= ,(cadr a) ,(caddr a)) a)) kws)
+                      (lambda (name) (string "keyword argument \"" name "\" repeated in call to \"new\""))
+                      "keyword argument"
+                      "keyword argument syntax")))
+             `(block
+               ,@(if (symbol? tn) '() `((= ,tn ,Texpr)))
+               (splatnew ,tn (call (top _new_kw_args) ,tn ,nt)))))
+          (inherit-unknown?
+           (if (any vararg? args)
+               ;; arity and conversion of every field at run time
+               `(block
+                 ,@(if (symbol? tn) '() `((= ,tn ,Texpr)))
+                 (splatnew ,tn (call (top _new_convert_args) ,tn (call (core tuple) ,@args))))
+               `(block
+                 ,@(if (symbol? tn) '() `((= ,tn ,Texpr)))
+                 (new ,tn ,@(map (lambda (fld val)
+                                   (convert-for-type-decl val `(call (core fieldtype) ,tn ,(+ fld 1)) #f #f))
+                                 (iota (length args)) args)))))
+          ((> (num-non-varargs args) (length field-names))
            `(call (core throw) (call (top ArgumentError)
                                      ,(string "new: too many arguments (expected " (length field-names) ")"))))
           ((any vararg? args)
@@ -872,20 +902,72 @@
 
 ;; rewrite calls to `new( ... )` to `new` expressions on the appropriate
 ;; type, determined by the containing constructor definition.
-(define (rewrite-ctor ctor Tname params field-names field-types)
+(define (rewrite-ctor ctor Tname params field-names field-types (inherit-unknown? #f))
   (define (ctor-body body type-params sparams selftype?)
     (pattern-replace (pattern-set
                       (pattern-lambda
                        (call (-/ new) . args)
                        (new-call Tname type-params sparams params
                                  (map (lambda (a) (ctor-body a type-params sparams selftype?)) args)
-                                 field-names field-types selftype?))
+                                 field-names field-types selftype? inherit-unknown?))
                       (pattern-lambda
                        (call (curly (-/ new) . p) . args)
                        (new-call Tname p sparams params
                                  (map (lambda (a) (ctor-body a type-params sparams selftype?)) args)
-                                 field-names field-types #f)))
+                                 field-names field-types #f inherit-unknown?)))
                      body))
+  (rewrite-ctor-defs ctor Tname params ctor-body))
+
+;; Rewrite the constructors declared in the body of an abstract type: they
+;; return a NamedTuple of the type's own fields (checked and converted through
+;; a return-type annotation), for use with `new(; A(...)..., ...)` in subtypes.
+(define (rewrite-parent-ctor ctor Tname params field-names field-types)
+  (define (ctor-body body type-params sparams selftype?)
+    (pattern-replace (pattern-set
+                      (pattern-lambda
+                       (call (-/ new) . args)
+                       (error (string "\"new\" is not allowed in the body of abstract type \"" Tname
+                                      "\"; return a NamedTuple of the declared fields instead")))
+                      (pattern-lambda
+                       (call (curly (-/ new) . p) . args)
+                       (error (string "\"new\" is not allowed in the body of abstract type \"" Tname
+                                      "\"; return a NamedTuple of the declared fields instead"))))
+                     body))
+  (define (add-rettype sig wheres)
+    (cond ((eq? (car sig) '|::|)
+           (error (string "constructors in the body of abstract type \"" Tname
+                          "\" may not declare a return type")))
+          ((eq? (car sig) 'where)
+           `(where ,(add-rettype (cadr sig) #t) ,@(cddr sig)))
+          (else
+           ;; without `where`, the declared field types may mention unbound
+           ;; type parameters: check the names only
+           `(|::| ,sig ,(if (and (pair? params) (not wheres))
+                            `(curly (core NamedTuple) (tuple ,@(map quotify field-names)))
+                            `(curly (core NamedTuple) (tuple ,@(map quotify field-names))
+                                    (curly (core Tuple) ,@field-types)))))))
+  (let ((def (rewrite-ctor-defs ctor Tname params ctor-body)))
+    (if (not (and (pair? def) (eq? (car def) 'function)))
+        (error (string "invalid expression in the body of abstract type \"" Tname
+                       "\": only field declarations and constructors are allowed")))
+    (let* ((sig (cadr def))
+           (fname (let loop ((s (unwrap-where sig)))
+                    (cond ((eq? (car s) '|::|) (loop (cadr s)))
+                          ((eq? (car s) 'call)
+                           (let ((head (cadr s)))
+                             (cond ((symbol? head) head)
+                                   ((and (pair? head) (eq? (car head) 'curly)) (cadr head))
+                                   ((and (decl? head) (eq? (cadr head) '|#ctor-self#|)) Tname)
+                                   (else #f))))
+                          (else #f)))))
+      (if (not (eq? fname Tname))
+          (error (string "invalid function definition in the body of abstract type \"" Tname
+                         "\": only constructors of \"" Tname "\" may be defined there")))
+      `(function ,(add-rettype sig #f) ,@(cddr def)))))
+
+;; Shared by rewrite-ctor and rewrite-parent-ctor: match the constructor
+;; definition forms and apply `ctor-body` to their bodies.
+(define (rewrite-ctor-defs ctor Tname params ctor-body)
   (pattern-replace
    (pattern-set
     ;; recognize `(t::(Type{X{T}} where T))(...)` as an inner-style constructor for X
@@ -911,15 +993,21 @@
                      (flatten-where-expr __)))
     ctor)))
 
-;; check if there are any calls to new with fewer than n arguments
+;; the smallest number of arguments passed to any call to `new` (#f if none):
+;; the number of fields that are always initialized. Splatted and keyword
+;; calls are checked at run time and do not count.
 (define (ctors-min-initialized expr)
+  (define (new-nargs args)
+    (if (or (any vararg? args) (any kwarg? args) (has-parameters? args))
+        #f
+        (length args)))
   (and (pair? expr)
        (min
         ((pattern-lambda (call (-/ new) . args)
-                         (length args))
+                         (new-nargs args))
          (car expr))
         ((pattern-lambda (call (curly (-/ new) . p) . args)
-                         (length args))
+                         (new-nargs args))
          (car expr))
         (ctors-min-initialized (car expr))
         (ctors-min-initialized (cdr expr)))))
@@ -951,7 +1039,11 @@
 ;;   name  — the struct name symbol
 ;;   sdef  — code to compute the struct info svec
 ;;   fdef  — code to define constructors
-(define (struct-def-expr- name params bounds super fields0 mut info-var use-shim)
+;; Split a struct or abstract type body into its field declarations and the
+;; remaining definitions (constructors).
+;; Returns: (values field-names field-types attrs defs loc)
+;;   attrs — flat list (index sym index sym ...) of `const`/`atomic` attributes
+(define (collect-field-decls fields0)
   (receive
    (fields defs) (separate eventually-decl? fields0)
    (let* ((attrs ())
@@ -966,22 +1058,32 @@
                                  x)))
                          fields)))
           (attrs (reverse attrs))
-          (defs        (filter (lambda (x) (not (or (effect-free? x) (eq? (car x) 'string)))) defs))
+          (defs        (filter (lambda (x) (not (or (effect-free? x) (linenum? x) (eq? (car x) 'string)))) defs))
           (loc         (if (and (pair? fields0) (linenum? (car fields0)))
                            (car fields0)
                            '(line 0 ||)))
           (field-names (map decl-var fields))
-          (field-types (map decl-type fields))
-          (min-initialized (min (ctors-min-initialized defs) (length fields)))
-          (ftypes-expr (if use-shim
-                           (insert-struct-shim field-types name)
-                           field-types)))
+          (field-types (map decl-type fields)))
      (let ((dups (has-dups field-names)))
        (if dups (error (string "duplicate field name: \"" (car dups) "\" is not unique"))))
      (for-each (lambda (v)
                  (if (not (symbol? v))
                      (error (string "field name \"" (deparse v) "\" is not a symbol"))))
                field-names)
+     (values field-names field-types attrs defs loc))))
+
+(define (struct-def-expr- name params bounds super fields0 mut info-var use-shim)
+  (receive
+   (field-names field-types attrs defs loc) (collect-field-decls fields0)
+   (let* (;; smallest `new` arity, or -1 when every field is always initialized;
+          ;; the runtime adds the inherited fields it knows about
+          (min-initialized (or (ctors-min-initialized defs) -1))
+          ;; with a declared supertype, fields may be inherited from abstract
+          ;; ancestors, which lowering cannot see (see `new-call`)
+          (inherit-unknown? (not (equal? super '(core Any))))
+          (ftypes-expr (if use-shim
+                           (insert-struct-shim field-types name)
+                           field-types)))
     (values name
        `(scope-block
          (block
@@ -1001,28 +1103,43 @@
           `(scope-block
             (block
              (hardscope)
-             ,@(map (lambda (c) (rewrite-ctor c name params field-names field-types)) defs))))))))
+             ,@(map (lambda (c) (rewrite-ctor c name params field-names field-types inherit-unknown?)) defs))))))))
 
-(define (abstract-type-def-expr name params super)
+;; `abstract type A{T} <: S; x::T; const y; A{T}(x) where T = (x = x, y = 0); end`
+;; fields0: the body items (may be empty). Declared fields are inherited by
+;; every subtype; constructors return a NamedTuple of the declared fields.
+(define (abstract-type-def-expr name params super fields0)
   (receive
    (params bounds) (sparam-name-bounds params)
-   `(block
-     (global ,name)
-     (scope-block
-      (block
-       (local-def ,name)
-       ,@(map (lambda (v) `(local ,v)) params)
-       ,@(map (lambda (n v) (make-assignment n (bounds-to-TypeVar v #t))) params bounds)
-       (toplevel-only abstract_type)
-       (= ,name (call (core _abstracttype) (thismodule) (inert ,name) (call (core svec) ,@params)))
-       (call (core _setsuper!) ,name ,super)
-       (call (core _typebody!) ,name)
-       (if (&& (call (core isdefinedglobal) (thismodule) (inert ,name) (false))
-               (call (core _equiv_typedef) (globalref (thismodule) ,name) ,name))
-           (null)
-           (const (globalref (thismodule) ,name) ,name))
-       (latestworld)
-       (null))))))
+   (receive
+    (field-names field-types attrs defs loc) (collect-field-decls (flatten-blocks fields0))
+    `(block
+      (global ,name)
+      (scope-block
+       (block
+        (local-def ,name)
+        ,@(map (lambda (v) `(local ,v)) params)
+        ,@(map (lambda (n v) (make-assignment n (bounds-to-TypeVar v #t))) params bounds)
+        (toplevel-only abstract_type)
+        (= ,name (call (core _abstracttype) (thismodule) (inert ,name) (call (core svec) ,@params)
+                       (call (core svec) ,@(map quotify field-names))
+                       (call (core svec) ,@attrs)))
+        (call (core _setsuper!) ,name ,super)
+        (call (core _typebody!) ,name (call (core svec) ,@field-types))
+        (if (&& (call (core isdefinedglobal) (thismodule) (inert ,name) (false))
+                (call (core _equiv_typedef) (globalref (thismodule) ,name) ,name))
+            (null)
+            (const (globalref (thismodule) ,name) ,name))
+        (latestworld)
+        (null)))
+      ,@(if (null? defs)
+            '()
+            `((scope-block
+               (block
+                (hardscope)
+                ,@(map (lambda (c) (rewrite-parent-ctor c name params field-names field-types)) defs)))
+              (latestworld)))
+      (null)))))
 
 (define (primitive-type-def-expr n name params super)
   (receive
@@ -2791,10 +2908,11 @@
 
    'abstract
    (lambda (e)
-     (let ((sig (cadr e)))
+     (let ((sig  (cadr e))
+           (body (if (length> e 2) (cdr (caddr e)) '())))
        (expand-forms
         (receive (name params super) (analyze-type-sig sig)
-                 (abstract-type-def-expr name params super)))))
+                 (abstract-type-def-expr name params super body)))))
 
    'primitive
    (lambda (e)

@@ -2052,11 +2052,17 @@ function parse_resword(ps::ParseState)
         # abstract type A <: B{T,S} end   ==>  (abstract (<: A (curly B T S)))
         # Oddities allowed by parser
         # abstract type A < B end         ==>  (abstract (call-i A < B))
+        # Fields (inherited by every subtype) and constructors returning them
+        # abstract type A \n x::Int \n end  ==>  (abstract A (block (::-i x Int)))
+        # abstract type A; const x; end     ==>  (abstract A (block (const x)))
         bump(ps, TRIVIA_FLAG)
         @check peek(ps) == K"type"
         bump(ps, TRIVIA_FLAG)
         parse_subtype_spec(ps)
         bump_semicolon_trivia(ps)
+        if peek(ps) != K"end"
+            parse_block(ps, ps1->parse_docstring(ps1, parse_struct_field))
+        end
         bump_closing_token(ps, K"end")
         emit(ps, mark, K"abstract")
     elseif word in KSet"struct mutable"

@@ -557,15 +557,23 @@ let s = test_mod.S_empty_new()
     @test s.x === 5
 end
 
-# flisp doesn't error with kwargs after `;` in `new`
-@test JuliaLowering.include_string(test_mod, """
+# keyword arguments initialize fields by name and cannot be mixed with
+# positional arguments (in either lowering)
+@test_throws LoweringError JuliaLowering.include_string(test_mod, """
 struct S_new_kwargs1
     x
     y
     S_new_kwargs1(args...; kwargs...) = new(args...; kwargs...)
 end
-S_new_kwargs1(1,2).x
-"""; expr_compat_mode=true) == 1
+"""; expr_compat_mode=true)
+@test JuliaLowering.include_string(test_mod, """
+struct S_new_kwargs2
+    x
+    y
+    S_new_kwargs2(; kwargs...) = new(; kwargs...)
+end
+S_new_kwargs2(y = 2, x = 1).x
+""") == 1
 
 # new() with splats and untyped fields
 @test JuliaLowering.include_string(test_mod, """
@@ -1071,4 +1079,64 @@ end
         S
     end
     """; expr_compat_mode) == 1
+end
+
+@testset "abstract types with fields" begin
+    @test JuliaLowering.include_string(test_mod, """
+    abstract type AFP{T}
+        x::T
+        AFP{T}(x) where {T} = (x = x,)
+    end
+    """) === nothing
+    @test fieldnames(test_mod.AFP) == (:x,)
+    @test fieldtypes(test_mod.AFP{Int}) == (Int,)
+    @test test_mod.AFP{Int}(1) === (x = 1,)
+    @test_throws MethodError test_mod.AFP{Int}("a")
+
+    @test JuliaLowering.include_string(test_mod, """
+    struct AFQ{T} <: AFP{Vector{T}}
+        y::T
+        AFQ{T}(x, y) where {T} = new(x, y)
+        AFQ(y::T) where {T} = new{T}(; AFP{Vector{T}}(T[])..., y)
+    end
+    """) === nothing
+    @test fieldnames(test_mod.AFQ) == (:x, :y)
+    @test fieldtypes(test_mod.AFQ{Int}) == (Vector{Int}, Int)
+    q = test_mod.AFQ{Int}([1], 2)
+    @test q.x == [1] && q.y == 2
+    @test test_mod.AFQ(3).x == Int[] && test_mod.AFQ(3).y == 3
+    @test test_mod.AFQ{Int}.name.n_inherited == 1
+
+    # docstrings on declared fields are accepted (they are attached by `@doc`
+    # on the type, as for structs)
+    @test JuliaLowering.include_string(test_mod, """
+    abstract type AFDoc
+        "the x"
+        x::Int
+    end
+    struct AFDocSub <: AFDoc
+        "the y"
+        y::Int
+    end
+    """) === nothing
+    @test fieldnames(test_mod.AFDocSub) == (:x, :y)
+
+    @test_throws LoweringError JuliaLowering.include_string(test_mod, """
+    abstract type AFBad
+        x
+        AFBad(x) = new(x)
+    end
+    """)
+    @test_throws LoweringError JuliaLowering.include_string(test_mod, """
+    abstract type AFBad2
+        x
+        f(x) = 1
+    end
+    """)
+    @test_throws LoweringError JuliaLowering.include_string(test_mod, """
+    struct AFBad3 <: AFP{Int}
+        y
+        AFBad3(x, y) = new(x; y)
+    end
+    """)
 end

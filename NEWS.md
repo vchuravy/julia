@@ -23,6 +23,12 @@ New language features
   call can be placed on its own line without switching to the comma separated
   call syntax ([#60181]).
 * Primitive types with non-byte-multiple logical widths can now be defined ([#61359]).
+* Abstract types may declare fields, `abstract type A; x::Int; end`, which every subtype then
+  has before its own fields, so methods on the abstract type can access `a.x` directly and
+  inference knows its declared type. Inner constructors of subtypes can initialize fields by name
+  with `new(; x = 1, y = 2)`, and an abstract type may declare constructors returning a
+  `NamedTuple` of its own fields for use as `new(; A(...)..., y)`. `fieldnames`, `fieldtypes`,
+  `fieldtype` and `hasfield` now report the declared fields of an abstract type.
 * Introduced explicitly wrapping arithmetic operators `+%`, `-%`, `*%` to annotate arithmetic operations
   that are semantically safe to wrap/overflow. Their behavior is currently identical to the default `+`, `-`, `*`
   operators. However, in a future version, there may be opt-in support to detect unannotated wrapping

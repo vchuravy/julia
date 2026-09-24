@@ -1149,6 +1149,11 @@ JL_DLLEXPORT jl_value_t *jl_nth_slot_type(jl_value_t *sig JL_PROPAGATES_ROOT, si
 void jl_compute_field_offsets(jl_datatype_t *st) JL_CANSAFEPOINT;
 void jl_check_valid_supertype(jl_value_t *super, const char *type_name) JL_CANSAFEPOINT;
 void jl_check_field_types(jl_svec_t *ftypes, jl_sym_t *type_name);
+void jl_check_inherited_fields(jl_datatype_t *dt, jl_svec_t *own_names, int min_init) JL_CANSAFEPOINT;
+jl_svec_t *jl_inherit_fields(jl_datatype_t *dt, jl_svec_t *own_names, jl_svec_t *own_types,
+                             const uint32_t *own_atomic, const uint32_t *own_const, int min_init,
+                             uint32_t **atomic_out, uint32_t **const_out) JL_CANSAFEPOINT;
+int jl_equiv_field_types(jl_datatype_t *old_dt, jl_datatype_t *new_dt) JL_CANSAFEPOINT;
 void jl_module_run_initializer(jl_module_t *m) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_binding_t *jl_get_module_binding(jl_module_t *m JL_PROPAGATES_ROOT, jl_sym_t *var, int alloc) JL_CANSAFEPOINT;
 JL_DLLEXPORT void jl_binding_deprecation_warning(jl_binding_t *b) JL_CANSAFEPOINT;

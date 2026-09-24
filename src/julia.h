@@ -649,6 +649,10 @@ typedef struct {
     uint8_t max_methods; // override for inference's max_methods setting (0 = no additional limit or relaxation)
     uint8_t constprop_heustic; // override for inference's constprop heuristic
     uint8_t concrete_only; // Bool: inference refuses to commit (records no backedge) at non-concrete call sites
+    // `names`/`types` are laid out as `[inherited..., own...]`: the first
+    // `n_inherited` fields are inherited from abstract ancestors that declare
+    // fields; the rest are this type's own declarations.
+    int32_t n_inherited;
 } jl_typename_t;
 
 typedef struct {
@@ -1762,7 +1766,9 @@ static inline int jl_field_isatomic(jl_datatype_t *st, int i) JL_NOTSAFEPOINT
 static inline int jl_field_isconst(jl_datatype_t *st, int i) JL_NOTSAFEPOINT
 {
     jl_typename_t *tn = st->name;
-    if (!tn->mutabl)
+    // an abstract type declares fields for its subtypes, which may be mutable:
+    // report the declared bit, not "immutable, hence const"
+    if (!tn->mutabl && !tn->abstract)
         return 1;
     const uint32_t *constfields = tn->constfields;
     if (constfields != NULL) {

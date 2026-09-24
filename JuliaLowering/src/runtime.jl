@@ -232,7 +232,8 @@ function bind_docs!(type::Type, docstr, lineno::LineNumberNode; field_docs=Core.
         fd = Dict{Symbol, Any}()
         fns = fieldnames(type)
         for i = 1:2:length(field_docs)
-            fd[fns[field_docs[i]]] = field_docs[i+1]
+            key = field_docs[i]
+            fd[key isa Symbol ? key : fns[key]] = field_docs[i+1]
         end
         metadata[:fields] = fd
     end

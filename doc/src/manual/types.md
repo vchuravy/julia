@@ -254,6 +254,76 @@ a function whose arguments are abstract types, because it is recompiled for each
 argument types with which it is invoked. (There may be a performance issue, however, in the case
 of function arguments that are containers of abstract types; see [Performance Tips](@ref man-performance-abstract-container).)
 
+### [Abstract types with fields](@id man-abstract-fields)
+
+An abstract type may declare fields. Every subtype then has those fields, stored before any
+field the subtype declares itself, so a method written for the abstract type can access them
+directly, and the compiler knows their declared types:
+
+```jldoctest abstractfields
+julia> abstract type Shape
+           name::String
+       end
+
+julia> struct Circle <: Shape
+           r::Float64
+       end
+
+julia> fieldnames(Circle)
+(:name, :r)
+
+julia> describe(s::Shape) = string(s.name, " with ", fieldcount(typeof(s)), " fields")
+describe (generic function with 1 method)
+
+julia> describe(Circle("unit", 1.0))
+"unit with 2 fields"
+```
+
+The rules are:
+
+  * A concrete type stores the fields declared by its abstract ancestors, from the most distant
+    ancestor to the nearest, followed by its own fields. Positional constructors, `new` and
+    [`fieldnames`](@ref) all use this order. Abstract types never have instances and never get
+    a layout of their own.
+  * A field name declared by an ancestor cannot be declared again by a subtype.
+  * `const` on a declared field means the field cannot be reassigned in a `mutable struct`
+    subtype; `@atomic` requires every concrete subtype to be a `mutable struct`. Primitive types
+    cannot subtype an abstract type that declares fields.
+  * An inner constructor must initialize every inherited field; only a trailing part of the
+    type's *own* fields may be left uninitialized.
+  * [`fieldnames`](@ref), [`fieldtypes`](@ref), [`fieldtype`](@ref) and [`hasfield`](@ref)
+    report the declared fields of an abstract type. The position of a declared field differs
+    between subtypes, so [`fieldindex`](@ref) and [`fieldcount`](@ref) throw for abstract types;
+    use field names instead of positions when working with values of an abstract type.
+
+Because the number and order of inherited fields is a property of the supertype, an inner
+constructor can initialize fields by name instead of position with the keyword form of `new`.
+An abstract type may also declare constructors in its body: they return a `NamedTuple` of the
+type's own fields, which a subtype splats into `new`:
+
+```jldoctest abstractfields
+julia> abstract type Named
+           name::String
+           Named(name) = (name = uppercase(name),)
+       end
+
+julia> struct Point <: Named
+           x::Float64
+           y::Float64
+           Point(name, x, y) = new(; Named(name)..., x, y)
+           Point(x, y) = new(; x, y, name = "origin")
+       end
+
+julia> Point("p", 1, 2)
+Point("P", 1.0, 2.0)
+
+julia> Point(0, 0).name
+"origin"
+```
+
+The keyword form converts each value to the field's declared type, accepts the fields in any
+order, and throws an `ArgumentError` for an unknown name or a missing inherited field.
+
 ## Primitive Types
 
 !!! warning

@@ -2533,13 +2533,31 @@ JL_CALLABLE(jl_f__structtype)
     return dt->name->wrapper;
 }
 
+// _abstracttype(module, name, params[, fieldnames, fieldattrs])
+// With field names, the declared field types follow in `_typebody!`, exactly
+// as for a struct; the fields are inherited by every subtype.
 JL_CALLABLE(jl_f__abstracttype)
 {
-    JL_NARGS(_abstracttype, 3, 3);
+    JL_NARGS(_abstracttype, 3, 5);
     JL_TYPECHK(_abstracttype, module, args[0]);
     JL_TYPECHK(_abstracttype, symbol, args[1]);
     JL_TYPECHK(_abstracttype, simplevector, args[2]);
-    jl_datatype_t *dt = jl_new_abstracttype(args[1], (jl_module_t*)args[0], NULL, (jl_svec_t*)args[2]);
+    jl_datatype_t *dt;
+    if (nargs == 3) {
+        dt = jl_new_abstracttype(args[1], (jl_module_t*)args[0], NULL, (jl_svec_t*)args[2]);
+    }
+    else {
+        if (nargs != 5)
+            jl_error("_abstracttype: expected 3 or 5 arguments");
+        JL_TYPECHK(_abstracttype, simplevector, args[3]);
+        JL_TYPECHK(_abstracttype, simplevector, args[4]);
+        // `types` is left NULL (not empty) until `_typebody!` so that
+        // instantiations created while evaluating the field types are recorded
+        // in `partial` and completed later, as for structs
+        dt = jl_new_datatype((jl_sym_t*)args[1], (jl_module_t*)args[0], NULL, (jl_svec_t*)args[2],
+                             (jl_svec_t*)args[3], NULL, (jl_svec_t*)args[4],
+                             1, 0, jl_svec_len((jl_svec_t*)args[3]));
+    }
     return dt->name->wrapper;
 }
 
@@ -2573,6 +2591,9 @@ static void jl_set_datatype_super(jl_datatype_t *tt, jl_value_t *super) JL_CANSA
     if (jl_is_datatype(super) && tt->name == ((jl_datatype_t*)super)->name)
         jl_errorf("invalid subtyping in definition of %s: a type cannot subtype itself.", type_name);
     jl_check_valid_supertype(super, type_name);
+    if (tt->isprimitivetype && jl_is_datatype(super) && jl_svec_len(jl_field_names((jl_datatype_t*)super)) > 0)
+        jl_errorf("invalid subtyping in definition of %s: a primitive type cannot subtype %s, which declares fields.",
+                  type_name, jl_symbol_name(((jl_datatype_t*)super)->name->name));
     jl_gc_write(tt, tt->super, jl_datatype_t, (jl_datatype_t*)super);
 }
 
@@ -2754,16 +2775,36 @@ JL_CALLABLE(jl_f__typebody)
     if (nargs == 2) {
         jl_value_t *ft = args[1];
         JL_TYPECHK(_typebody!, simplevector, ft);
-        size_t nf = jl_svec_len(ft);
-        jl_check_field_types((jl_svec_t*)ft, dt->name->name);
+        jl_typename_t *tn = dt->name;
+        jl_check_field_types((jl_svec_t*)ft, tn->name);
         if (dt->types != NULL)
             jl_errorf("Internal Error: Expected type fields to be unset");
-        jl_gc_write(dt, dt->types, jl_svec_t, (jl_svec_t*)ft);
+        if (jl_svec_len((jl_svec_t*)ft) != jl_svec_len(tn->names))
+            jl_errorf("Internal Error: field type count does not match field name count");
+        // Merge in the fields inherited from abstract supertypes (`names`
+        // currently holds the own fields, with own-sized attribute bitmaps).
+        {
+            int min_init = (int)jl_svec_len(tn->names) - tn->n_uninitialized;
+            jl_check_inherited_fields(dt, tn->names, min_init);
+            jl_svec_t *merged = NULL;
+            uint32_t *atomicfields = NULL, *constfields = NULL;
+            JL_GC_PUSH1(&merged);
+            merged = jl_inherit_fields(dt, tn->names, (jl_svec_t*)ft, tn->atomicfields, tn->constfields,
+                                       min_init, &atomicfields, &constfields);
+            free((void*)tn->atomicfields);
+            free((void*)tn->constfields);
+            tn->atomicfields = atomicfields;
+            tn->constfields = constfields;
+            jl_gc_write(dt, dt->types, jl_svec_t, merged);
+            ft = (jl_value_t*)merged;
+            JL_GC_POP();
+        }
+        size_t nf = jl_svec_len(ft);
         // If a supertype can reference the same type, then we may not be
         // able to compute the layout of the object before needing to
         // publish it, so we must assume it cannot be inlined, if that
         // check passes, then we also still need to check the fields too.
-        if (!dt->name->mutabl && (nf == 0 || !references_name((jl_value_t*)dt->super, dt->name, 0, 1))) {
+        if (!dt->name->abstract && !dt->name->mutabl && (nf == 0 || !references_name((jl_value_t*)dt->super, dt->name, 0, 1))) {
             int mayinlinealloc = 1;
             size_t i;
             for (i = 0; i < nf; i++) {
@@ -2802,6 +2843,7 @@ int equiv_type(jl_value_t *ta, jl_value_t *tb) JL_CANSAFEPOINT
           dta->name->abstract == dtb->name->abstract &&
           dta->name->mutabl == dtb->name->mutabl &&
           dta->name->n_uninitialized == dtb->name->n_uninitialized &&
+          dta->name->n_inherited == dtb->name->n_inherited &&
           dta->isprimitivetype == dtb->isprimitivetype &&
           (!dta->isprimitivetype || dta->layout->size == dtb->layout->size) &&
           (dta->name->atomicfields == NULL
@@ -2824,6 +2866,11 @@ int equiv_type(jl_value_t *ta, jl_value_t *tb) JL_CANSAFEPOINT
     // before checking whether the supertypes are equal
     b = jl_substitute_datatype(b, dtb, dta);
     if (!jl_types_equal(a, b))
+        goto no;
+    // struct field types are compared by jl_resolve_typegroup; an abstract
+    // type's declared field types must match too
+    if (dta->name->abstract && dta->types != NULL && dtb->types != NULL &&
+        !jl_equiv_field_types(dta, dtb))
         goto no;
     {
         JL_TRY {

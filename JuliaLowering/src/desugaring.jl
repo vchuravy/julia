@@ -3221,10 +3221,13 @@ function expand_typevars(ctx, type_params)
     return (typevar_names, typevar_stmts)
 end
 
+# `abstract type A{T} <: S; x::T; const y; A{T}(x) where T = (x = x, y = 0); end`
+# Declared fields are inherited by every subtype; constructors declared in the
+# body return a NamedTuple of the declared fields.
 function expand_abstract_or_primitive_type(ctx, ex)
     is_abstract = kind(ex) == K"abstract"
     if is_abstract
-        @jl_assert numchildren(ex) == 1 ex
+        @jl_assert 1 <= numchildren(ex) <= 2 ex
     else
         @jl_assert kind(ex) == K"primitive" ex
         @jl_assert numchildren(ex) == 2 ex
@@ -3232,8 +3235,47 @@ function expand_abstract_or_primitive_type(ctx, ex)
     nbits = is_abstract ? nothing : ex[2]
     name, type_params, supertype = analyze_type_sig(ctx, ex[1])
     name, _ = relayer_global_if_unhygienic(ctx, name)
+    name_globalref = @mknode(name; mod=syntax_module(name))
     typevar_names, typevar_stmts = expand_typevars(ctx, type_params)
+    field_names = SyntaxList()
+    field_types = SyntaxList()
+    field_attrs = SyntaxList()
+    field_docs = SyntaxList()
+    inner_defs = SyntaxList()
+    if is_abstract && numchildren(ex) == 2
+        type_body = flatten_blocks(ex[2])
+        if kind(type_body) != K"block"
+            throw(LoweringError(type_body, "expected block for `abstract type` fields"))
+        end
+        _collect_struct_fields(ctx, field_names, field_types, field_attrs, field_docs,
+                               inner_defs, children(type_body))
+    end
     newtype_var = ssavar(ctx, ex, "new_type")
+    # Parent constructors and field docs, after the constant binding so that
+    # the type name in their bodies resolves to the global
+    fdef_stmts = SyntaxList()
+    if !isempty(inner_defs)
+        for (def_i, def) in enumerate(inner_defs)
+            inner_defs[def_i] = rewrite_parent_ctor(ctx, def, name, name_globalref,
+                                                    typevar_names, field_names, field_types)
+        end
+        push!(fdef_stmts, @ast ctx ex [K"scope_block" [K"hard_scope"]
+            [K"block" inner_defs...]
+        ])
+        push!(fdef_stmts, @ast ctx ex (::K"latestworld"))
+    end
+    if !isempty(field_docs)
+        push!(fdef_stmts, @ast ctx ex [K"call"
+            bind_docs!::K"Value"
+            name
+            nothing_(ctx, ex)
+            ::K"SourceLocation"(ex)
+            [K"kw"
+                "field_docs"::K"Identifier"
+                [K"call" "svec"::K"core" field_docs...]
+            ]
+        ])
+    end
     @ast ctx ex [K"block"
         [K"scope_block" [K"hard_scope"]
             [K"block"
@@ -3250,11 +3292,21 @@ function expand_abstract_or_primitive_type(ctx, ex)
                         if !is_abstract
                             nbits
                         end
+                        if is_abstract
+                            [K"call" "svec"::K"core" [n=>K"Symbol" for n in field_names]...]
+                        end
+                        if is_abstract
+                            [K"call" "svec"::K"core" field_attrs...]
+                        end
                     ]
                 ]
                 [K"=" name newtype_var]
                 [K"call" "_setsuper!"::K"core" newtype_var supertype]
-                [K"call" "_typebody!"::K"core" name]
+                if is_abstract
+                    [K"call" "_typebody!"::K"core" name [K"call" "svec"::K"core" field_types...]]
+                else
+                    [K"call" "_typebody!"::K"core" name]
+                end
             ]
         ]
         [K"assert" "toplevel_only"::K"Symbol" [K"syntaxinert" ex] ]
@@ -3271,6 +3323,7 @@ function expand_abstract_or_primitive_type(ctx, ex)
             nothing_(ctx, ex)
             [K"constdecl" name newtype_var]
         ]
+        fdef_stmts...
         nothing_(ctx, ex)
     ]
 end
@@ -3330,7 +3383,9 @@ function _collect_struct_fields(ctx, field_names, field_types, field_attrs, fiel
                     push!(field_attrs, @ast ctx e "const"::K"Symbol")
                 end
                 if !isnothing(m.docs)
-                    push!(field_docs, @ast ctx e n::K"Integer")
+                    # keyed by name: a struct may inherit fields from abstract
+                    # supertypes, which shifts the positions of its own fields
+                    push!(field_docs, @ast ctx e m.name=>K"Symbol")
                     push!(field_docs, @ast ctx e m.docs)
                 end
             elseif kind(e) == K"string" || is_effect_free(e)
@@ -3359,6 +3414,19 @@ function _new_call_convert_arg(ctx, full_struct_type, field_type, field_index, v
             field_index::K"Integer"
         ]
         convert_for_type_decl(ctx, field_type, val, tmp_type, false)
+    ]
+end
+
+# like _new_call_convert_arg, for a field whose declared type is unknown to
+# lowering (it may be inherited from an abstract supertype)
+function _new_call_convert_arg_dyn(ctx, full_struct_type, field_index, val)
+    @ast ctx val [K"block"
+        tmp_type := [K"call"
+            "fieldtype"::K"core"
+            full_struct_type
+            field_index::K"Integer"
+        ]
+        convert_for_type_decl(ctx, val, val, tmp_type, false)
     ]
 end
 
@@ -3461,7 +3529,8 @@ end
 # this case either.
 #
 #     (t::Type{X{A,B}})() = new()
-function rewrite_ctor(ctx, ex, tname, global_tname, struct_typevars, field_types)
+function rewrite_ctor(ctx, ex, tname, global_tname, struct_typevars, field_types,
+                      inherit_unknown::Bool=false)
     is_leaf(ex) && return ex
     @stm ex begin
         [K"inert" _] -> ex
@@ -3471,11 +3540,61 @@ function rewrite_ctor(ctx, ex, tname, global_tname, struct_typevars, field_types
             body2 = _rewrite_ctor_new_calls(
                 ctx, body, global_tname,
                 mapsyntax(typevar_bounds, wheres),
-                struct_typevars, ctor_self, field_types)
+                struct_typevars, ctor_self, field_types, inherit_unknown)
             @ast ctx ex [K"function" call2 body2]
         end
         x -> mapchildren(e->rewrite_ctor(
-            ctx, e, tname, global_tname, struct_typevars, field_types), ex)
+            ctx, e, tname, global_tname, struct_typevars, field_types, inherit_unknown), ex)
+    end
+end
+
+function _check_no_new_calls(ctx, ex, tname)
+    is_leaf(ex) && return
+    if _is_new_call(ex)
+        throw(LoweringError(ex, "`new` is not allowed in the body of abstract type `$(syntax_name(tname))`; return a NamedTuple of the declared fields instead"))
+    end
+    for e in children(ex)
+        _check_no_new_calls(ctx, e, tname)
+    end
+end
+
+function _add_ctor_rettype(ctx, sig, rett)
+    if kind(sig) == K"where"
+        @ast ctx sig [K"where" _add_ctor_rettype(ctx, sig[1], rett) sig[2:end]...]
+    else
+        @ast ctx sig [K"::" sig rett]
+    end
+end
+
+# Rewrite a constructor declared in the body of an abstract type: it returns a
+# NamedTuple of the type's own fields, converted and checked through a
+# return-type annotation, for use with `new(; A(...)..., ...)` in subtypes.
+function rewrite_parent_ctor(ctx, ex, tname, global_tname, struct_typevars,
+                             field_names, field_types)
+    @stm ex begin
+        [K"function" call body] -> let (sig, wheres) = flatten_wheres(call)
+            if kind(sig) == K"::"
+                throw(LoweringError(sig, "constructors in the body of an abstract type may not declare a return type"))
+            end
+            call2, ctor_self =
+                rewrite_ctor_sig(ctx, sig, tname, global_tname, struct_typevars, wheres)
+            if isnothing(ctor_self)
+                throw(LoweringError(sig, "only constructors of `$(syntax_name(tname))` may be defined in the body of an abstract type"))
+            end
+            _check_no_new_calls(ctx, body, tname)
+            # Without `where`, the declared field types may mention unbound
+            # type parameters: check only the names then.
+            rett = if isempty(struct_typevars) || !isempty(wheres)
+                @ast ctx ex [K"curly" "NamedTuple"::K"core"
+                    [K"tuple" [n=>K"Symbol" for n in field_names]...]
+                    [K"curly" "Tuple"::K"core" field_types...]]
+            else
+                @ast ctx ex [K"curly" "NamedTuple"::K"core"
+                    [K"tuple" [n=>K"Symbol" for n in field_names]...]]
+            end
+            @ast ctx ex [K"function" _add_ctor_rettype(ctx, call2, rett) body]
+        end
+        _ -> throw(LoweringError(ex, "invalid expression in the body of an abstract type: only field declarations and constructors are allowed"))
     end
 end
 
@@ -3487,30 +3606,31 @@ end
 #
 # This function should do as much as `new-call`, but does not use curlyargs
 # or ctor_sparams, so may be missing something.
+#
+# inherit_unknown: the struct declares a supertype, so it may inherit fields
+# from abstract ancestors that lowering cannot see. Then `field_types` describes
+# only the own fields, which follow the inherited ones: every argument is
+# converted through `fieldtype`, arity is checked at run time, and the keyword
+# form `new(; name=value, ...)` initializes fields by name.
 function _rewrite_ctor_new_calls(ctx, ex0, global_struct_name, ctor_sparams,
-                                       struct_typevars, ctor_self, field_types)
+                                       struct_typevars, ctor_self, field_types,
+                                       inherit_unknown::Bool=false)
     if is_leaf(ex0)
         return ex0
     elseif !_is_new_call(ex0)
         return mapchildren(
             e->_rewrite_ctor_new_calls(ctx, e, global_struct_name, ctor_sparams,
-                                       struct_typevars, ctor_self, field_types),
+                                       struct_typevars, ctor_self, field_types,
+                                       inherit_unknown),
             ex0
         )
     end
     # Rewrite a call to new()
-    e0args = children(ex0)
-    kw_arg_i = findfirst(e->(k = kind(e); k == K"kw"), e0args)
-    ex = if !isnothing(kw_arg_i)
-        throw(LoweringError(e0args[kw_arg_i], "`new` does not accept keyword arguments"))
-    elseif kind(e0args[end]) === K"parameters" # flisp oversight
-        if is_flisp_compat(ex0)
-            @mknode(ex0; children=e0args[1:end-1])
-        else
-            throw(LoweringError(e0args[end], "`new` does not accept keyword arguments"))
-        end
-    else
-        ex0
+    ex = ex0
+    new_args = copy(ex[2:end])
+    kws = remove_kw_args!(ctx, new_args)
+    if !isnothing(kws) && !isempty(new_args)
+        throw(LoweringError(ex0, "`new` cannot mix positional and keyword arguments"))
     end
     full_struct_type = if kind(ex[1]) == K"curly"
         # new{A,B}(...)
@@ -3535,9 +3655,42 @@ function _rewrite_ctor_new_calls(ctx, ex0, global_struct_name, ctor_sparams,
             throw(LoweringError(ex[1], "too few type parameters specified in `new`"))
         end
     end
-    new_args = ex[2:end]
+    if !isnothing(kws)
+        # new(; a=1, nt..., b)  =>  splatnew(T, _new_kw_args(T, (; a=1, nt..., b)))
+        return @ast ctx ex [K"block"
+            struct_type := full_struct_type
+            [K"splatnew"
+                struct_type
+                [K"call" "_new_kw_args"::K"top" struct_type
+                    expand_named_tuple(ctx, ex, kws; field_name="keyword argument",
+                                       element_name="keyword argument")]
+            ]
+        ]
+    end
     n_splat = sum(kind(t) == K"..." for t in new_args; init=0)
     n_nonsplat = length(new_args) - n_splat
+    if inherit_unknown
+        if n_splat == 0
+            return @ast ctx ex [K"block"
+                struct_type := full_struct_type
+                [K"new"
+                    struct_type
+                    [_new_call_convert_arg_dyn(ctx, struct_type, i, arg)
+                     for (i, arg) in enumerate(new_args)]...
+                ]
+            ]
+        else
+            # arity and conversion of every field at run time
+            return @ast ctx ex [K"block"
+                struct_type := full_struct_type
+                [K"splatnew"
+                    struct_type
+                    [K"call" "_new_convert_args"::K"top" struct_type
+                        [K"call" "tuple"::K"core" new_args...]]
+                ]
+            ]
+        end
+    end
     n_fields = length(field_types)
     function throw_n_fields_error(desc)
         @ast ctx ex [K"call"
@@ -3600,11 +3753,12 @@ function _rewrite_ctor_new_calls(ctx, ex0, global_struct_name, ctor_sparams,
     end
 end
 
+# The smallest number of arguments passed to any call to `new` (typemax(Int)
+# if none): the number of fields that are always initialized. Splatted and
+# keyword calls are checked at run time and do not count.
 function _constructor_min_initialized(ex::SyntaxTree)
     if _is_new_call(ex)
-        if any(kind(e) == K"..." for e in ex[2:end])
-            # Lowering ensures new with splats always inits all fields
-            # or in the case of splatnew this is enforced by the runtime.
+        if any(kind(e) in KSet"... kw parameters" for e in ex[2:end])
             typemax(Int)
         else
             numchildren(ex) - 1
@@ -3720,8 +3874,11 @@ function expand_typegroup_def(ctx, ex)
         _collect_struct_fields(ctx, field_names, field_types, field_attrs, field_docs,
                                inner_defs, children(type_body))
 
+        # smallest `new` arity, or -1 when every field is always initialized;
+        # the runtime adds the inherited fields it knows about
         min_initialized = minimum((_constructor_min_initialized(e) for e in inner_defs),
-                                  init=length(field_names))
+                                  init=typemax(Int))
+        min_initialized == typemax(Int) && (min_initialized = -1)
 
         push!(entries, TypeGroupEntry(sdef, docs, typevar_names, typevar_stmts,
                                       field_names, field_types, field_attrs,
@@ -3856,7 +4013,7 @@ function expand_typegroup_def(ctx, ex)
             for (def_i, def) in enumerate(inner_defs)
                 inner_defs[def_i] =
                     rewrite_ctor(ctx, def, struct_names[i], global_names[i],
-                             e.typevar_names, e.field_types)
+                             e.typevar_names, e.field_types, !is_core_Any(e.supertype))
             end
             push!(fdef_stmts, @ast ctx e.sdef [K"scope_block" [K"hard_scope"]
                 [K"block" inner_defs...]
@@ -3914,8 +4071,11 @@ function expand_struct_def(ctx, ex, docs)
     inner_defs = SyntaxList()
     _collect_struct_fields(ctx, field_names, field_types, field_attrs, field_docs,
                            inner_defs, children(type_body))
+    # smallest `new` arity, or -1 when every field is always initialized; the
+    # runtime adds the inherited fields it knows about
     min_initialized = minimum((_constructor_min_initialized(e) for e in inner_defs),
-                              init=length(field_names))
+                              init=typemax(Int))
+    min_initialized == typemax(Int) && (min_initialized = -1)
     global_struct_name, _ = relayer_global_if_unhygienic(ctx, struct_name)
     struct_mod = syntax_module(global_struct_name)
     struct_globalref = @mknode(global_struct_name; mod=struct_mod)
@@ -4005,7 +4165,7 @@ function expand_struct_def(ctx, ex, docs)
         for (def_i, def) in enumerate(inner_defs)
             inner_defs[def_i] =
                 rewrite_ctor(ctx, def, struct_name, struct_globalref,
-                             typevar_names, field_types)
+                             typevar_names, field_types, !is_core_Any(supertype))
         end
         push!(fdef_stmts, @ast ctx ex [K"scope_block" [K"hard_scope"]
             [K"block" inner_defs...]

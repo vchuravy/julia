@@ -3436,7 +3436,9 @@ function abstract_eval_new(interp::AbstractInterpreter, e::Expr, sstate::Stateme
         # information beyond the declared type.
         if fcount !== nothing
             nothrow = isconcretedispatch(rt)
-            @assert nargs ≤ fcount "malformed :new expression" # syntactically enforced by the front-end
+            # the front-end cannot count fields inherited from abstract
+            # supertypes, so a `new` with too many arguments throws at run time
+            nargs ≤ fcount || return RTEffects(Bottom, ErrorException, EFFECTS_THROWS)
             ats = Vector{Any}(undef, nargs)
             local anyrefine = false
             local allconst = isconcretedispatch(rt)

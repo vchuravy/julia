@@ -3076,7 +3076,8 @@ function dump(io::IOContext, x::DataType, n::Int, indent)
     if x !== Any
         print(io, " <: ", supertype(x))
     end
-    if n > 0 && !(x <: Tuple) && !isabstracttype(x)
+    is_abstract = isabstracttype(x)
+    if n > 0 && !(x <: Tuple) && (!is_abstract || (!isType(x) && !isempty(x.name.names)))
         tvar_io::IOContext = io
         for tparam in x.parameters
             # approximately recapture the list of tvar parameterization
@@ -3094,7 +3095,8 @@ function dump(io::IOContext, x::DataType, n::Int, indent)
         for idx in eachindex(fields)
             println(io)
             print(io, indent, "  ")
-            is_mut && isconst(x, idx) && print(io, "const ")
+            (is_mut || is_abstract) && isconst(x, idx) && print(io, "const ")
+            (is_mut || is_abstract) && isfieldatomic(x, idx) && print(io, "@atomic ")
             print(io, fields[idx])
             if isassigned(fieldtypes, idx)
                 print(io, "::")
