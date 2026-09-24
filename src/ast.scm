@@ -238,7 +238,10 @@
                     "struct "
                     (deparse-block (deparse (caddr e)) (cdr (cadddr e)) ilvl)))
            ((abstract)
-            (string "abstract type " (deparse (cadr e)) " end"))
+            (if (equal? (cadr e) '(true))
+                (string "mutable abstract type "
+                        (deparse-block (deparse (caddr e)) (cdr (cadddr e)) ilvl))
+                (string "abstract type " (deparse (cadr e)) " end")))
            ((primitive)
             (string "primitive type " (deparse (cadr e)) " " (deparse (caddr e)) " end"))
            ((module)

@@ -4440,18 +4440,27 @@ static bool emit_f_opfield(jl_codectx_t &ctx, jl_cgval_t *ret, jl_value_t *f,
     }
 
     jl_datatype_t *uty = (jl_datatype_t*)jl_unwrap_unionall(obj.typ);
-    if (jl_is_datatype(uty) && jl_struct_try_layout(uty)) {
+    // a `mutable abstract type` with a stable field prefix: the field is at the
+    // offset the prefix determines in every instance (see emit_getfield)
+    jl_datatype_t *lty = uty; // the type providing the layout
+    if (jl_is_datatype(uty) && uty->name->abstract && uty->name->mutabl && uty->types != NULL &&
+        fld.constant && jl_is_symbol(fld.constant) && jl_atomic_load_relaxed(&uty->name->stable_field_prefix)) {
+        jl_datatype_t *shadow = jl_abstract_prefix_layout(uty);
+        if (shadow)
+            lty = shadow;
+    }
+    if (jl_is_datatype(uty) && (lty != uty || jl_struct_try_layout(uty))) {
         ssize_t idx = -1;
         if (fld.constant && jl_is_symbol(fld.constant)) {
-            idx = jl_field_index(uty, (jl_sym_t*)fld.constant, 0);
+            idx = jl_field_index(lty, (jl_sym_t*)fld.constant, 0);
         }
         else if (fld.constant && fld.typ == (jl_value_t*)jl_long_type) {
             ssize_t i = jl_unbox_long(fld.constant);
-            if (i > 0 && i <= (ssize_t)jl_datatype_nfields(uty))
+            if (i > 0 && i <= (ssize_t)jl_datatype_nfields(lty))
                 idx = i - 1;
         }
         if (idx != -1) {
-            jl_value_t *ft = jl_field_type(uty, idx);
+            jl_value_t *ft = jl_field_type(lty, idx);
             if (!jl_has_free_typevars(ft)) {
                 if (op != StoreKind::Modify) {
                     emit_typecheck(ctx, val, ft, fname);
@@ -4460,9 +4469,9 @@ static bool emit_f_opfield(jl_codectx_t &ctx, jl_cgval_t *ret, jl_value_t *f,
                         return true;
                 }
                 // TODO: attempt better codegen for approximate types
-                bool isboxed = jl_field_isptr(uty, idx);
-                bool isatomic = jl_field_isatomic(uty, idx);
-                bool needlock = isatomic && !isboxed && jl_datatype_size(jl_field_type(uty, idx)) > MAX_ATOMIC_SIZE;
+                bool isboxed = jl_field_isptr(lty, idx);
+                bool isatomic = jl_field_isatomic(lty, idx);
+                bool needlock = isatomic && !isboxed && jl_datatype_size(jl_field_type(lty, idx)) > MAX_ATOMIC_SIZE;
                 *ret = jl_cgval_t();
                 if (isatomic == (order == jl_memory_order_notatomic)) {
                     std::string msg(fname);
@@ -4483,10 +4492,10 @@ static bool emit_f_opfield(jl_codectx_t &ctx, jl_cgval_t *ret, jl_value_t *f,
                     msg += " cannot be changed";
                     emit_error(ctx, msg);
                 }
-                else if (jl_field_isconst(uty, idx)) {
+                else if (jl_field_isconst(lty, idx)) {
                     std::string msg(fname);
                     msg += ": const field .";
-                    msg += jl_symbol_name((jl_sym_t*)jl_svecref(jl_field_names(uty), idx));
+                    msg += jl_symbol_name((jl_sym_t*)jl_svecref(jl_field_names(lty), idx));
                     msg += " of type ";
                     msg += jl_symbol_name(uty->name->name);
                     msg += " cannot be changed";
@@ -4494,7 +4503,7 @@ static bool emit_f_opfield(jl_codectx_t &ctx, jl_cgval_t *ret, jl_value_t *f,
                 }
                 else {
                     assert(obj.isboxed);
-                    *ret = emit_setfield(ctx, uty, obj, idx, val, cmp, true,
+                    *ret = emit_setfield(ctx, lty, obj, idx, val, cmp, true,
                             (needlock || order <= jl_memory_order_notatomic)
                                 ? AtomicOrdering::NotAtomic
                                 : get_llvm_atomic_order(order),
@@ -5314,10 +5323,20 @@ static bool emit_builtin_call(jl_codectx_t &ctx, jl_cgval_t *ret, jl_value_t *f,
             else if (jl_is_datatype(utt) && utt->name->abstract && utt->name->names != NULL &&
                      utt->types != NULL &&
                      (order == jl_memory_order_unspecified || order == jl_memory_order_notatomic)) {
-                // A field declared by an abstract type exists in every instance, at a
-                // position that depends on the runtime type: look it up by name, and
-                // type the result with the declared field type.
+                // A field declared by an abstract type exists in every instance. While
+                // the abstract type's fields are a stable prefix of every subtype's
+                // fields, it sits at the offset the prefix determines (inference recorded
+                // a `:fieldprefix` edge for this access); otherwise its position depends
+                // on the runtime type: look it up by name, and type the result with the
+                // declared field type.
                 ssize_t idx = jl_field_index(utt, name, 0);
+                if (idx != -1 && jl_atomic_load_relaxed(&utt->name->stable_field_prefix)) {
+                    jl_datatype_t *shadow = jl_abstract_prefix_layout(utt);
+                    if (shadow && !jl_has_free_typevars(jl_field_type(shadow, idx))) {
+                        *ret = emit_getfield_knownidx(ctx, obj, idx, shadow, order);
+                        return true;
+                    }
+                }
                 if (idx != -1 && !jl_field_isatomic(utt, idx)) {
                     Value *typ = emit_typeof(ctx, obj, false, false);
                     Value *index = ctx.builder.CreateCall(prepare_call(jlfieldindex_func),

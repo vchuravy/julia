@@ -1363,6 +1363,18 @@
                `(const ,(parse-eq s)))
         (parse-eq s))))
 
+;; abstract type A [<: B] [fields...] end, after the `type` token; an
+;; abstract type may declare fields (and constructors returning them) in a
+;; struct-like body. A mutable abstract type carries the flag as its first
+;; argument: (abstract #t spec body).
+(define (parse-abstract-type-def s mut?)
+  (let* ((spec (parse-subtype-spec s))
+         (body (parse-block s parse-struct-field)))
+    (begin0 (cond (mut? (list 'abstract '(true) spec body))
+                  ((every linenum? (cdr body)) (list 'abstract spec))
+                  (else (list 'abstract spec body)))
+            (expect-end s "abstract type"))))
+
 (define (parse-struct-def s mut? word)
   (if (reserved-word? (peek-token s))
       (error (string "invalid type name \"" (take-token s) "\"")))
@@ -1503,22 +1515,23 @@
         (if (not (eq? (peek-token s) 'type))
             (parse-call-chain s word #f)
             (begin (take-token s)
-                   (let* ((spec (parse-subtype-spec s))
-                          ;; an abstract type may declare fields (and constructors
-                          ;; returning them) in a struct-like body
-                          (body (parse-block s parse-struct-field)))
-                     (begin0 (if (every linenum? (cdr body))
-                                 (list 'abstract spec)
-                                 (list 'abstract spec body))
-                             (expect-end s "abstract type"))))))
+                   (parse-abstract-type-def s #f))))
        ((struct)
         (begin (take-token s)
                (parse-struct-def s #f word)))
        ((mutable)
-        (if (not (eq? (peek-token s) 'struct))
-            (parse-call-chain s word #f)
-            (begin (take-token s)
-                   (parse-struct-def s #t word))))
+        (cond ((eq? (peek-token s) 'struct)
+               (take-token s)
+               (parse-struct-def s #t word))
+              ((eq? (peek-token s) 'abstract)
+               ;; mutable abstract type A ... end: every concrete subtype must be mutable
+               (take-token s)
+               (if (not (eq? (peek-token s) 'type))
+                   (error "expected \"type\" after \"mutable abstract\""))
+               (take-token s)
+               (parse-abstract-type-def s #t))
+              (else
+               (parse-call-chain s word #f))))
        ((primitive)
         (if (not (eq? (peek-token s) 'type))
             (parse-call-chain s word #f)

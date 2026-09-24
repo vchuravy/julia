@@ -38,6 +38,10 @@ New language features
   is resolved per argument by the linearization of the argument's type (Dylan's rule), and stays
   ambiguous when the argument positions disagree. Defining the type invalidates code compiled
   under the earlier disjointness of its supertypes, like a method definition would.
+* A subtype may redeclare a field inherited from an abstract type with a subtype of its declared
+  type, and `mutable abstract type A ... end` requires every concrete subtype to be mutable, so
+  methods on `A` can assign its fields. Fields declared by an abstract type are accessed at a
+  fixed offset while they are the leading fields of every subtype.
 * Introduced explicitly wrapping arithmetic operators `+%`, `-%`, `*%` to annotate arithmetic operations
   that are semantically safe to wrap/overflow. Their behavior is currently identical to the default `+`, `-`, `*`
   operators. However, in a future version, there may be opt-in support to detect unannotated wrapping

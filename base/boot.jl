@@ -690,6 +690,18 @@ struct PartialTask
     PartialTask(@nospecialize(fetch_type)) = new(fetch_type)
 end
 
+# A fact about the type graph that inferred code relies on and a later type
+# definition can undo: `:disjoint` (`a` and `b` have no common subtype, until
+# a type declares both as supertypes) or `:fieldprefix` (the fields of the
+# abstract type `a` start every subtype's fields, until a subtype breaks it).
+# Recorded in a code instance's edges and checked by the runtime.
+struct TypeGraphEdge
+    kind::Symbol
+    a
+    b
+    TypeGraphEdge(kind::Symbol, @nospecialize(a), @nospecialize(b)) = new(kind, a, b)
+end
+
 eval(Core, quote
     GotoNode(label::Int) = $(Expr(:new, :GotoNode, :label))
     NewvarNode(slot::SlotNumber) = $(Expr(:new, :NewvarNode, :slot))

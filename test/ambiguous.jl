@@ -720,10 +720,14 @@ pf(::Ref{Int}, ::HGrid) = :h
 pf(::Ref, ::VGrid) = :v
 @test_throws MethodError pf(Ref(1), HV())
 @test pf(Ref(1.0), HV()) === :v
-# a `Type` position is undecided
+# a `Type` position is ordered by the linearization of the type
 tf(::Type{<:HGrid}) = :h
 tf(::Type{<:VGrid}) = :v
-@test_throws MethodError tf(HV)
+@test tf(HV) === :h && tf(VH) === :v
+tf2(::Type{T}, ::VGrid) where {T<:HGrid} = :h
+tf2(::Type{<:VGrid}, ::HGrid) = :v
+@test tf2(HV, VH()) === :h
+@test_throws MethodError tf2(HV, HV())
 
 # methods defined before the join: the join records their interference and
 # clears their "only match" bit

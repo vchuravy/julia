@@ -1161,8 +1161,12 @@ JL_DLLEXPORT jl_svec_t *jl_typename_joins(jl_typename_t *a, jl_typename_t *b) JL
 JL_DLLEXPORT void jl_register_join_typename(jl_typename_t *J) JL_CANSAFEPOINT;
 JL_DLLEXPORT void jl_unregister_join_typename(jl_typename_t *J) JL_CANSAFEPOINT;
 JL_DLLEXPORT void jl_activate_type(jl_datatype_t *dt) JL_CANSAFEPOINT;
-JL_DLLEXPORT void jl_datatype_activate_joins(jl_typename_t *J) JL_CANSAFEPOINT;
+JL_DLLEXPORT void jl_datatype_activate(jl_datatype_t *dt) JL_CANSAFEPOINT;
 int jl_activate_joins_locked(jl_typename_t *J, size_t max_world) JL_CANSAFEPOINT;
+int jl_activate_field_prefix_locked(jl_datatype_t *dt, size_t max_world) JL_CANSAFEPOINT;
+void jl_typegraph_invalidate_stale(size_t max_world) JL_CANSAFEPOINT;
+extern jl_array_t *jl_field_prefix_breakers JL_GLOBALLY_ROOTED;
+extern jl_genericmemory_t *jl_typegraph_backedges JL_GLOBALLY_ROOTED;
 extern jl_array_t *jl_join_registry JL_GLOBALLY_ROOTED;
 void jl_check_inherited_fields(jl_datatype_t *dt, jl_svec_t *own_names, int min_init) JL_CANSAFEPOINT;
 jl_svec_t *jl_inherit_fields(jl_datatype_t *dt, jl_svec_t *own_names, jl_svec_t *own_types,

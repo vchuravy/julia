@@ -99,6 +99,7 @@ JL_DLLEXPORT jl_typename_t *jl_new_typename_in(jl_sym_t *name, jl_module_t *modu
     tn->parents = NULL;
     tn->linearization = NULL;
     jl_atomic_store_relaxed(&tn->may_join, 0);
+    jl_atomic_store_relaxed(&tn->stable_field_prefix, 0);
     return tn;
 }
 
@@ -3038,14 +3039,193 @@ JL_DLLEXPORT void jl_unregister_join_typename(jl_typename_t *J)
     JL_UNLOCK(&join_registry_lock);
 }
 
+static void collect_field_ancestors(jl_datatype_t *dt, arraylist_t *out) JL_CANSAFEPOINT;
+
+// Stable field prefixes (Gerbil's C4 "struct suffix" rule, as a flag) -------
+//
+// The fields of an abstract type `A` are a prefix of the fields of each of
+// its subtypes as long as no subtype places another field-declaring ancestor
+// between or after `A`'s ancestors in its linearization, and no subtype
+// changes the storage of one of those fields by refining its type. While
+// that holds (`stable_field_prefix` on `A`'s typename), a field of a value
+// statically typed as `A` sits at the offset the prefix alone determines,
+// and codegen loads it directly (see `jl_abstract_prefix_layout`). Defining
+// a subtype that breaks the prefix clears the flag and invalidates the code
+// compiled with it (through the `:fieldprefix` type-graph edges, gf.c).
+
+// The typenames whose definition broke an ancestor's field prefix; a package
+// image replays the breaks of its own typenames when loaded.
+jl_array_t *jl_field_prefix_breakers JL_GLOBALLY_ROOTED;
+
+JL_DLLEXPORT int jl_typename_stable_field_prefix(jl_typename_t *tn) JL_NOTSAFEPOINT
+{
+    return jl_atomic_load_relaxed(&tn->stable_field_prefix);
+}
+
+static int field_storage_is_pointer(jl_value_t *ft) JL_CANSAFEPOINT
+{
+    size_t fsz = 0, al = 0;
+    return !jl_islayout_inline(ft, &fsz, &al);
+}
+
+// The field-declaring ancestors of `dt` whose fields are not a prefix of the
+// fields of `dt` (in the same order and with the same storage): appended to
+// `broken` as typenames.
+static void field_prefix_breaks(jl_datatype_t *dt, arraylist_t *broken) JL_CANSAFEPOINT
+{
+    arraylist_t ancestors;
+    arraylist_new(&ancestors, 0);
+    collect_field_ancestors(dt, &ancestors);
+    // keep the ancestor instantiations reachable while comparing them
+    jl_array_t *roots = NULL, *aroots = NULL;
+    jl_svec_t *adtypes = NULL;
+    JL_GC_PUSH3(&roots, &aroots, &adtypes);
+    roots = jl_alloc_vec_any(ancestors.len);
+    for (size_t a = 0; a < ancestors.len; a++)
+        jl_array_ptr_set(roots, a, ancestors.items[a]);
+    size_t nanc = ancestors.len;
+    arraylist_free(&ancestors);
+    // 1. order: the field-declaring ancestors before A in dt's list must be
+    //    exactly the field-declaring ancestors of A (a subset of dt's, by
+    //    monotonicity of the linearization)
+    aroots = jl_alloc_vec_any(nanc);
+    for (size_t a = 0; a < nanc; a++) {
+        arraylist_t aanc;
+        arraylist_new(&aanc, 0);
+        collect_field_ancestors((jl_datatype_t*)jl_array_ptr_ref(roots, a), &aanc);
+        size_t na = aanc.len < nanc ? aanc.len : nanc;
+        for (size_t k = 0; k < na; k++)
+            jl_array_ptr_set(aroots, k, aanc.items[k]);
+        arraylist_free(&aanc);
+        int ok = na == a;
+        for (size_t k = 0; ok && k < a; k++) {
+            jl_typename_t *ktn = ((jl_datatype_t*)jl_array_ptr_ref(roots, k))->name;
+            ok = ((jl_datatype_t*)jl_array_ptr_ref(aroots, k))->name == ktn;
+        }
+        if (!ok)
+            arraylist_push(broken, ((jl_datatype_t*)jl_array_ptr_ref(roots, a))->name);
+    }
+    // 2. storage: a refined inherited field stored differently from its
+    //    declaration breaks every ancestor whose fields include it
+    if (dt->types != NULL) {
+        size_t pos = 0;
+        for (size_t a = 0; a < nanc; a++) {
+            jl_datatype_t *ad = (jl_datatype_t*)jl_array_ptr_ref(roots, a);
+            jl_typename_t *atn = ad->name;
+            adtypes = jl_get_fieldtypes(ad);
+            size_t start = atn->n_inherited, end = jl_svec_len(atn->names);
+            for (size_t i = start; i < end; i++, pos++) {
+                jl_value_t *declared = jl_svecref(adtypes, i);
+                jl_value_t *actual = jl_svecref(dt->types, pos);
+                if (actual == declared || jl_types_equal(actual, declared))
+                    continue;
+                if (field_storage_is_pointer(declared) && field_storage_is_pointer(actual))
+                    continue;
+                for (size_t b = a; b < nanc; b++) {
+                    jl_typename_t *btn = ((jl_datatype_t*)jl_array_ptr_ref(roots, b))->name;
+                    if (jl_svec_len(btn->names) > pos)
+                        arraylist_push(broken, btn);
+                }
+            }
+        }
+    }
+    JL_GC_POP();
+}
+
+static jl_mutex_t prefix_shadow_lock;
+static jl_genericmemory_t *prefix_shadow_types JL_GLOBALLY_ROOTED; // abstract instantiation => shadow struct
+
+// A concrete struct type with exactly the fields (names, types, attributes)
+// of the abstract instantiation `dt`, whose layout is the layout of the
+// field prefix of every subtype of `dt` while `dt`'s prefix is stable. NULL
+// when the field types are not fixed (free type variables). Cached.
+JL_DLLEXPORT jl_datatype_t *jl_abstract_prefix_layout(jl_datatype_t *dt)
+{
+    jl_typename_t *tn = dt->name;
+    if (!tn->abstract || dt->types == NULL || jl_svec_len(dt->types) == 0 || dt->hasfreetypevars)
+        return NULL;
+    if (jl_has_free_typevars((jl_value_t*)dt))
+        return NULL;
+    JL_LOCK(&prefix_shadow_lock);
+    if (prefix_shadow_types == NULL)
+        prefix_shadow_types = (jl_genericmemory_t*)jl_an_empty_memory_any;
+    jl_datatype_t *shadow = (jl_datatype_t*)jl_eqtable_get(prefix_shadow_types, (jl_value_t*)dt, NULL);
+    if (shadow == NULL) {
+        jl_svec_t *fattrs = NULL;
+        JL_GC_PUSH2(&shadow, &fattrs);
+        // the declared attributes, as (index, :atomic/:const) pairs
+        size_t nf = jl_svec_len(tn->names), nattr = 0, i;
+        for (i = 0; i < nf; i++)
+            nattr += (jl_field_isatomic(dt, i) != 0) + (jl_field_isconst(dt, i) != 0);
+        fattrs = jl_alloc_svec(2 * nattr);
+        for (i = 0, nattr = 0; i < nf; i++) {
+            if (jl_field_isatomic(dt, i)) {
+                jl_svecset(fattrs, 2 * nattr, jl_box_long(i + 1));
+                jl_svecset(fattrs, 2 * nattr + 1, (jl_value_t*)jl_atomic_sym);
+                nattr++;
+            }
+            if (jl_field_isconst(dt, i)) {
+                jl_svecset(fattrs, 2 * nattr, jl_box_long(i + 1));
+                jl_svecset(fattrs, 2 * nattr + 1, (jl_value_t*)jl_const_sym);
+                nattr++;
+            }
+        }
+        // a mutable struct with these fields (mutability does not affect the offsets)
+        shadow = jl_new_datatype(jl_symbol("#fieldprefix"), jl_core_module, jl_any_type, jl_emptysvec,
+                                 tn->names, dt->types, fattrs, 0, 1, nf);
+        int inserted = 0;
+        jl_genericmemory_t *nt = jl_eqtable_put(prefix_shadow_types, (jl_value_t*)dt, (jl_value_t*)shadow, &inserted);
+        prefix_shadow_types = nt;
+        JL_GC_POP();
+    }
+    JL_UNLOCK(&prefix_shadow_lock);
+    if (shadow->layout == NULL)
+        return NULL;
+    return shadow;
+}
+
+// Called with `world_counter_lock` held: clear the field-prefix flag of the
+// ancestors whose prefix `dt`'s definition breaks, invalidating the code
+// compiled with it. Returns whether anything changed.
+int jl_activate_field_prefix_locked(jl_datatype_t *dt, size_t max_world)
+{
+    if (dt->name->n_inherited == 0)
+        return 0;
+    arraylist_t broken;
+    arraylist_new(&broken, 0);
+    field_prefix_breaks(dt, &broken);
+    int changed = 0;
+    for (size_t i = 0; i < broken.len; i++) {
+        jl_typename_t *btn = (jl_typename_t*)broken.items[i];
+        if (!jl_atomic_load_relaxed(&btn->stable_field_prefix))
+            continue;
+        jl_atomic_store_release(&btn->stable_field_prefix, 0);
+        changed = 1;
+    }
+    arraylist_free(&broken);
+    if (changed) {
+        int present = 0;
+        for (size_t i = 0; i < jl_array_nrows(jl_field_prefix_breakers) && !present; i++)
+            present = jl_array_ptr_ref(jl_field_prefix_breakers, i) == (jl_value_t*)dt->name;
+        if (!present)
+            jl_array_ptr_1d_push(jl_field_prefix_breakers, (jl_value_t*)dt->name);
+        jl_typegraph_invalidate_stale(max_world);
+    }
+    return changed;
+}
+
 // Called once a type definition is kept (not discarded as an equivalent
-// redefinition): publishes what depends on the whole type graph. A type with
-// several supertypes joins its parents (registered here) and changes
-// dispatch for methods on them (see `jl_datatype_activate_joins` in gf.c).
+// redefinition): publishes what depends on the whole type graph, in a new
+// world when dispatch or compiled code is affected. A type with several
+// supertypes joins its parents and changes dispatch for methods on them
+// (`jl_activate_joins_locked`, gf.c); a type with inherited fields may break
+// the field prefix of an ancestor (`jl_activate_field_prefix_locked`).
 JL_DLLEXPORT void jl_activate_type(jl_datatype_t *dt)
 {
-    if (dt->name->parents != NULL)
-        jl_datatype_activate_joins(dt->name);
+    jl_typename_t *tn = dt->name;
+    if (tn->parents == NULL && tn->n_inherited == 0)
+        return;
+    jl_datatype_activate(dt);
 }
 
 // For the Serialization stdlib: restore the multiple-supertypes state of a
@@ -3110,6 +3290,18 @@ void jl_datatype_set_supers(jl_datatype_t *dt, jl_svec_t *supers)
         jl_gc_write(tn, tn->linearization, jl_svec_t, lin);
         tn->has_multiple_supers = 1;
     }
+    // a `mutable abstract type` requires every concrete subtype to be a
+    // mutable struct; an abstract subtype inherits the requirement
+    for (i = 0; i < n; i++) {
+        jl_datatype_t *s = (jl_datatype_t*)jl_svecref(supers, i);
+        if (s->name->mutabl && s->name->abstract && !tn->mutabl) {
+            if (tn->abstract)
+                tn->mutabl = 1;
+            else
+                jl_errorf("invalid subtyping in definition of %s: %s is a mutable abstract type, so %s must be a mutable struct.",
+                          type_name, jl_symbol_name(s->name->name), type_name);
+        }
+    }
     if (n > 1) {
         // unique-ancestor invariant
         size_t nlin = jl_svec_len(lin);
@@ -3147,13 +3339,13 @@ void jl_datatype_set_supers(jl_datatype_t *dt, jl_svec_t *supers)
 // (the reversed linearization; the `super` chain for single-parent
 // typenames). Every `names` list is `[inherited..., own...]`, so an ancestor
 // contributes exactly the slice `names[n_inherited:end]`.
-static void collect_field_ancestors(jl_datatype_t *dt, arraylist_t *out) JL_CANSAFEPOINT
+static void collect_field_ancestors_(jl_datatype_t *dt, arraylist_t *out, int own_only) JL_CANSAFEPOINT
 {
     jl_svec_t *lin = dt->name->linearization;
     if (lin != NULL) {
         for (size_t i = 1; i < jl_svec_len(lin); i++) {
             jl_typename_t *stn = (jl_typename_t*)jl_svecref(lin, i);
-            if (stn->names != NULL && jl_svec_len(stn->names) > (size_t)stn->n_inherited) {
+            if (stn->names != NULL && jl_svec_len(stn->names) > (own_only ? (size_t)stn->n_inherited : 0)) {
                 int pending = 0;
                 jl_datatype_t *s = jl_datatype_ancestor(dt, stn, &pending);
                 if (s == NULL)
@@ -3167,7 +3359,7 @@ static void collect_field_ancestors(jl_datatype_t *dt, arraylist_t *out) JL_CANS
         jl_datatype_t *s = jl_datatype_compute_super(dt);
         while (s != NULL && s != jl_any_type) {
             jl_typename_t *stn = s->name;
-            if (stn->names != NULL && jl_svec_len(stn->names) > (size_t)stn->n_inherited)
+            if (stn->names != NULL && jl_svec_len(stn->names) > (own_only ? (size_t)stn->n_inherited : 0))
                 arraylist_push(out, s);
             s = jl_datatype_compute_super(s);
         }
@@ -3177,6 +3369,11 @@ static void collect_field_ancestors(jl_datatype_t *dt, arraylist_t *out) JL_CANS
         out->items[i] = out->items[j - 1];
         out->items[j - 1] = tmp;
     }
+}
+
+static void collect_field_ancestors(jl_datatype_t *dt, arraylist_t *out) JL_CANSAFEPOINT
+{
+    collect_field_ancestors_(dt, out, 1);
 }
 
 static int ancestor_field_isconst(jl_datatype_t *ad, size_t i) JL_NOTSAFEPOINT
@@ -3195,7 +3392,7 @@ void jl_check_inherited_fields(jl_datatype_t *dt, jl_svec_t *own_names, int min_
 {
     jl_typename_t *tn = dt->name;
     const char *type_name = jl_symbol_name(tn->name);
-    size_t n_own = jl_svec_len(own_names);
+    (void)own_names; // an own declaration of an inherited name refines it (checked in jl_inherit_fields)
     arraylist_t ancestors;
     arraylist_new(&ancestors, 0);
     collect_field_ancestors(dt, &ancestors);
@@ -3216,13 +3413,8 @@ void jl_check_inherited_fields(jl_datatype_t *dt, jl_svec_t *own_names, int min_
                     }
                 }
             }
-            for (size_t k = 0; k < n_own; k++) {
-                if (jl_svecref(own_names, k) == (jl_value_t*)fname) {
-                    arraylist_free(&ancestors);
-                    jl_errorf("invalid field declaration in definition of %s: field `%s` is already declared by %s",
-                              type_name, jl_symbol_name(fname), jl_symbol_name(atn->name));
-                }
-            }
+            // (an own declaration of the same name refines the inherited
+            // field: checked against the declared type in jl_inherit_fields)
             if (!tn->abstract && !tn->mutabl && jl_field_isatomic(ad, i)) {
                 arraylist_free(&ancestors);
                 jl_errorf("invalid field declaration in definition of %s: field `%s` of %s is declared @atomic, so %s must be a mutable struct",
@@ -3261,7 +3453,25 @@ jl_svec_t *jl_inherit_fields(jl_datatype_t *dt, jl_svec_t *own_names, jl_svec_t 
         jl_typename_t *atn = ((jl_datatype_t*)ancestors.items[a])->name;
         n_inh += jl_svec_len(atn->names) - atn->n_inherited;
     }
-    size_t ntotal = n_inh + n_own;
+    // an own declaration of an inherited name refines that field (covariantly)
+    // in its inherited slot instead of adding a field
+    size_t n_refined = 0;
+    int *refines = (int*)calloc_s((n_own + 1) * sizeof(int)); // own index -> inherited slot + 1, or 0
+    for (size_t k = 0; k < n_own; k++) {
+        size_t pos = 0;
+        for (size_t a = 0; a < ancestors.len && !refines[k]; a++) {
+            jl_typename_t *atn = ((jl_datatype_t*)ancestors.items[a])->name;
+            size_t start = atn->n_inherited, end = jl_svec_len(atn->names);
+            for (size_t i = start; i < end; i++, pos++) {
+                if (jl_svecref(atn->names, i) == jl_svecref(own_names, k)) {
+                    refines[k] = (int)pos + 1;
+                    n_refined++;
+                    break;
+                }
+            }
+        }
+    }
+    size_t ntotal = n_inh + n_own - n_refined;
     jl_svec_t *names = own_names, *types = own_types, *adtypes = NULL;
     JL_GC_PUSH3(&names, &types, &adtypes);
     if (n_inh > 0) {
@@ -3281,11 +3491,55 @@ jl_svec_t *jl_inherit_fields(jl_datatype_t *dt, jl_svec_t *own_names, jl_svec_t 
             }
         }
         assert(pos == n_inh);
-        for (size_t k = 0; k < n_own; k++) {
-            jl_svecset(names, n_inh + k, jl_svecref(own_names, k));
-            if (types != NULL)
-                jl_svecset(types, n_inh + k, jl_svecref(own_types, k));
+        // an ancestor's own refinements of inherited fields carry over (the
+        // nearest ancestor's type wins), matched by name; an ancestor that
+        // only refines declares no field of its own
+        if (types != NULL) {
+            arraylist_t refiners;
+            arraylist_new(&refiners, 0);
+            collect_field_ancestors_(dt, &refiners, 0);
+            for (size_t a = 0; a < refiners.len; a++) {
+                jl_datatype_t *ad = (jl_datatype_t*)refiners.items[a];
+                jl_typename_t *atn = ad->name;
+                adtypes = jl_get_fieldtypes(ad);
+                for (size_t i = 0; i < (size_t)atn->n_inherited; i++) {
+                    jl_value_t *fname = jl_svecref(atn->names, i);
+                    for (size_t p = 0; p < n_inh; p++) {
+                        if (jl_svecref(names, p) == fname) {
+                            jl_svecset(types, p, jl_svecref(adtypes, i));
+                            break;
+                        }
+                    }
+                }
+            }
+            arraylist_free(&refiners);
         }
+        for (size_t k = 0; k < n_own; k++) {
+            if (refines[k]) {
+                if (types != NULL) {
+                    jl_value_t *declared = jl_svecref(types, refines[k] - 1);
+                    jl_value_t *refined = jl_svecref(own_types, k);
+                    if (!jl_subtype(refined, declared)) {
+                        ios_t buf;
+                        ios_mem(&buf, 64);
+                        jl_static_show((JL_STREAM*)&buf, refined);
+                        ios_write(&buf, " is not a subtype of the declared ", 34);
+                        jl_static_show((JL_STREAM*)&buf, declared);
+                        ios_putc('\0', &buf);
+                        free(refines);
+                        jl_errorf("invalid field declaration in definition of %s: field `%s` is redeclared as %s",
+                                  jl_symbol_name(tn->name), jl_symbol_name((jl_sym_t*)jl_svecref(own_names, k)), buf.buf);
+                    }
+                    jl_svecset(types, refines[k] - 1, refined);
+                }
+                continue;
+            }
+            jl_svecset(names, pos, jl_svecref(own_names, k));
+            if (types != NULL)
+                jl_svecset(types, pos, jl_svecref(own_types, k));
+            pos++;
+        }
+        assert(pos == ntotal);
     }
     // attribute bitmaps: an inherited `const` only matters for a mutable (or
     // abstract) type; an inherited `@atomic` on an immutable concrete type was
@@ -3311,8 +3565,19 @@ jl_svec_t *jl_inherit_fields(jl_datatype_t *dt, jl_svec_t *own_names, jl_svec_t 
             }
         }
     }
-    for (size_t k = 0; k < n_own; k++) {
-        size_t p = n_inh + k;
+    for (size_t k = 0, p = n_inh; k < n_own; k++) {
+        if (refines[k]) {
+            // a refined field keeps the declared attributes
+            if ((own_atomic != NULL && (own_atomic[k / 32] & (1 << (k % 32)))) ||
+                (own_const != NULL && (own_const[k / 32] & (1 << (k % 32))))) {
+                free(refines);
+                free(atomicfields);
+                free(constfields);
+                jl_errorf("invalid field declaration in definition of %s: the redeclaration of inherited field `%s` cannot add `const` or `@atomic`",
+                          jl_symbol_name(tn->name), jl_symbol_name((jl_sym_t*)jl_svecref(own_names, k)));
+            }
+            continue;
+        }
         if (own_atomic != NULL && (own_atomic[k / 32] & (1 << (k % 32)))) {
             if (atomicfields == NULL)
                 atomicfields = (uint32_t*)calloc_s(nb);
@@ -3323,12 +3588,17 @@ jl_svec_t *jl_inherit_fields(jl_datatype_t *dt, jl_svec_t *own_names, jl_svec_t 
                 constfields = (uint32_t*)calloc_s(nb);
             constfields[p / 32] |= 1 << (p % 32);
         }
+        p++;
     }
+    free(refines);
     arraylist_free(&ancestors);
     jl_gc_write(tn, tn->names, jl_svec_t, names);
     tn->n_inherited = (int32_t)n_inh;
     if (tn->abstract) {
         tn->n_uninitialized = 0;
+        // until a subtype interleaves another stateful ancestor or refines a
+        // field's storage, every subtype's fields start with these fields
+        jl_atomic_store_release(&tn->stable_field_prefix, ntotal > 0);
     }
     else {
         size_t ninit = (min_init < 0 || (size_t)min_init > ntotal) ? ntotal : (size_t)min_init;

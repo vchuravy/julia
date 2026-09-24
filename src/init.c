@@ -595,6 +595,8 @@ static NOINLINE void _finish_jl_init_(jl_image_buf_t sysimage, jl_ptls_t ptls, j
         jl_global_roots_list = (jl_genericmemory_t*)jl_an_empty_memory_any;
         jl_global_roots_keyset = (jl_genericmemory_t*)jl_an_empty_memory_any;
         jl_join_registry = jl_alloc_vec_any(0);
+        jl_field_prefix_breakers = jl_alloc_vec_any(0);
+        jl_typegraph_backedges = (jl_genericmemory_t*)jl_an_empty_memory_any;
     }
 
     jl_init_flisp();

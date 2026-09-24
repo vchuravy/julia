@@ -3213,6 +3213,8 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
         }
         else {
             jl_queue_for_serialization(&s, jl_join_registry);
+            jl_queue_for_serialization(&s, jl_field_prefix_breakers);
+            jl_queue_for_serialization(&s, jl_typegraph_backedges);
         }
         jl_serialize_reachable(&s);
         // step 1.2: ensure all gvars are part of the sysimage too
@@ -3386,6 +3388,8 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
             jl_write_value(&s, global_roots_list);
             jl_write_value(&s, global_roots_keyset);
             jl_write_value(&s, jl_join_registry);
+            jl_write_value(&s, jl_field_prefix_breakers);
+            jl_write_value(&s, jl_typegraph_backedges);
             jl_write_value(&s, s.ptls->root_task->tls);
             write_uint32(f, jl_get_gs_ctr());
             size_t world = jl_atomic_load_acquire(&jl_world_counter);
@@ -3561,11 +3565,22 @@ JL_DLLEXPORT uint32_t jl_create_system_image(void **_native_data, jl_array_t *wo
         // extext_methods: [method1, ...], worklist-owned "extending external" methods added to functions owned by modules outside the worklist
         extext_methods = jl_alloc_vec_any(0);
         jl_collect_extext_methods(extext_methods, mod_array);
-        // join_typenames: the worklist-owned typenames declaring multiple supertypes
+        // join_typenames: the worklist-owned typenames declaring multiple
+        // supertypes, and those whose fields broke an ancestor's field prefix
+        // (both change the state of typenames owned by other images)
         join_typenames = jl_alloc_vec_any(0);
         for (size_t i = 0; i < jl_array_nrows(jl_join_registry); i++) {
             jl_value_t *tn = jl_array_ptr_ref(jl_join_registry, i);
             if (!jl_object_in_image(tn))
+                jl_array_ptr_1d_push(join_typenames, tn);
+        }
+        for (size_t i = 0; i < jl_array_nrows(jl_field_prefix_breakers); i++) {
+            jl_value_t *tn = jl_array_ptr_ref(jl_field_prefix_breakers, i);
+            if (jl_object_in_image(tn))
+                continue;
+            size_t j, n = jl_array_nrows(join_typenames);
+            for (j = 0; j < n && jl_array_ptr_ref(join_typenames, j) != tn; j++) ;
+            if (j == n)
                 jl_array_ptr_1d_push(join_typenames, tn);
         }
 
@@ -4143,6 +4158,8 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
         jl_global_roots_list = (jl_genericmemory_t*)jl_read_value(&s);
         jl_global_roots_keyset = (jl_genericmemory_t*)jl_read_value(&s);
         jl_join_registry = (jl_array_t*)jl_read_value(&s);
+        jl_field_prefix_breakers = (jl_array_t*)jl_read_value(&s);
+        jl_typegraph_backedges = (jl_genericmemory_t*)jl_read_value(&s);
         jl_gc_write(s.ptls->root_task, s.ptls->root_task->tls, jl_value_t, jl_read_value(&s));
 
         uint32_t gs_ctr = read_uint32(f);
@@ -4737,8 +4754,13 @@ static jl_value_t *jl_restore_package_image_from_stream(ios_t *f, jl_image_t *im
             // images: register them and update the methods already loaded
             // (the image's own methods were compiled with the joins known)
             int new_joins = 0;
-            for (size_t i = 0; i < jl_array_nrows(join_typenames); i++)
-                new_joins |= jl_activate_joins_locked((jl_typename_t*)jl_array_ptr_ref(join_typenames, i), world);
+            for (size_t i = 0; i < jl_array_nrows(join_typenames); i++) {
+                jl_typename_t *tn = (jl_typename_t*)jl_array_ptr_ref(join_typenames, i);
+                if (tn->parents != NULL)
+                    new_joins |= jl_activate_joins_locked(tn, world);
+                if (tn->n_inherited > 0)
+                    new_joins |= jl_activate_field_prefix_locked((jl_datatype_t*)jl_unwrap_unionall(tn->wrapper), world);
+            }
             if (new_methods || new_joins)
                 world += 1;
             jl_activate_methods(extext_methods, internal_methods, world, pkgname);

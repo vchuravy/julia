@@ -285,10 +285,16 @@ The rules are:
     ancestor to the nearest, followed by its own fields. Positional constructors, `new` and
     [`fieldnames`](@ref) all use this order. Abstract types never have instances and never get
     a layout of their own.
-  * A field name declared by an ancestor cannot be declared again by a subtype.
+  * A subtype may declare an inherited field again with a subtype of its declared type
+    (`struct Unit <: Shape; name::SubString{String}; end`): the field keeps its position and
+    attributes, and code written for the abstract type keeps seeing the declared type.
   * `const` on a declared field means the field cannot be reassigned in a `mutable struct`
     subtype; `@atomic` requires every concrete subtype to be a `mutable struct`. Primitive types
     cannot subtype an abstract type that declares fields.
+  * `mutable abstract type A ... end` requires every concrete subtype to be a `mutable struct`
+    (an abstract subtype inherits the requirement), so `ismutabletype(A)` holds and a method on
+    `A` may assign its non-`const` fields, `a.name = "unit"`, which the compiler then knows
+    cannot fail.
   * An inner constructor must initialize every inherited field; only a trailing part of the
     type's *own* fields may be left uninitialized.
   * [`fieldnames`](@ref), [`fieldtypes`](@ref), [`fieldtype`](@ref) and [`hasfield`](@ref)
@@ -298,6 +304,16 @@ The rules are:
 
 Because the number and order of inherited fields is a property of the supertype, an inner
 constructor can initialize fields by name instead of position with the keyword form of `new`.
+
+!!! note "Performance"
+    As long as the fields of an abstract type are the first fields of every one of its
+    subtypes, in the same order and with the same storage, a method on the abstract type reads
+    and writes them at a fixed offset, as fast as a method on a concrete type. That holds
+    unless a subtype declares another abstract type with fields *before* it in its supertype
+    list (see [Multiple supertypes](@ref man-multiple-supertypes)), or refines a field to a
+    type stored differently (an inline `Int` for a declared `Number`). Such a definition
+    switches the affected abstract types to a lookup by field name, recompiling the methods
+    that used the fixed offsets, like a method definition would.
 An abstract type may also declare constructors in its body: they return a `NamedTuple` of the
 type's own fields, which a subtype splats into `new`:
 

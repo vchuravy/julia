@@ -278,7 +278,7 @@ function peek_initial_reserved_words(ps::ParseState)
         return true
     elseif is_contextual_keyword(k)
         k2 = peek(ps, 2, skip_newlines=false)
-        return (k == K"mutable"   && k2 == K"struct") ||
+        return (k == K"mutable"   && (k2 == K"struct" || k2 == K"abstract")) ||
                (k == K"primitive" && k2 == K"type")   ||
                (k == K"abstract"  && k2 == K"type")
     elseif k == K"typegroup" && ps.stream.version < (1, 14)
@@ -2043,7 +2043,7 @@ function parse_resword(ps::ParseState)
             bump(ps, TRIVIA_FLAG, skip_newlines=true)
             emit(ps, mark, word)
         end
-    elseif word == K"abstract"
+    elseif word == K"abstract" || (word == K"mutable" && peek(ps, 2) == K"abstract")
         # Abstract type definitions
         # abstract type A end             ==>  (abstract A)
         # abstract type A ; end             ==>  (abstract A)
@@ -2055,6 +2055,12 @@ function parse_resword(ps::ParseState)
         # Fields (inherited by every subtype) and constructors returning them
         # abstract type A \n x::Int \n end  ==>  (abstract A (block (::-i x Int)))
         # abstract type A; const x; end     ==>  (abstract A (block (const x)))
+        # Every concrete subtype must be mutable
+        # mutable abstract type A end     ==>  (abstract-mut A)
+        is_mut = word == K"mutable"
+        if is_mut
+            bump(ps, TRIVIA_FLAG)
+        end
         bump(ps, TRIVIA_FLAG)
         @check peek(ps) == K"type"
         bump(ps, TRIVIA_FLAG)
@@ -2064,7 +2070,7 @@ function parse_resword(ps::ParseState)
             parse_block(ps, ps1->parse_docstring(ps1, parse_struct_field))
         end
         bump_closing_token(ps, K"end")
-        emit(ps, mark, K"abstract")
+        emit(ps, mark, K"abstract", is_mut ? MUTABLE_FLAG : EMPTY_FLAGS)
     elseif word in KSet"struct mutable"
         # struct A <: B \n a::X \n end  ==>  (struct (<: A B) (block (::-i a X)))
         # struct A \n a \n b \n end  ==>  (struct A (block a b))

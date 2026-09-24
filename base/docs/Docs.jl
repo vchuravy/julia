@@ -311,7 +311,7 @@ elseif head === :call && length(x.args) >= 1 && isexpr(x.args[1], :(::))
     else
         n = if isexpr(x, :module)
             isa(x.args[1], Bool) ? 2 : 3
-        elseif isexpr(x, :struct)
+        elseif isexpr(x, :struct) || (isexpr(x, :abstract) && isa(x.args[1], Bool))
             2
         elseif isexpr(x, (:call, :macrocall, :function, :(=), :macro, :where, :curly,
                           :(::), :(<:), :(>:), :local, :global, :const, :atomic,
@@ -364,7 +364,7 @@ function metadata(__source__, __module__, expr, ismodule)
     else
         push!(args, Pair(:module, __module__))
     end
-    if isexpr(expr, :struct) || (isexpr(expr, :abstract) && length(expr.args) == 2)
+    if isexpr(expr, :struct) || (isexpr(expr, :abstract) && length(expr.args) >= 2)
         # Field docs for concrete types, and for abstract types declaring fields.
         P = Pair{Symbol,Any}
         fields = P[]

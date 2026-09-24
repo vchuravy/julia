@@ -141,7 +141,7 @@ function untokenize(head::SyntaxHead; unique=true, include_flag_suff=true)
                 has_flags(head, TOPLEVEL_SEMICOLONS_FLAG) && (str = str*"-;")
             elseif k == K"function"
                 has_flags(head, SHORT_FORM_FUNCTION_FLAG) && (str = str*"-=")
-            elseif k == K"struct"
+            elseif k == K"struct" || k == K"abstract"
                 has_flags(head, MUTABLE_FLAG) && (str = str*"-mut")
             elseif k == K"module"
                 has_flags(head, BARE_MODULE_FLAG) && (str = str*"-bare")

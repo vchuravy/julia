@@ -1419,10 +1419,20 @@ end
         return setfield!_nothrow(𝕃, rewrap_unionall(s.a, s00), name, v) &&
                setfield!_nothrow(𝕃, rewrap_unionall(s.b, s00), name, v)
     elseif isa(s, DataType)
-        # Can't say anything about abstract types
-        isabstracttype(s) && return false
         ismutabletype(s) || return false
         isa(name, Const) || return false
+        if isabstracttype(s)
+            # a `mutable abstract type`: every instance is mutable and has the
+            # declared field, whose declared attributes hold in every subtype
+            name.val isa Symbol || return false
+            field = Int(ccall(:jl_field_index, Cint, (Any, Any, Cint), s, name.val, false)) + 1
+            field == 0 && return false
+            isconst(s, field) && return false
+            isfieldatomic(s, field) && return false
+            v_expected = fieldtype(s0, name.val)
+            ⊑ = partialorder(𝕃)
+            return v ⊑ v_expected
+        end
         field = try_compute_fieldidx(s, name.val)
         field === nothing && return false
         # `try_compute_fieldidx` already check for field index bound.
@@ -1618,6 +1628,16 @@ function _fieldtype_nothrow(@nospecialize(s), exact::Bool, egal::Bool, name::Con
         a = _fieldtype_nothrow(u.a, exact, egal, name)
         b = _fieldtype_nothrow(u.b, exact, egal, name)
         return exact ? (a || b) : (a && b)
+    end
+    if u isa DataType && isabstracttype(u) && !isType(u) && isdefined(u.name, :names)
+        # a field declared by an abstract type exists in every subtype, at a
+        # position no later than its declared one
+        fname = name.val
+        if fname isa Symbol
+            return any(n -> n === fname, u.name.names)
+        else
+            return 1 <= fname::Int <= length(u.name.names)
+        end
     end
     egal || return false
     u isa DataType || return false

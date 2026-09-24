@@ -669,6 +669,8 @@ tests = [
         "abstract type A \n x::Int \n end"  =>  "(abstract A (block (::-i x Int)))"
         ((v=v"1.8",), "abstract type A; const x; end")  =>  "(abstract A (block (const x)))"
         "abstract type A <: B\n x\n A(x) = (x = x,)\nend"  =>  "(abstract (<: A B) (block x (function-= (call A x) (tuple-p-, (= x x)))))"
+        "mutable abstract type A end"    =>  "(abstract-mut A)"
+        "mutable abstract type A <: B\n x::Int\nend"  =>  "(abstract-mut (<: A B) (block (::-i x Int)))"
         # primitive type
         "primitive type A 32 end"   =>  "(primitive A 32)"
         "primitive type A 32 ; end" =>  "(primitive A 32)"

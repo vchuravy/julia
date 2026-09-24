@@ -1108,7 +1108,7 @@
 ;; `abstract type A{T} <: S; x::T; const y; A{T}(x) where T = (x = x, y = 0); end`
 ;; fields0: the body items (may be empty). Declared fields are inherited by
 ;; every subtype; constructors return a NamedTuple of the declared fields.
-(define (abstract-type-def-expr name params super fields0)
+(define (abstract-type-def-expr name params super fields0 . mut?)
   (receive
    (params bounds) (sparam-name-bounds params)
    (receive
@@ -1123,7 +1123,8 @@
         (toplevel-only abstract_type)
         (= ,name (call (core _abstracttype) (thismodule) (inert ,name) (call (core svec) ,@params)
                        (call (core svec) ,@(map quotify field-names))
-                       (call (core svec) ,@attrs)))
+                       (call (core svec) ,@attrs)
+                       ,@(if (and (pair? mut?) (car mut?)) '((true)) '())))
         (call (core _setsuper!) ,name ,super)
         (call (core _typebody!) ,name (call (core svec) ,@field-types))
         (if (&& (call (core isdefinedglobal) (thismodule) (inert ,name) (false))
@@ -2919,11 +2920,14 @@
 
    'abstract
    (lambda (e)
-     (let ((sig  (cadr e))
-           (body (if (length> e 2) (cdr (caddr e)) '())))
+     (let* ((flag? (and (pair? (cadr e)) (memq (car (cadr e)) '(true false))))
+            (mut?  (and flag? (eq? (car (cadr e)) 'true)))
+            (args  (if flag? (cddr e) (cdr e)))
+            (sig   (car args))
+            (body  (if (pair? (cdr args)) (cdr (cadr args)) '())))
        (expand-forms
         (receive (name params super) (analyze-type-sig sig)
-                 (abstract-type-def-expr name params super body)))))
+                 (abstract-type-def-expr name params super body mut?)))))
 
    'primitive
    (lambda (e)

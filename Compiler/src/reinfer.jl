@@ -264,6 +264,16 @@ function verify_method(codeinst::CodeInstance, validation_world::UInt, workspace
                         min_valid2, max_valid2 = verify_call(sig, initial.callees, j+2, nmatches, world, fully_covers, matches)
                         j += 2 + nmatches
                         edge = sig
+                    elseif edge isa Core.TypeGraphEdge
+                        j += 1
+                        # a fact about the type graph: valid now, or undone by a type defined since
+                        if ccall(:jl_typegraph_edge_valid, Cint, (Any,), edge) != 0
+                            min_valid2 = UInt(1)
+                            max_valid2 = typemax(UInt)
+                        else
+                            min_valid2 = UInt(1)
+                            max_valid2 = UInt(0)
+                        end
                     elseif edge isa Core.Binding
                         j += 1
                         # Check that what of and how this code accessed the leaf partition is still valid.

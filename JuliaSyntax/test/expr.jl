@@ -787,6 +787,9 @@
             Expr(:abstract, :A, Expr(:block, LineNumberNode(2), Expr(:(::), :a, :X)))
         @test parsestmt("abstract type A \n \"doc\" \n a end") ==
             Expr(:abstract, :A, Expr(:block, LineNumberNode(2), "doc", :a))
+        @test parsestmt("mutable abstract type A end") == Expr(:abstract, true, :A, Expr(:block))
+        @test parsestmt("mutable abstract type A \n a::X \n end") ==
+            Expr(:abstract, true, :A, Expr(:block, LineNumberNode(2), Expr(:(::), :a, :X)))
     end
 
     @testset "typegroup" begin

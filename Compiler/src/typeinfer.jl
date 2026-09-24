@@ -839,6 +839,8 @@ function Base.iterate(it::ForwardToBackedgeIterator, i::Int = 1)
             continue
         elseif isa(item, Core.Binding)
             return ((nothing, item), i + 1)
+        elseif isa(item, Core.TypeGraphEdge)
+            return ((nothing, item), i + 1)
         end
         if isa(item, CodeInstance)
             item = get_ci_mi(item)
@@ -894,6 +896,8 @@ function store_backedges(caller::CodeInstance, edges::SimpleVector)
         end
         if item isa Core.Binding
             maybe_add_binding_backedge!(item, caller)
+        elseif item isa Core.TypeGraphEdge
+            ccall(:jl_typegraph_add_backedge, Cvoid, (Any, Any), item, caller)
         elseif item isa MethodTable
             ccall(:jl_method_table_add_backedge, Cvoid, (Any, Any), invokesig, caller)
         else

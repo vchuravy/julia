@@ -1107,6 +1107,19 @@ end
     @test test_mod.AFQ(3).x == Int[] && test_mod.AFQ(3).y == 3
     @test test_mod.AFQ{Int}.name.n_inherited == 1
 
+    # a mutable abstract type requires mutable concrete subtypes
+    @test JuliaLowering.include_string(test_mod, """
+    mutable abstract type AFMut
+        count::Int
+    end
+    mutable struct AFMut1 <: AFMut end
+    """) === nothing
+    @test ismutabletype(test_mod.AFMut) && isabstracttype(test_mod.AFMut)
+    @test test_mod.AFMut1(1).count == 1
+    @test_throws ErrorException JuliaLowering.include_string(test_mod, """
+    struct AFMut2 <: AFMut end
+    """)
+
     # docstrings on declared fields are accepted (they are attached by `@doc`
     # on the type, as for structs)
     @test JuliaLowering.include_string(test_mod, """

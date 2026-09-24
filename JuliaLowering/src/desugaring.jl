@@ -3233,8 +3233,14 @@ end
 # body return a NamedTuple of the declared fields.
 function expand_abstract_or_primitive_type(ctx, ex)
     is_abstract = kind(ex) == K"abstract"
+    is_mutable = false
     if is_abstract
-        @jl_assert 1 <= numchildren(ex) <= 2 ex
+        @jl_assert 1 <= numchildren(ex) <= 3 ex
+        if kind(ex[1]) == K"Value"
+            # mutable abstract type: (abstract true sig block)
+            is_mutable = ex[1].value::Bool
+            ex = @ast ctx ex [K"abstract" children(ex)[2:end]...]
+        end
     else
         @jl_assert kind(ex) == K"primitive" ex
         @jl_assert numchildren(ex) == 2 ex
@@ -3304,6 +3310,9 @@ function expand_abstract_or_primitive_type(ctx, ex)
                         end
                         if is_abstract
                             [K"call" "svec"::K"core" field_attrs...]
+                        end
+                        if is_mutable
+                            true::K"Bool"
                         end
                     ]
                 ]

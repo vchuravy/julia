@@ -2228,6 +2228,45 @@ end
     return ConditionalTypes(thentype, elsetype)
 end
 
+# `isa`, `===` or `<:` between two types whose intersection is empty today but
+# could be filled by a later type declaring both as supertypes: fold it,
+# recording the dependency so that such a definition invalidates this code
+function refine_unstable_disjoint!(@nospecialize(f), argtypes::Vector{Any}, sv::AbsIntState)
+    (isvarargtype(argtypes[2]) || isvarargtype(argtypes[3])) && return Bool
+    if f === isa
+        a = widenconst(argtypes[2])
+        b, isexact = instanceof_tfunc(argtypes[3], true)
+        (b === Bottom || has_free_typevars(b) || a <: b || iskindtype(a)) && return Bool
+    elseif f === (===)
+        a = widenconst(argtypes[2])
+        b = widenconst(argtypes[3])
+    else
+        a, isexact_a = instanceof_tfunc(argtypes[2], false)
+        b, isexact_b = instanceof_tfunc(argtypes[3], false)
+        (has_free_typevars(a) || has_free_typevars(b) || a <: b || isexact_a || b === Bottom) && return Bool
+    end
+    (isa(a, Type) && isa(b, Type)) || return Bool
+    hasintersect(a, b) && return Bool
+    disjointness_stable(a, b) && return Const(false) # the tfunc folds this itself
+    push!(sv.edges, Core.TypeGraphEdge(:disjoint, a, b))
+    return Const(false)
+end
+
+# A field access through an abstract type with a stable field prefix: codegen
+# reads the field at the offset the prefix determines, so record the
+# dependency on the prefix staying stable
+function record_fieldprefix_edge!(@nospecialize(objt), @nospecialize(fldt), sv::AbsIntState)
+    fldt isa Const && fldt.val isa Symbol || return nothing
+    t = unwrap_unionall(widenconst(objt))
+    t isa DataType || return nothing
+    tn = t.name
+    isabstracttype(t) && isdefined(tn, :names) && !isempty(tn.names) || return nothing
+    ccall(:jl_typename_stable_field_prefix, Cint, (Any,), tn) != 0 || return nothing
+    any(n -> n === fldt.val, tn.names) || return nothing
+    push!(sv.edges, Core.TypeGraphEdge(:fieldprefix, tn.wrapper, nothing))
+    return nothing
+end
+
 function abstract_call_builtin(interp::AbstractInterpreter, f::Builtin, (; fargs, argtypes)::ArgInfo,
                                vtypes::Union{VarTable,Nothing}, sv::AbsIntState)
     @nospecialize f
@@ -2260,6 +2299,12 @@ function abstract_call_builtin(interp::AbstractInterpreter, f::Builtin, (; fargs
     ft = popfirst!(argtypes)
     rt = builtin_tfunction(interp, f, argtypes, sv)
     pushfirst!(argtypes, ft)
+    if la == 3 && rt === Bool && (f === isa || f === (===) || f === (<:))
+        rt = refine_unstable_disjoint!(f, argtypes, sv)
+    elseif f === getfield || f === setfield! || f === swapfield! || f === modifyfield! ||
+           f === replacefield! || f === setfieldonce!
+        la ≥ 3 && record_fieldprefix_edge!(argtypes[2], argtypes[3], sv)
+    end
     if has_mustalias(𝕃ᵢ) && f === getfield && isa(fargs, Vector{Any}) && la ≥ 3
         a3 = argtypes[3]
         if isa(a3, Const)

@@ -98,6 +98,8 @@ function _incomplete_tag(theerror::ErrorSpec, codelen)
         return i <= 2 ? :other : :block
     elseif kp == K"struct"
         return i == 1 ? :other : :block
+    elseif kp == K"abstract"
+        return i == 1 ? :other : :block
     elseif kp == K"do"
         return i < 3  ? :other : :block
     else

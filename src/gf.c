@@ -3261,6 +3261,21 @@ static int c3_rank(jl_datatype_t *cd, jl_typename_t *tn) JL_NOTSAFEPOINT
 
 enum { C3_EQ = 0, C3_LT, C3_GT, C3_UNKNOWN };
 
+// the nominal type a `Type` element stands for: `Type{A}` and `Type{<:A}`
+// (a `UnionAll` over a `Type` of its variable) stand for `A`; NULL otherwise
+static jl_value_t *type_element_bound(jl_value_t *t JL_PROPAGATES_ROOT) JL_NOTSAFEPOINT
+{
+    if (jl_is_unionall(t)) {
+        jl_unionall_t *ua = (jl_unionall_t*)t;
+        if (jl_is_some_Type(ua->body) && jl_some_Type_T(ua->body) == (jl_value_t*)ua->var)
+            return ua->var->ub;
+        return NULL;
+    }
+    if (jl_is_some_Type(t))
+        return jl_some_Type_T(t);
+    return NULL;
+}
+
 // order of the signature elements `ai` and `bi` at the query element `ci`:
 // C3_LT if the linearization of `ci` lists `ai`'s typename first
 static int c3_position(jl_value_t *ci, jl_value_t *ai, jl_value_t *bi) JL_CANSAFEPOINT
@@ -3274,6 +3289,13 @@ static int c3_position(jl_value_t *ci, jl_value_t *ai, jl_value_t *bi) JL_CANSAF
         bi = ((jl_tvar_t*)bi)->ub;
     if (ai == bi)
         return C3_EQ;
+    if (jl_is_some_Type(ci)) {
+        // `Type{X}`: methods on `Type{<:A}` and `Type{<:B}` are ordered by the linearization of `X`
+        jl_value_t *x = jl_some_Type_T(ci), *ab = type_element_bound(ai), *bb = type_element_bound(bi);
+        if (ab == NULL || bb == NULL)
+            return C3_UNKNOWN;
+        return c3_position(x, ab, bb); // a `Type{T} where T<:A` element stands for `A` (typevar bounds are read there)
+    }
     if (jl_has_free_typevars(ai) || jl_has_free_typevars(bi))
         return C3_UNKNOWN;
     if (!jl_is_datatype(ai) || !jl_is_datatype(bi) || jl_is_some_Type(ai) || jl_is_some_Type(bi))
@@ -3316,6 +3338,8 @@ static int c3_query_capable(jl_value_t *query) JL_NOTSAFEPOINT
         jl_value_t *qi = jl_tparam(unw, i);
         if (jl_is_vararg(qi))
             return 0;
+        if (jl_is_some_Type(qi))
+            qi = jl_some_Type_T(qi);
         if (jl_is_datatype(qi) && ((jl_datatype_t*)qi)->name->linearization != NULL)
             return 1;
     }
@@ -4137,6 +4161,11 @@ int jl_activate_joins_locked(jl_typename_t *J, size_t max_world)
         htable_free(&flush.shadowed);
     }
     JL_UNLOCK(&mc->writelock);
+    // code that relied on the disjointness of the joined types
+    if (jl_typegraph_backedges != NULL && jl_typegraph_backedges->length > 0) {
+        jl_typegraph_invalidate_stale(max_world);
+        changed = 1;
+    }
     if (changed && _jl_debug_method_invalidation) {
         jl_array_ptr_1d_push(_jl_debug_method_invalidation, J->wrapper);
         loctag = jl_cstr_to_string("jl_datatype_activate_joins");
@@ -4154,18 +4183,124 @@ int jl_activate_joins_locked(jl_typename_t *J, size_t max_world)
     return changed;
 }
 
-// The definition of a type with several supertypes was kept: register its
-// join and update dispatch for the pairs of types it newly joins, in a new world.
-JL_DLLEXPORT void jl_datatype_activate_joins(jl_typename_t *J)
+// --- Type-graph edges ---
+//
+// Inference may rely on a fact about the type graph that a later type
+// definition can undo: that two abstract types are disjoint (kind
+// `:disjoint`, until a type declares both as supertypes), or that the fields
+// of an abstract type are a stable prefix of every subtype's fields (kind
+// `:fieldprefix`, until a subtype breaks the prefix). Such a dependency is a
+// `Core.TypeGraphEdge` in the code instance's edges; it is recorded here as
+// edge => callers, checked again after every type definition that may
+// change the graph, and re-verified against the graph when an image loads.
+jl_genericmemory_t *jl_typegraph_backedges JL_GLOBALLY_ROOTED;
+
+JL_DLLEXPORT int jl_typegraph_edge_valid(jl_value_t *edge)
 {
+    jl_sym_t *kind = (jl_sym_t*)jl_fieldref_noalloc(edge, 0);
+    jl_value_t *a = jl_fieldref_noalloc(edge, 1);
+    if (strcmp(jl_symbol_name(kind), "disjoint") == 0) {
+        jl_value_t *b = jl_fieldref_noalloc(edge, 2);
+        return jl_has_empty_intersection(a, b);
+    }
+    if (strcmp(jl_symbol_name(kind), "fieldprefix") == 0) {
+        jl_value_t *t = jl_unwrap_unionall(a);
+        return jl_is_datatype(t) && jl_atomic_load_relaxed(&((jl_datatype_t*)t)->name->stable_field_prefix);
+    }
+    return 0;
+}
+
+JL_DLLEXPORT void jl_typegraph_add_backedge(jl_value_t *edge, jl_code_instance_t *caller)
+{
+    assert(jl_is_code_instance(caller));
+    if (!jl_atomic_load_relaxed(&allow_new_worlds))
+        return;
+    jl_methcache_t *mc = jl_method_table->cache;
+    JL_LOCK(&mc->writelock);
+    if (jl_atomic_load_relaxed(&allow_new_worlds)) {
+        if (jl_typegraph_backedges == NULL)
+            jl_typegraph_backedges = (jl_genericmemory_t*)jl_an_empty_memory_any;
+        jl_array_t *callers = (jl_array_t*)jl_eqtable_get(jl_typegraph_backedges, edge, NULL);
+        if (callers == NULL) {
+            callers = jl_alloc_vec_any(0);
+            JL_GC_PUSH1(&callers);
+            jl_array_ptr_1d_push(callers, (jl_value_t*)caller);
+            int inserted = 0;
+            jl_typegraph_backedges = jl_eqtable_put(jl_typegraph_backedges, edge, (jl_value_t*)callers, &inserted);
+            JL_GC_POP();
+        }
+        else {
+            size_t i, n = jl_array_nrows(callers);
+            for (i = 0; i < n; i++)
+                if (jl_array_ptr_ref(callers, i) == (jl_value_t*)caller)
+                    break;
+            if (i == n)
+                jl_array_ptr_1d_push(callers, (jl_value_t*)caller);
+        }
+    }
+    JL_UNLOCK(&mc->writelock);
+}
+
+// invalidate the callers of every recorded edge that no longer holds
+void jl_typegraph_invalidate_stale(size_t max_world)
+{
+    if (jl_typegraph_backedges == NULL)
+        return;
+    jl_methcache_t *mc = jl_method_table->cache;
+    JL_LOCK(&mc->writelock);
+    jl_genericmemory_t *table = jl_typegraph_backedges;
+    _Atomic(jl_value_t*) *tab = (_Atomic(jl_value_t*)*)table->ptr;
+    jl_value_t *loctag = NULL;
+    JL_GC_PUSH1(&loctag);
+    for (size_t i = 0, n = table->length; i < n; i += 2) {
+        jl_value_t *edge = jl_atomic_load_relaxed(&tab[i]);
+        jl_value_t *callers = jl_atomic_load_relaxed(&tab[i + 1]);
+        if (callers == NULL || edge == NULL || edge == jl_nothing)
+            continue;
+        JL_GC_PROMISE_ROOTED(edge); // reachable from the table
+        JL_GC_PROMISE_ROOTED(callers);
+        if (jl_typegraph_edge_valid(edge))
+            continue;
+        size_t nc = jl_array_nrows(callers);
+        for (size_t j = 0; j < nc; j++) {
+            jl_code_instance_t *backedge = (jl_code_instance_t*)jl_array_ptr_ref(callers, j);
+            JL_GC_PROMISE_ROOTED(backedge);
+            invalidate_code_instance(backedge, max_world, 0);
+            if (_jl_debug_method_invalidation) {
+                jl_array_ptr_1d_push(_jl_debug_method_invalidation, edge);
+                loctag = jl_cstr_to_string("jl_typegraph_invalidate");
+                jl_array_ptr_1d_push(_jl_debug_method_invalidation, loctag);
+            }
+        }
+        // remove this entry (cf. `jl_eqtable_pop`)
+        jl_gc_write_atomic(table, tab[i], jl_value_t, jl_nothing, relaxed);
+        jl_gc_write_atomic(table, tab[i + 1], jl_value_t, NULL, relaxed);
+    }
+    JL_GC_POP();
+    JL_UNLOCK(&mc->writelock);
+}
+
+// The definition of `dt` was kept: register its join (if it declares several
+// supertypes) and update dispatch for the pairs of types it newly joins,
+// break the field prefixes its inherited fields break, and publish a new
+// world when anything changed.
+JL_DLLEXPORT void jl_datatype_activate(jl_datatype_t *dt)
+{
+    jl_typename_t *tn = dt->name;
     JL_LOCK(&world_counter_lock);
     if (!jl_atomic_load_relaxed(&allow_new_worlds)) {
-        jl_register_join_typename(J); // the type exists: keep intersections right
+        if (tn->parents != NULL)
+            jl_register_join_typename(tn); // the type exists: keep intersections right
         JL_UNLOCK(&world_counter_lock);
-        jl_error("Definitions of types with several supertypes have been disabled via a call to disable_new_worlds.");
+        jl_error("Definitions of types with several supertypes or inherited fields have been disabled via a call to disable_new_worlds.");
     }
     size_t world = jl_atomic_load_relaxed(&jl_world_counter);
-    if (jl_activate_joins_locked(J, world))
+    int changed = 0;
+    if (tn->parents != NULL)
+        changed |= jl_activate_joins_locked(tn, world);
+    if (tn->n_inherited > 0)
+        changed |= jl_activate_field_prefix_locked(dt, world);
+    if (changed)
         jl_atomic_store_release(&jl_world_counter, world + 1);
     JL_UNLOCK(&world_counter_lock);
 }

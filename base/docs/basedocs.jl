@@ -124,7 +124,9 @@ An abstract type may itself declare several supertypes, `abstract type T <: (A, 
 see the manual section on [Multiple supertypes](@ref man-multiple-supertypes).
 
 An abstract type may declare fields, which every subtype then has (before any
-field of its own), so that methods on the abstract type can access them directly:
+field of its own), so that methods on the abstract type can access them directly;
+`mutable abstract type` additionally requires every concrete subtype to be a
+`mutable struct`, so such methods may assign the fields as well:
 
 ```julia
 abstract type Shape

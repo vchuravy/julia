@@ -2323,6 +2323,10 @@ function show_unquoted(io::IO, ex::Expr, indent::Int, prec::Int, quote_level::In
         show_list(IOContext(io, beginsym=>false), args, ' ', indent, 0, quote_level)
         print(io, " end")
 
+    elseif head === :abstract && nargs == 3 && args[1] isa Bool
+        show_block(IOContext(io, beginsym=>false), args[1] ? Symbol("mutable abstract type") : Symbol("abstract type"), args[2], args[3], indent, quote_level)
+        print(io, "end")
+
     # empty return (i.e. "function f() return end")
     elseif head === :return && nargs == 1 && args[1] === nothing
         print(io, head)
@@ -3066,7 +3070,7 @@ end
 function dump(io::IOContext, x::DataType, n::Int, indent)
     # For some reason, tuples are structs
     is_struct = isstructtype(x) && !(x <: Tuple)
-    is_mut = is_struct && ismutabletype(x)
+    is_mut = (is_struct || (isabstracttype(x) && !isType(x))) && ismutabletype(x)
     is_mut && print(io, "mutable ")
     is_struct && print(io, "struct ")
     isprimitivetype(x) && print(io, "primitive type ")

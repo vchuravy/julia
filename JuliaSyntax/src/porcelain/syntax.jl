@@ -1280,7 +1280,7 @@ function _green_to_est(parent::SyntaxTree, parent_i::Int,
             return kind(out) in KSet"Identifier = ::" ? out :
                 mknode(st, SyntaxList(out))
         elseif (kind(parent) === K"struct" && parent_i === 3) ||
-               (kind(parent) === K"abstract" && parent_i === 2)
+               (kind(parent) === K"abstract" && parent_i === (has_flags(parent, MUTABLE_FLAG) ? 3 : 2))
             # (abstract _ (block (doc "foo" field1))) => (abstract _ (block "foo" field1))
             cs_tmp = SyntaxList()
             for c in cs
@@ -1308,6 +1308,9 @@ function _green_to_est(parent::SyntaxTree, parent_i::Int,
     elseif k === K"struct"
         is_mutable = valleaf(has_flags(st, MUTABLE_FLAG))
         pushfirst!(cs, is_mutable)
+    elseif k === K"abstract" && has_flags(st, MUTABLE_FLAG)
+        # mutable abstract type: (abstract true sig block)
+        pushfirst!(cs, valleaf(true))
     elseif k === K"importpath"
         ret_k = K"."
         for i in eachindex(cs)

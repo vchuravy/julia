@@ -1377,6 +1377,71 @@ precompile_test_harness("multiple supertypes dispatch") do dir
     end
 end
 
+precompile_test_harness("stable field prefix across packages") do dir
+    # a getter through an abstract type with fields is compiled with a fixed
+    # field offset; a package defining a subtype that breaks the prefix must
+    # invalidate it, whether loaded before or after the getter's package
+    function define_prefix_packages(tag)
+        PA = Symbol("PrefixA_$tag"); PB = Symbol("PrefixB_$tag"); PC = Symbol("PrefixC_$tag")
+        write(joinpath(dir, "$PA.jl"),
+            """
+            module $PA
+                abstract type P; p::Int; end
+                struct P1 <: P; end
+                getp(x::P) = x.p
+                precompile(getp, (P,)); precompile(getp, (P1,))
+            end
+            """)
+        write(joinpath(dir, "$PB.jl"),
+            """
+            module $PB
+                using $PA
+                abstract type Q; q::Int; end
+                struct QP <: ($PA.P, Q); end   # fields (q, p): P's field is no longer first
+            end
+            """)
+        write(joinpath(dir, "$PC.jl"),
+            """
+            module $PC
+                using $PA
+                readp(x) = $PA.getp(x)
+                precompile(readp, ($PA.P,))
+            end
+            """)
+        for m in (PA, PB, PC)
+            Base.compilecache(Base.PkgId(string(m)))
+        end
+        return PA, PB, PC
+    end
+    let (PA, PB, PC) = define_prefix_packages("0x6d1e4b70")
+        @eval using $PA, $PC
+        A = invokelatest(getglobal, @__MODULE__, PA)
+        C = invokelatest(getglobal, @__MODULE__, PC)
+        invokelatest() do
+            @test A.getp(A.P1(3)) == 3 && C.readp(A.P1(4)) == 4
+            @test ccall(:jl_typename_stable_field_prefix, Cint, (Any,), A.P.name) == 1
+        end
+        @eval using $PB
+        B = invokelatest(getglobal, @__MODULE__, PB)
+        invokelatest() do
+            @test ccall(:jl_typename_stable_field_prefix, Cint, (Any,), A.P.name) == 0
+            @test fieldnames(B.QP) == (:q, :p)
+            @test A.getp(B.QP(1, 2)) == 2 && C.readp(B.QP(1, 2)) == 2 && A.getp(A.P1(3)) == 3
+        end
+    end
+    let (PA, PB, PC) = define_prefix_packages("0x6d1e4b71")
+        @eval using $PA, $PB
+        @eval using $PC
+        A = invokelatest(getglobal, @__MODULE__, PA)
+        B = invokelatest(getglobal, @__MODULE__, PB)
+        C = invokelatest(getglobal, @__MODULE__, PC)
+        invokelatest() do
+            @test ccall(:jl_typename_stable_field_prefix, Cint, (Any,), A.P.name) == 0
+            @test A.getp(B.QP(1, 2)) == 2 && C.readp(B.QP(1, 2)) == 2 && A.getp(A.P1(3)) == 3
+        end
+    end
+end
+
 precompile_test_harness("invoke") do dir
     InvokeModule = :Invoke0x030e7e97c2365aad
     CallerModule = :Caller0x030e7e97c2365aad

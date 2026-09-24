@@ -584,3 +584,66 @@ let M = JoinInvalidation
     @test Compiler.typeintersect_bounded(Int, M.D) === Union{}
     @test Compiler.tmeet(Union{M.C, Int}, M.D) === M.D
 end
+
+# Type-graph edges: inference folds a test between two abstract types whose
+# intersection is empty today, recording the dependency, and the definition of
+# a type joining them invalidates the code; likewise for a field access through
+# an abstract type whose fields are a stable prefix of every subtype's fields
+module TypeGraphEdges
+abstract type A end
+abstract type B end
+isb(x::A) = x isa B
+egal(x::A, y::B) = x === y
+sub(::Type{T}) where {T<:A} = T <: B
+struct AOnly <: A end
+abstract type P; p::Int; end
+abstract type Q; q::Int; end
+struct P1 <: P; end
+getp(x::P) = x.p
+end
+
+let interp = InvalidationTester()
+    M = TypeGraphEdges
+    @test Base.infer_return_type(M.isb, (M.A,); interp) === Bool   # widened Const(false)
+    src = Base.code_typed(M.isb, (M.A,); interp)[1][1]
+    @test any(x -> x isa Core.ReturnNode && x.val === false, src.code)
+    @test Base.infer_return_type(M.egal, (M.A, M.B); interp) === Bool
+    @test Base.infer_return_type(M.sub, (Type{<:M.A},); interp) === Bool
+    for (f, t) in ((M.isb, (M.A,)), (M.egal, (M.A, M.B)), (M.sub, (Type{<:M.A},)))
+        mi = Compiler.specialize_method(only(methods(f)), Tuple{typeof(f), t...}, Core.svec())
+        ci = mi.cache
+        @test ci.max_world == typemax(UInt)
+        @test any(e -> e isa Core.TypeGraphEdge && e.kind === :disjoint, ci.edges)
+    end
+    @test !M.isb(M.AOnly())
+    mi = Compiler.specialize_method(only(methods(M.isb)), Tuple{typeof(M.isb), M.A}, Core.svec())
+    ci = mi.cache
+    world_before = Base.get_world_counter()
+    list = ccall(:jl_debug_method_invalidation, Any, (Cint,), 1)
+    @eval M struct J <: (A, B) end
+    ccall(:jl_debug_method_invalidation, Any, (Cint,), 0)
+    @test any(x -> x == "jl_typegraph_invalidate", list)
+    @test world_before <= ci.max_world < Base.get_world_counter()
+    @test M.isb(M.J()) && M.egal(M.J(), M.J()) && M.sub(M.J)
+    interp = InvalidationTester() # a fresh local cache: the old inference results are stale
+    @test Base.infer_return_type(M.isb, (M.A,); interp) === Bool
+    src = Base.code_typed(M.isb, (M.A,); interp)[1][1]
+    @test !any(x -> x isa Core.ReturnNode && x.val === false, src.code)
+
+    # a field prefix
+    @test Base.infer_return_type(M.getp, (M.P,); interp) === Int
+    mi = Compiler.specialize_method(only(methods(M.getp)), Tuple{typeof(M.getp), M.P}, Core.svec())
+    ci = mi.cache
+    @test ci.max_world == typemax(UInt)
+    @test any(e -> e isa Core.TypeGraphEdge && e.kind === :fieldprefix && e.a === M.P, ci.edges)
+    @test M.getp(M.P1(3)) == 3
+    world_before = Base.get_world_counter()
+    @eval M struct PQ <: (P, Q); end       # fields (q, p): P's field is no longer first
+    @test fieldnames(M.PQ) == (:q, :p)
+    @test world_before <= ci.max_world < Base.get_world_counter()
+    @test M.getp(M.PQ(1, 2)) == 2 && M.getp(M.P1(3)) == 3
+    interp = InvalidationTester()
+    @test Base.infer_return_type(M.getp, (M.P,); interp) === Int
+    mi = Compiler.specialize_method(only(methods(M.getp)), Tuple{typeof(M.getp), M.P}, Core.svec())
+    @test !any(e -> e isa Core.TypeGraphEdge, mi.cache.edges)   # the prefix is gone, nothing to depend on
+end

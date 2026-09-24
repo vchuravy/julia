@@ -3141,6 +3141,10 @@ static void gc_mark_roots(jl_gc_markqueue_t *mq) JL_NOTSAFEPOINT
     gc_heap_snapshot_record_gc_roots((jl_value_t*)jl_global_roots_keyset, "global_roots_keyset");
     gc_try_claim_and_push(mq, jl_join_registry, NULL);
     gc_heap_snapshot_record_gc_roots((jl_value_t*)jl_join_registry, "join_registry");
+    gc_try_claim_and_push(mq, jl_field_prefix_breakers, NULL);
+    gc_heap_snapshot_record_gc_roots((jl_value_t*)jl_field_prefix_breakers, "field_prefix_breakers");
+    gc_try_claim_and_push(mq, jl_typegraph_backedges, NULL);
+    gc_heap_snapshot_record_gc_roots((jl_value_t*)jl_typegraph_backedges, "typegraph_backedges");
     gc_try_claim_and_push(mq, precompile_field_replace, NULL);
     gc_heap_snapshot_record_gc_roots((jl_value_t*)precompile_field_replace, "precompile_field_replace");
     jl_gc_foreach_alloc_profile_root(gc_mark_alloc_profile_root, mq);

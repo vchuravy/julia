@@ -379,6 +379,10 @@ vst1_toplevel_only(vcx, st) = @stm st begin
         vst1_typesig(vcx, sig)
     [K"abstract" sig [K"block" body...]] ->
         vst1_typesig(vcx, sig) & _struct_noassign(vcx, body) & all(vst1_struct_arg, vcx, body)
+    [K"abstract" [K"Value"] sig [K"block" body...]] ->
+        vst1_typesig(vcx, sig) & (
+            !(st[1].value isa Bool) ? @fail(st[1], "expected mutable flag") :
+                _struct_noassign(vcx, body) & all(vst1_struct_arg, vcx, body))
     [K"primitive" sig n] ->
         vst1_typesig(vcx, sig) & vst1(vcx, n)
     [K"import" [K":" p1 ps...]] ->

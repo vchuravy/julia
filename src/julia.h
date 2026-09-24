@@ -666,6 +666,7 @@ typedef struct {
     // typenames with this bit may have a common subtype ("join") even though
     // neither is an ancestor of the other
     _Atomic(uint8_t) may_join;
+    _Atomic(uint8_t) stable_field_prefix; // abstract type with fields: every subtype's fields start with its fields (see jl_activate_field_prefix)
 } jl_typename_t;
 
 typedef struct {
@@ -2094,6 +2095,10 @@ JL_DLLEXPORT jl_value_t *jl_type_union(jl_value_t **ts, size_t n) JL_CANSAFEPOIN
 JL_DLLEXPORT jl_value_t *jl_type_intersection(jl_value_t *a, jl_value_t *b) JL_CANSAFEPOINT;
 JL_DLLEXPORT int jl_has_empty_intersection(jl_value_t *x, jl_value_t *y) JL_CANSAFEPOINT;
 JL_DLLEXPORT int jl_provably_disjoint(jl_value_t *a, jl_value_t *b) JL_CANSAFEPOINT;
+JL_DLLEXPORT jl_datatype_t *jl_abstract_prefix_layout(jl_datatype_t *dt) JL_CANSAFEPOINT;
+JL_DLLEXPORT int jl_typename_stable_field_prefix(jl_typename_t *tn) JL_NOTSAFEPOINT;
+JL_DLLEXPORT int jl_typegraph_edge_valid(jl_value_t *edge) JL_CANSAFEPOINT;
+JL_DLLEXPORT void jl_typegraph_add_backedge(jl_value_t *edge, jl_code_instance_t *caller) JL_CANSAFEPOINT;
 JL_DLLEXPORT int jl_disjointness_stable(jl_value_t *a, jl_value_t *b) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_value_t *jl_type_unionall(jl_tvar_t *v, jl_value_t *body) JL_CANSAFEPOINT;
 JL_DLLEXPORT const char *jl_typename_str(jl_value_t *v) JL_NOTSAFEPOINT;

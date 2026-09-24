@@ -2538,7 +2538,7 @@ JL_CALLABLE(jl_f__structtype)
 // as for a struct; the fields are inherited by every subtype.
 JL_CALLABLE(jl_f__abstracttype)
 {
-    JL_NARGS(_abstracttype, 3, 5);
+    JL_NARGS(_abstracttype, 3, 6);
     JL_TYPECHK(_abstracttype, module, args[0]);
     JL_TYPECHK(_abstracttype, symbol, args[1]);
     JL_TYPECHK(_abstracttype, simplevector, args[2]);
@@ -2547,16 +2547,21 @@ JL_CALLABLE(jl_f__abstracttype)
         dt = jl_new_abstracttype(args[1], (jl_module_t*)args[0], NULL, (jl_svec_t*)args[2]);
     }
     else {
-        if (nargs != 5)
-            jl_error("_abstracttype: expected 3 or 5 arguments");
+        if (nargs == 4)
+            jl_error("_abstracttype: expected 3, 5 or 6 arguments");
         JL_TYPECHK(_abstracttype, simplevector, args[3]);
         JL_TYPECHK(_abstracttype, simplevector, args[4]);
+        int mutabl = 0;
+        if (nargs == 6) {
+            JL_TYPECHK(_abstracttype, bool, args[5]);
+            mutabl = args[5] == jl_true; // `mutable abstract type`: every concrete subtype must be mutable
+        }
         // `types` is left NULL (not empty) until `_typebody!` so that
         // instantiations created while evaluating the field types are recorded
         // in `partial` and completed later, as for structs
         dt = jl_new_datatype((jl_sym_t*)args[1], (jl_module_t*)args[0], NULL, (jl_svec_t*)args[2],
                              (jl_svec_t*)args[3], NULL, (jl_svec_t*)args[4],
-                             1, 0, jl_svec_len((jl_svec_t*)args[3]));
+                             1, mutabl, jl_svec_len((jl_svec_t*)args[3]));
     }
     return dt->name->wrapper;
 }
