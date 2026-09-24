@@ -4046,6 +4046,7 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
                                                  jl_array_t **extext_methods JL_REQUIRE_ROOTED_SLOT,
                                                  jl_array_t **internal_methods JL_REQUIRE_ROOTED_SLOT,
                                                  jl_array_t **method_roots_list JL_REQUIRE_ROOTED_SLOT,
+                                                 jl_array_t **join_typenames_out JL_REQUIRE_ROOTED_SLOT,
                                                  pkgcachesizes *cachesizes) JL_CANSAFEPOINT JL_GC_DISABLED
 {
     jl_task_t *ct = jl_current_task;
@@ -4601,10 +4602,10 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
     jl_gc_enable(en);
 
     if (s.incremental) {
-        // replay the join registry for the image's typenames with multiple
-        // supertypes (marks their ancestors, possibly in other images)
-        for (size_t i = 0; i < jl_array_nrows(join_typenames); i++)
-            jl_register_join_typename((jl_typename_t*)jl_array_ptr_ref(join_typenames, i));
+        // the image's typenames with multiple supertypes are registered as
+        // joins by the caller, under the world lock, since joining two
+        // types of other images changes dispatch for their methods
+        *join_typenames_out = join_typenames;
         jl_add_methods(*extext_methods);
     }
 
@@ -4681,9 +4682,9 @@ static jl_value_t *jl_restore_package_image_from_stream(ios_t *f, jl_image_t *im
     needs_permalloc = jl_options.permalloc_pkgimg || needs_permalloc;
 
     jl_value_t *restored = NULL;
-    jl_array_t *init_order = NULL, *extext_methods = NULL, *internal_methods = NULL, *method_roots_list = NULL;
+    jl_array_t *init_order = NULL, *extext_methods = NULL, *internal_methods = NULL, *method_roots_list = NULL, *join_typenames = NULL;
     jl_svec_t *cachesizes_sv = NULL;
-    JL_GC_PUSH6(&restored, &init_order, &extext_methods, &internal_methods, &method_roots_list, &cachesizes_sv);
+    JL_GC_PUSH7(&restored, &init_order, &extext_methods, &internal_methods, &method_roots_list, &cachesizes_sv, &join_typenames);
 
     { // make a permanent in-memory copy of f (excluding the header)
         ios_bufmode(f, bm_none);
@@ -4708,7 +4709,7 @@ static jl_value_t *jl_restore_package_image_from_stream(ios_t *f, jl_image_t *im
                 ios_close(f);
             ios_static_buffer(f, sysimg, len);
             pkgcachesizes cachesizes;
-            jl_restore_system_image_from_stream_(f, image, depmods, checksum, (jl_array_t**)&restored, &init_order, &extext_methods, &internal_methods, &method_roots_list, &cachesizes);
+            jl_restore_system_image_from_stream_(f, image, depmods, checksum, (jl_array_t**)&restored, &init_order, &extext_methods, &internal_methods, &method_roots_list, &join_typenames, &cachesizes);
             JL_SIGATOMIC_END();
 
             // Add roots to methods
@@ -4732,12 +4733,18 @@ static jl_value_t *jl_restore_package_image_from_stream(ios_t *f, jl_image_t *im
             JL_LOCK(&world_counter_lock);
             // allocate a world for the new methods, and insert them there, invalidating content as needed
             size_t world = jl_atomic_load_relaxed(&jl_world_counter);
-            if (new_methods)
+            // the image's types with several supertypes join types of other
+            // images: register them and update the methods already loaded
+            // (the image's own methods were compiled with the joins known)
+            int new_joins = 0;
+            for (size_t i = 0; i < jl_array_nrows(join_typenames); i++)
+                new_joins |= jl_activate_joins_locked((jl_typename_t*)jl_array_ptr_ref(join_typenames, i), world);
+            if (new_methods || new_joins)
                 world += 1;
             jl_activate_methods(extext_methods, internal_methods, world, pkgname);
             // TODO: inject internal_methods into caches here, so the system can see them immediately as potential candidates (before validation)
             // allow users to start running in this updated world
-            if (new_methods)
+            if (new_methods || new_joins)
                 jl_atomic_store_release(&jl_world_counter, world);
             // now permit more methods to be added again
             JL_UNLOCK(&world_counter_lock);
@@ -4781,7 +4788,7 @@ static void jl_restore_system_image_from_stream(ios_t *f, jl_image_t *image) JL_
     ios_t f_payload;
     ios_static_buffer(&f_payload, f->buf + datastartpos, f->size - datastartpos);
     jl_restore_system_image_from_stream_(&f_payload, image, NULL,
-                                         checksum, NULL, NULL, NULL, NULL, NULL, NULL);
+                                         checksum, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 }
 
 JL_DLLEXPORT jl_value_t *jl_restore_incremental_from_buf(jl_image_buf_t buf, jl_image_t *image, jl_array_t *depmods, int completeinfo, const char *pkgname, int needs_permalloc) JL_CANSAFEPOINT

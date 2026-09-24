@@ -33,7 +33,11 @@ New language features
   supertype returned by `supertype`; `Base.direct_supertypes` returns all of them and `Base.ancestors`
   all supertypes in C3 linearization order (Dylan's rule), which `InteractiveUtils.supertypes` now
   follows too. Two abstract types that are not subtypes of each other may therefore intersect:
-  `typeintersect` returns the union of the types declaring both as supertypes.
+  `typeintersect` returns the union of the types declaring both as supertypes. Methods defined on
+  two supertypes of such a type both apply to it; a call that static specificity leaves ambiguous
+  is resolved per argument by the linearization of the argument's type (Dylan's rule), and stays
+  ambiguous when the argument positions disagree. Defining the type invalidates code compiled
+  under the earlier disjointness of its supertypes, like a method definition would.
 * Introduced explicitly wrapping arithmetic operators `+%`, `-%`, `*%` to annotate arithmetic operations
   that are semantically safe to wrap/overflow. Their behavior is currently identical to the default `+`, `-`, `*`
   operators. However, in a future version, there may be opt-in support to detect unannotated wrapping

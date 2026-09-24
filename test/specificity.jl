@@ -335,3 +335,13 @@ let root = NTuple
     B = Tuple{Union{UnionAll(N, UnionAll(T, x1)), UnionAll(N, UnionAll(T, x2))}}
     @ccall jl_type_morespecific_no_subtype(A::Any, B::Any)::Cint
 end
+
+# static specificity does not order methods on sibling supertypes of a type
+# declaring both (the C3 tie-break decides at dispatch time instead)
+abstract type SpecA end
+abstract type SpecB end
+struct SpecAB <: (SpecA, SpecB) end
+@test !args_morespecific(Tuple{SpecA}, Tuple{SpecB})
+@test !args_morespecific(Tuple{SpecB}, Tuple{SpecA})
+@test !args_morespecific(Tuple{SpecA, Int}, Tuple{SpecB, Integer})
+@test args_morespecific(Tuple{SpecAB}, Tuple{SpecA}) && args_morespecific(Tuple{SpecAB}, Tuple{SpecB})

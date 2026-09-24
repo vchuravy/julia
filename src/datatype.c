@@ -3039,11 +3039,13 @@ JL_DLLEXPORT void jl_unregister_join_typename(jl_typename_t *J)
 }
 
 // Called once a type definition is kept (not discarded as an equivalent
-// redefinition): publishes what depends on the whole type graph.
+// redefinition): publishes what depends on the whole type graph. A type with
+// several supertypes joins its parents (registered here) and changes
+// dispatch for methods on them (see `jl_datatype_activate_joins` in gf.c).
 JL_DLLEXPORT void jl_activate_type(jl_datatype_t *dt)
 {
     if (dt->name->parents != NULL)
-        jl_register_join_typename(dt->name);
+        jl_datatype_activate_joins(dt->name);
 }
 
 // For the Serialization stdlib: restore the multiple-supertypes state of a

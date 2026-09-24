@@ -6234,6 +6234,137 @@ JL_DLLEXPORT int jl_has_empty_intersection(jl_value_t *x, jl_value_t *y)
     return intersect_types(x, y, 1) == jl_bottom_type;
 }
 
+// Stability of an empty intersection under future type definitions.
+//
+// A later definition can only relate two existing types by declaring a new
+// subtype of both (`struct J <: (A, B)`), and only when both are abstract
+// nominal types that may serve as supertypes. So an intersection proven empty
+// through a concrete type, a non-abstract typename (which never gains
+// subtypes), a typename that cannot be a supertype (`Tuple`, `Type`, ...), or
+// through invariant parameters that are unequal closed types, stays empty
+// forever; one that is empty only because two open abstract typenames are
+// unrelated may be filled by a join type defined later.
+static int disjointness_stable(jl_value_t *a, jl_value_t *b) JL_CANSAFEPOINT
+{
+    if (a == jl_bottom_type || b == jl_bottom_type || a == b)
+        return 1;
+    if (jl_is_typevar(a))
+        return disjointness_stable(((jl_tvar_t*)a)->ub, b);
+    if (jl_is_typevar(b))
+        return disjointness_stable(a, ((jl_tvar_t*)b)->ub);
+    if (jl_is_unionall(a))
+        a = jl_unwrap_unionall(a);
+    if (jl_is_unionall(b))
+        b = jl_unwrap_unionall(b);
+    if (jl_is_uniontype(a))
+        return disjointness_stable(((jl_uniontype_t*)a)->a, b) &&
+               disjointness_stable(((jl_uniontype_t*)a)->b, b);
+    if (jl_is_uniontype(b))
+        return disjointness_stable(a, ((jl_uniontype_t*)b)->a) &&
+               disjointness_stable(a, ((jl_uniontype_t*)b)->b);
+    if (jl_is_some_Type(a) || jl_is_some_Type(b)) {
+        if (jl_is_some_Type(a) && jl_is_some_Type(b)) {
+            // the instances are the types themselves: equal or not, permanently
+            jl_value_t *ta = jl_some_Type_T(a), *tb = jl_some_Type_T(b);
+            if (jl_has_free_typevars(ta) || jl_has_free_typevars(tb))
+                return 0;
+            return !jl_types_equal(ta, tb);
+        }
+        // a type wrapper against a nominal type: its instances are types,
+        // whose own supertypes (the kinds) never change
+        return 1;
+    }
+    if (!jl_is_datatype(a) || !jl_is_datatype(b))
+        return 0;
+    jl_datatype_t *ad = (jl_datatype_t*)a, *bd = (jl_datatype_t*)b;
+    if (jl_is_concrete_type(a) || jl_is_concrete_type(b))
+        return 1;
+    if (ad->name != bd->name) {
+        // a non-abstract typename never gains a supertype, and `Tuple` can
+        // be neither a supertype nor a subtype of another name
+        if (!ad->name->abstract || !bd->name->abstract)
+            return 1;
+        if (ad->name == jl_tuple_typename || bd->name == jl_tuple_typename)
+            return 1;
+        int pending = 0;
+        jl_datatype_t *anc = jl_datatype_ancestor(ad, bd->name, &pending);
+        if (anc != NULL) {
+            ad = anc;
+        }
+        else {
+            anc = jl_datatype_ancestor(bd, ad->name, &pending);
+            if (anc == NULL)
+                return 0; // two open, unrelated abstract names: a join may be defined later
+            bd = anc;
+        }
+    }
+    // same typename: the emptiness comes from the parameters
+    if (ad->name == jl_tuple_typename) {
+        size_t na = jl_nparams(ad), nb = jl_nparams(bd), np, i;
+        int vaa = na > 0 && jl_is_vararg(jl_tparam(ad, na - 1));
+        int vab = nb > 0 && jl_is_vararg(jl_tparam(bd, nb - 1));
+        if (!vaa && !vab) {
+            if (na != nb)
+                return 1;
+            np = na;
+        }
+        else {
+            np = na < nb ? na : nb;
+        }
+        for (i = 0; i < np; i++) {
+            jl_value_t *ai = jl_tparam(ad, i), *bi = jl_tparam(bd, i);
+            if (jl_is_vararg(ai))
+                ai = jl_unwrap_vararg(ai);
+            if (jl_is_vararg(bi))
+                bi = jl_unwrap_vararg(bi);
+            if (jl_has_empty_intersection(ai, bi) && disjointness_stable(ai, bi))
+                return 1;
+        }
+        return 0;
+    }
+    size_t i, np = jl_nparams(ad);
+    if (np != jl_nparams(bd))
+        return 0;
+    for (i = 0; i < np; i++) {
+        // invariant position: the parameters must be equal types, and
+        // equality of closed types is permanent
+        jl_value_t *ai = jl_tparam(ad, i), *bi = jl_tparam(bd, i);
+        if (jl_is_typevar(ai) || jl_is_typevar(bi)) {
+            if (jl_is_typevar(ai))
+                ai = ((jl_tvar_t*)ai)->ub;
+            if (jl_is_typevar(bi))
+                bi = ((jl_tvar_t*)bi)->ub;
+            if (!jl_has_free_typevars(ai) && !jl_has_free_typevars(bi) &&
+                jl_has_empty_intersection(ai, bi) && disjointness_stable(ai, bi))
+                return 1;
+            continue;
+        }
+        if (jl_has_free_typevars(ai) || jl_has_free_typevars(bi))
+            continue;
+        if (!jl_types_equal(ai, bi))
+            return 1;
+    }
+    return 0;
+}
+
+// `typeintersect(a, b) === Union{}`, and no later type definition can change
+// that (see `disjointness_stable`). Compile-time folds that rely on two types
+// being disjoint (`isa`, `===`, `<:`, dead branches) must use this instead of
+// a plain emptiness test, since a type declaring several supertypes may join
+// two previously disjoint abstract types.
+JL_DLLEXPORT int jl_provably_disjoint(jl_value_t *a, jl_value_t *b)
+{
+    if (!jl_has_empty_intersection(a, b))
+        return 0;
+    return disjointness_stable(a, b);
+}
+
+// the stability part alone, for callers that already know the intersection is empty
+JL_DLLEXPORT int jl_disjointness_stable(jl_value_t *a, jl_value_t *b)
+{
+    return disjointness_stable(a, b);
+}
+
 // return a SimpleVector of all vars from UnionAlls wrapping a given type
 jl_svec_t *jl_outer_unionall_vars(jl_value_t *u)
 {

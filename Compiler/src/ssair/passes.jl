@@ -251,7 +251,7 @@ end
 function (walker_callback::TypeConstrainingWalker)(@nospecialize(def), @nospecialize(_defssa::AnySSAValue))
     if isa(def, PiNode)
         walker_callback.typeconstraint =
-            typeintersect(walker_callback.typeconstraint, widenconst(def.typ))
+            typeintersect_bounded(walker_callback.typeconstraint, widenconst(def.typ))
         return LiftedValue(def.val)
     end
     return nothing
@@ -303,7 +303,7 @@ function walk_to_defs(compact::IncrementalCompact, @nospecialize(defssa), @nospe
                     val = OldSSAValue(val.id)
                 end
                 edge_typ = argextype_widened(val, compact)
-                hasintersect(edge_typ, typeconstraint) || continue
+                isdisjoint_stable(edge_typ, typeconstraint) && continue
                 push!(possible_predecessors, n)
             end
             for n in possible_predecessors
@@ -2261,8 +2261,8 @@ function adce_pass!(ir::IRCode, inlining::Union{Nothing,InliningState}=nothing)
             if !isassigned(stmt.values, i)
                 # Should be impossible to have something used only by PiNodes that's undef
                 push!(to_drop, i)
-            elseif !hasintersect(argextype_widened(stmt.values[i], compact),
-                                 widenconst(t))
+            elseif isdisjoint_stable(argextype_widened(stmt.values[i], compact),
+                                     widenconst(t))
                 push!(to_drop, i)
             end
         end

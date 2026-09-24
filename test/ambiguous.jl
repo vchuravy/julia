@@ -662,4 +662,144 @@ let ambig = Ref{Int32}(0)
     @test ms[4].method === which(ambig10, (Vararg{Number},))
 end
 
+
+# Dispatch at a type declaring several supertypes: methods on sibling
+# supertypes are unordered by specificity, and the C3 linearization of the
+# argument type breaks the tie (per argument; the call stays ambiguous when
+# the positions disagree or a position is undecidable)
+module JoinAmbig
+using Test
+using Base: get_world_counter
+
+module Orient
+    abstract type Grid end
+    abstract type HGrid <: Grid end
+    abstract type VGrid <: Grid end
+    struct HV <: (HGrid, VGrid) end   # HV, HGrid, VGrid, Grid, Any
+    struct VH <: (VGrid, HGrid) end   # VH, VGrid, HGrid, Grid, Any
+    orient(::HGrid) = :h
+    orient(::VGrid) = :v
+    kf(::HGrid; a=1) = (:h, a)
+    kf(::VGrid; a=1) = (:v, a)
+    gw(::T, ::HGrid) where {T} = :h
+    gw(::S, ::VGrid) where {S} = :v
+end
+using .Orient: HGrid, VGrid, HV, VH, orient
+@test orient(HV()) === :h && orient(VH()) === :v
+@test which(orient, (HV,)) === which(orient, (HGrid,))
+@test which(orient, (VH,)) === which(orient, (VGrid,))
+@test invoke(orient, Tuple{VGrid}, HV()) === :v
+@test length(methods(orient, (HV,))) == 1
+@test length(Base.methods_including_ambiguous(orient, (HV,))) == 1
+@test length(Base.methods_including_ambiguous(orient, (Orient.Grid,))) == 2
+@test hasmethod(orient, (HV,)) && hasmethod(orient, (VH,))
+@test !Base.isambiguous(which(orient, (HGrid,)), which(orient, (VGrid,)))
+@test isempty(Test.detect_ambiguities(Orient))
+@test Orient.kf(HV(); a=2) == (:h, 2) && Orient.kf(VH()) == (:v, 1)
+@test Orient.gw(1, HV()) === :h && Orient.gw(1, VH()) === :v
+@test Base.return_types(orient, (HV,)) == [Symbol]
+@test Base.infer_return_type(orient, (HV,)) === Symbol
+# the union as a whole has no single winner, but a call with it is split per member
+@test isempty(methods(orient, (Union{HV, VH},)))
+@test Base.infer_return_type(x -> orient(x), (Union{HV, VH},)) === Symbol
+
+# two arguments whose linearizations disagree stay ambiguous
+merge2(::HGrid, ::VGrid) = 1
+merge2(::VGrid, ::HGrid) = 2
+@test merge2(HV(), VH()) == 1 && merge2(VH(), HV()) == 2
+@test_throws MethodError merge2(HV(), HV())
+@test Base.isambiguous(methods(merge2)...)
+@test length(Base.methods_including_ambiguous(merge2, (HV, HV))) == 2
+@test isempty(methods(merge2, (HV, HV)))
+let err = sprint(showerror, try merge2(HV(), HV()) catch e; e end)
+    @test occursin("Possible fix, define", err)
+    @test occursin("linearization", err)
+end
+# a position where the candidates differ only in their parameters is undecided
+pf(::Ref{Int}, ::HGrid) = :h
+pf(::Ref, ::VGrid) = :v
+@test_throws MethodError pf(Ref(1), HV())
+@test pf(Ref(1.0), HV()) === :v
+# a `Type` position is undecided
+tf(::Type{<:HGrid}) = :h
+tf(::Type{<:VGrid}) = :v
+@test_throws MethodError tf(HV)
+
+# methods defined before the join: the join records their interference and
+# clears their "only match" bit
+abstract type A end
+abstract type B end
+f(::A) = :a
+f(::B) = :b
+const METHOD_SIG_LATEST_ONLY = 0x2
+@test !iszero(which(f, (A,)).dispatch_status & METHOD_SIG_LATEST_ONLY)
+struct AB <: (A, B) end
+@test f(AB()) === :a
+interferes(m1, m2) = (mem = m1.interferences; any(i -> isassigned(mem, i) && mem[i] === m2, 1:length(mem)))
+@test interferes(which(f, (A,)), which(f, (B,))) && interferes(which(f, (B,)), which(f, (A,)))
+@test iszero(which(f, (A,)).dispatch_status & METHOD_SIG_LATEST_ONLY)
+@test iszero(which(f, (B,)).dispatch_status & METHOD_SIG_LATEST_ONLY)
+
+# a call compiled at an abstract type before the join, through a method that
+# does not mention the joined types itself
+gk(::Any) = :any
+gk(::B) = :b
+callgk(x::A) = gk(x)
+struct AOnly <: A end
+@test callgk(AOnly()) === :any
+struct AB2 <: (A, B) end
+@test callgk(AB2()) === :b
+@test callgk(AOnly()) === :any
+# and one that never had a matching method
+missing_before(x::A) = mb(x)
+function mb end
+@test_throws MethodError missing_before(AOnly())
+mb(::B) = :b
+struct AB3 <: (A, B) end
+@test missing_before(AB3()) === :b
+
+# a callable join type
+struct CallJ <: (A, B) end
+(::A)(x) = (:a, x)
+(::B)(x) = (:b, x)
+@test CallJ()(1) == (:a, 1)
+
+# a later method on a nearer supertype replaces the C3 winner
+abstract type A0 end
+abstract type A1 <: A0 end
+abstract type B0 end
+r(::A0) = :a0
+r(::B0) = :b0
+struct RJ <: (A1, B0) end     # RJ, A1, A0, B0, Any
+@test r(RJ()) === :a0
+callr(x::RJ) = r(x)
+@test callr(RJ()) === :a0
+r(::A1) = :a1
+@test r(RJ()) === :a1 && callr(RJ()) === :a1
+
+# the world moves when the join changes dispatch, and the invalidation log names it
+abstract type LA end
+abstract type LB end
+lf(::LA) = :a
+lf(::LB) = :b
+let list = ccall(:jl_debug_method_invalidation, Any, (Cint,), 1)
+    w = get_world_counter()
+    @eval struct LoggedJoin <: (LA, LB) end
+    ccall(:jl_debug_method_invalidation, Any, (Cint,), 0)
+    @test get_world_counter() > w
+    @test any(x -> x == "jl_datatype_activate_joins", list)
+    @test any(x -> x === LoggedJoin, list)
+    # the same pair again changes nothing
+    list = ccall(:jl_debug_method_invalidation, Any, (Cint,), 1)
+    @eval abstract type LoggedJoin2 <: (LA, LB) end
+    ccall(:jl_debug_method_invalidation, Any, (Cint,), 0)
+    @test !any(x -> x == "jl_datatype_activate_joins", list)
+end
+
+Base.Experimental.@max_methods 1 function mm end
+mm(::A) = :a
+mm(::B) = :b
+@test mm(AB()) === :a
+end # module JoinAmbig
+
 nothing

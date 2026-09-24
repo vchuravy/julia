@@ -865,6 +865,10 @@ end
 
 ismutabletypename(tn::Core.TypeName) = tn.flags & 0x2 == 0x2
 
+# whether the typename, or one of its ancestors, declares several supertypes
+# (its ancestry is a C3 linearization rather than a chain)
+_has_multiple_supers(tn::Core.TypeName) = tn.flags & 0x8 == 0x8
+
 """
     isstructtype(T)::Bool
 

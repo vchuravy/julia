@@ -2193,7 +2193,7 @@ end
     if isexact_tty && !isa(tty_ub, TypeVar)
         tty_lb = tty_ub # TODO: this would be wrong if !isexact_tty, but instanceof_tfunc doesn't preserve this info
         if !has_free_typevars(tty_lb) && !has_free_typevars(tty_ub)
-            thentype = typeintersect(tty, tty_ub)
+            thentype = typeintersect_bounded(tty, tty_ub)
             if iskindtype(tty_ub) && thentype !== Bottom
                 # `typeintersect` may be unable narrow down `Type`-type
                 thentype = tty_ub
@@ -2530,7 +2530,7 @@ function abstract_invoke(interp::AbstractInterpreter, arginfo::ArgInfo, si::Stmt
             specsig = get_ci_abi(method_or_ci)
             defdef = get_ci_mi(method_or_ci).def
             exct_ci = method_or_ci.exctype
-            if !hasintersect(argtype, specsig)
+            if isdisjoint_stable(argtype, specsig)
                 return Future(CallMeta(Bottom, TypeError, EFFECTS_THROWS, NoCallInfo()))
             elseif !(argtype <: specsig) || ((!isa(method_or_ci.def, ABIOverride) && isa(defdef, Method)) && !(argtype <: defdef.sig))
                 exct_ci = Union{exct_ci, TypeError}
@@ -2557,7 +2557,10 @@ function abstract_invoke(interp::AbstractInterpreter, arginfo::ArgInfo, si::Stmt
             lookupsig = method.sig # edge kind
             argtype = argtypes_to_type(pushfirst!(argtype_tail(argtypes, 4), ft))
             nargtype = typeintersect(lookupsig, argtype)
-            nargtype === Bottom && return Future(CallMeta(Bottom, TypeError, EFFECTS_THROWS, NoCallInfo()))
+            if nargtype === Bottom
+                isdisjoint_stable(lookupsig, argtype) && return Future(CallMeta(Bottom, TypeError, EFFECTS_THROWS, NoCallInfo()))
+                return Future(CallMeta(Any, Any, Effects(), NoCallInfo())) # a later type may join the argument and signature types
+            end
             nargtype isa DataType || return Future(CallMeta(Any, Any, Effects(), NoCallInfo())) # other cases are not implemented below
             # Fall through to generic invoke handling
         end
@@ -2572,7 +2575,10 @@ function abstract_invoke(interp::AbstractInterpreter, arginfo::ArgInfo, si::Stmt
         end
         argtype = argtypes_to_type(argtype_tail(argtypes, 4))
         nargtype = typeintersect(types, argtype)
-        nargtype === Bottom && return Future(CallMeta(Bottom, TypeError, EFFECTS_THROWS, NoCallInfo()))
+        if nargtype === Bottom
+            isdisjoint_stable(types, argtype) && return Future(CallMeta(Bottom, TypeError, EFFECTS_THROWS, NoCallInfo()))
+            return Future(CallMeta(Any, Any, Effects(), NoCallInfo())) # a later type may join the argument and signature types
+        end
         nargtype isa DataType || return Future(CallMeta(Any, Any, Effects(), NoCallInfo())) # other cases are not implemented below
         isdispatchelem(ft) || return Future(CallMeta(Any, Any, Effects(), NoCallInfo())) # check that we might not have a subtype of `ft` at runtime, before doing supertype lookup below
         lookupsig = rewrap_unionall(Tuple{ft, unwrapped.parameters...}, types)::Type
@@ -3140,7 +3146,10 @@ function abstract_call_opaque_closure(interp::AbstractInterpreter, closure::Part
     ocargsig′ = unwrap_unionall(ocargsig)
     ocargsig′ isa DataType || return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
     ocsig = rewrap_unionall(Tuple{Tuple, ocargsig′.parameters...}, ocargsig)
-    hasintersect(sig, ocsig) || return Future(CallMeta(Union{}, Union{MethodError,TypeError}, EFFECTS_THROWS, NoCallInfo()))
+    if !hasintersect(sig, ocsig)
+        isdisjoint_stable(sig, ocsig) && return Future(CallMeta(Union{}, Union{MethodError,TypeError}, EFFECTS_THROWS, NoCallInfo()))
+        return Future(CallMeta(Any, Any, Effects(), NoCallInfo())) # a later type may join the argument and signature types
+    end
     ocmethod = closure.source::Method
     if !isdefined(ocmethod, :source)
         # This opaque closure was created from optimized source. We cannot infer it further.

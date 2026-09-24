@@ -206,14 +206,33 @@ gdispatch(::HGrid) = :h
 @testset "method lookup through every parent" begin
     @test gdispatch(VHCell()) === :h     # via the secondary parent
     @test gdispatch(HVCell()) === :h
-    # both methods apply and (without the C3 tie-break of the dispatch phase)
-    # the call is ambiguous
-    @test length(Base.methods_including_ambiguous(fdispatch, (HVCell,))) == 2
-    @test length(Base.methods_including_ambiguous(fdispatch, (VHCell,))) == 2
-    @test isempty(methods(fdispatch, (HVCell,)))
-    @test !hasmethod(fdispatch, (VHCell,))
-    @test_throws MethodError fdispatch(HVCell())
-    @test Base.isambiguous(methods(fdispatch)...)
+    # both methods apply; the linearization of the argument type orders them
+    @test length(Base.methods_including_ambiguous(fdispatch, (HVCell,))) == 1
+    @test length(Base.methods_including_ambiguous(fdispatch, (HVGrid,))) == 1
+    @test length(Base.methods_including_ambiguous(fdispatch, (Grid,))) == 2
+    @test length(methods(fdispatch, (HVCell,))) == 1
+    @test hasmethod(fdispatch, (VHCell,))
+    @test fdispatch(HVCell()) === :h && fdispatch(VHCell()) === :v
+    @test fdispatch(MutHV(1)) === :h && fdispatch(reinterpret(PrimHV, 0x1)) === :h
+    @test which(fdispatch, (HVCell,)).sig == Tuple{typeof(fdispatch), HGrid}
+    @test which(fdispatch, (VHCell,)).sig == Tuple{typeof(fdispatch), VGrid}
+    @test !Base.isambiguous(methods(fdispatch)...)
+    @test Base.return_types(fdispatch, (HVCell,)) == [Symbol]
+    @test Base.return_types(fdispatch, (HVGrid,)) == [Symbol]
+end
+
+# a join does not change dispatch for the concrete types that exist already
+struct HOnlyCell <: HGrid end
+@testset "existing concrete dispatch survives a join" begin
+    @test fdispatch(HOnlyCell()) === :h
+    mi = Base.method_instance(fdispatch, (HOnlyCell,))
+    ci = mi.cache
+    @test ci.max_world == typemax(UInt)
+    @eval struct LateJoin <: (HGrid, VGrid) end
+    @test fdispatch(HOnlyCell()) === :h
+    @test Base.method_instance(fdispatch, (HOnlyCell,)) === mi
+    @test mi.cache === ci && ci.max_world == typemax(UInt)
+    @test fdispatch(LateJoin()) === :h
 end
 
 @testset "redefinition" begin

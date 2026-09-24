@@ -1183,6 +1183,23 @@ function bodyfunction(basemethod::Method; world::UInt=get_world_counter())
     return nothing
 end
 
+# split a tuple type at its first position holding a union of types with
+# several supertypes; `nothing` when there is none
+function _split_join_union(@nospecialize ti)
+    u = unwrap_unionall(ti)
+    u isa DataType && u.name === Tuple.name || return nothing
+    params = u.parameters
+    for i = 1:length(params)
+        p = params[i]
+        p isa Union || continue
+        members = uniontypes(p)
+        length(members) <= 8 || continue
+        all(c -> c isa DataType && _has_multiple_supers(c.name), members) || continue
+        return Any[rewrap_unionall(Tuple{params[1:i-1]..., c, params[i+1:end]...}, ti) for c in members]
+    end
+    return nothing
+end
+
 """
     Base.isambiguous(m1, m2; ambiguous_bottom=false)::Bool
 
@@ -1297,9 +1314,21 @@ function isambiguous(m1::Method, m2::Method; ambiguous_bottom::Bool=false)
             return false # report that the type system failed to decide if it was ambiguous by saying they definitely are not
         end
     end
-    inner(ti) || return false
-    # otherwise type-intersection reported an ambiguity we couldn't solve
-    return true
+    # a position holding a union of types with several supertypes: each of
+    # them may order the methods differently by its own linearization, so the
+    # ambiguity is decided per member (`f(::A)` and `f(::B)` intersect in
+    # `Union{AB, BA}` for the joins `AB <: (A, B)` and `BA <: (B, A)`)
+    todo = Any[ti]
+    while !isempty(todo)
+        t = pop!(todo)
+        split = _split_join_union(t)
+        if split === nothing
+            inner(t) && return true # type-intersection reported an ambiguity we couldn't solve
+        else
+            append!(todo, split)
+        end
+    end
+    return false
 end
 
 """

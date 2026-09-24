@@ -1295,6 +1295,88 @@ precompile_test_harness("multiple supertypes") do dir
     end
 end
 
+precompile_test_harness("multiple supertypes dispatch") do dir
+    # Methods on two abstract types from different packages, a caller
+    # precompiled while they were disjoint, and a join defined by a fourth
+    # package: loading the join must record the interference of the two
+    # methods and invalidate the caller (an image compiled without the join
+    # is rejected by edge verification when loaded after it), so dispatch,
+    # `isa`, and `isambiguous` agree with the join whatever the load order.
+    function define_join_packages(tag)
+        JX = Symbol("JoinX_$tag"); JY = Symbol("JoinY_$tag"); JW = Symbol("JoinW_$tag"); JZ = Symbol("JoinZ_$tag")
+        write(joinpath(dir, "$JX.jl"),
+            """
+            module $JX
+                abstract type A end
+                f(::A) = :a
+                k(::Any) = :any
+            end
+            """)
+        write(joinpath(dir, "$JY.jl"),
+            """
+            module $JY
+                using $JX
+                abstract type B end
+                $JX.f(::B) = :b
+                $JX.k(::B) = :b
+            end
+            """)
+        write(joinpath(dir, "$JW.jl"),
+            """
+            module $JW
+                using $JX, $JY
+                struct AO <: $JX.A end
+                w(x::$JX.A) = $JX.f(x)
+                w2(x::$JX.A) = x isa $JY.B
+                wk(x::$JX.A) = $JX.k(x)
+                precompile(w, ($JX.A,)); precompile(w2, ($JX.A,)); precompile(wk, ($JX.A,))
+                precompile(w, (AO,)); precompile(w2, (AO,)); precompile(wk, (AO,))
+            end
+            """)
+        write(joinpath(dir, "$JZ.jl"),
+            """
+            module $JZ
+                using $JX, $JY
+                struct C <: ($JX.A, $JY.B) end
+            end
+            """)
+        for m in (JX, JY, JW, JZ)
+            Base.compilecache(Base.PkgId(string(m)))
+        end
+        return JX, JY, JW, JZ
+    end
+    function check_join_packages(X, Y, W, Z)
+        invokelatest() do
+            c = Z.C()
+            @test W.w(W.AO()) === :a && W.w2(W.AO()) == false && W.wk(W.AO()) === :any
+            @test W.w(c) === :a          # f(::A) precedes f(::B) in the linearization of C
+            @test W.w2(c) == true        # not folded under the old disjointness
+            @test W.wk(c) === :b         # k(::B) now applies and beats k(::Any)
+            fa = which(X.f, (X.A,)); fb = which(X.f, (Y.B,))
+            @test !Base.isambiguous(fa, fb)
+            mem = fa.interferences
+            @test any(i -> isassigned(mem, i) && mem[i] === fb, 1:length(mem))
+            @test typeintersect(X.A, Y.B) === Z.C
+        end
+    end
+    # the caller loaded before the join
+    let (JX, JY, JW, JZ) = define_join_packages("0x3f7a1c2e")
+        @eval using $JX, $JY, $JW
+        W = invokelatest(getglobal, @__MODULE__, JW)
+        invokelatest() do
+            @test W.w(W.AO()) === :a && W.w2(W.AO()) == false && W.wk(W.AO()) === :any
+        end
+        @eval using $JZ
+        check_join_packages((invokelatest(getglobal, @__MODULE__, m) for m in (JX, JY, JW, JZ))...)
+    end
+    # the caller loaded after the join
+    let (JX, JY, JW, JZ) = define_join_packages("0x3f7a1c2f")
+        @eval using $JX, $JY, $JZ
+        @eval using $JW
+        check_join_packages((invokelatest(getglobal, @__MODULE__, m) for m in (JX, JY, JW, JZ))...)
+    end
+end
+
 precompile_test_harness("invoke") do dir
     InvokeModule = :Invoke0x030e7e97c2365aad
     CallerModule = :Caller0x030e7e97c2365aad

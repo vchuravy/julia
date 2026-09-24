@@ -2565,6 +2565,8 @@ static int jl_type_intersection2(jl_value_t *t1, jl_value_t *t2, jl_value_t **is
 }
 
 
+static int type_mentions_join(jl_value_t *t) JL_NOTSAFEPOINT;
+
 // check if `type` is replacing `m` with an ambiguity here, given other methods in `d` that already match it
 static int is_replacing(char ambig, jl_value_t *type, jl_method_t *m, jl_method_t *const *d, size_t n, jl_value_t *isect, jl_value_t *isect2, char *morespec) JL_CANSAFEPOINT
 {
@@ -2582,8 +2584,10 @@ static int is_replacing(char ambig, jl_value_t *type, jl_method_t *m, jl_method_
         // since m2 was also a previous match over isect,
         // see if m was previously dominant over all m2
         // or if this was already ambiguous before
-        if (ambig && !jl_type_morespecific(m->sig, m2->sig)) {
+        if (ambig && !jl_type_morespecific(m->sig, m2->sig) &&
+            !type_mentions_join(isect) && !(isect2 && type_mentions_join(isect2))) {
             // m and m2 were previously ambiguous over the full intersection of mi with type, and will still be ambiguous with addition of type
+            // (unless the intersection mentions a type with several supertypes, where the C3 tie-break may have selected, or may now select, one of them)
             return 0;
         }
     }
@@ -2792,7 +2796,10 @@ static void _typename_invalidate_backedges(jl_typename_t *tn, int explct, void *
                 if (jl_subtype(*env->isect, m->sig) || (*env->isect2 && jl_subtype(*env->isect2, m->sig))) {
                     // We now know that there actually was a previous
                     // method for this part of the type intersection.
-                    if (!jl_type_morespecific(env->type, m->sig)) {
+                    // (a new method ambiguous with it may still be selected
+                    // by the C3 tie-break at a type with several supertypes)
+                    if (!jl_type_morespecific(env->type, m->sig) &&
+                        !type_mentions_join(*env->isect) && !(*env->isect2 && type_mentions_join(*env->isect2))) {
                         missing = 0;
                         break;
                     }
@@ -3227,6 +3234,161 @@ cleanup:
 }
 
 
+// --- C3 tie-break for calls at a type with several supertypes ---
+//
+// Two methods on sibling supertypes (`f(::A)` and `f(::B)`) are unordered by
+// static specificity, so a call with an argument of a join type `C <: (A, B)`
+// would be ambiguous. Dylan resolves such ties per argument position by the
+// class precedence list: `A` precedes `B` in the C3 linearization of `C`, so
+// `f(::A)` wins. Since linearizations are monotonic, every subtype of `C`
+// orders `A` and `B` the same way, which makes the rule usable for
+// non-concrete queries too. The rule only applies to methods that fully cover
+// the query and are unordered by the recorded interferences; a method must
+// be preferred at some position and never worse at another, else the call
+// stays ambiguous (also when a position is undecidable: a `Type`, a union,
+// a difference in parameters only, ...).
+
+// index of `tn` in the linearization of `cd` (0 is `cd` itself), or -1
+static int c3_rank(jl_datatype_t *cd, jl_typename_t *tn) JL_NOTSAFEPOINT
+{
+    jl_svec_t *lin = cd->name->linearization;
+    size_t i, n = jl_svec_len(lin);
+    for (i = 0; i < n; i++)
+        if (jl_svecref(lin, i) == (jl_value_t*)tn)
+            return (int)i;
+    return -1;
+}
+
+enum { C3_EQ = 0, C3_LT, C3_GT, C3_UNKNOWN };
+
+// order of the signature elements `ai` and `bi` at the query element `ci`:
+// C3_LT if the linearization of `ci` lists `ai`'s typename first
+static int c3_position(jl_value_t *ci, jl_value_t *ai, jl_value_t *bi) JL_CANSAFEPOINT
+{
+    if (ai == bi)
+        return C3_EQ;
+    // a method on `T where T<:A` is, at this position, a method on `A`
+    if (jl_is_typevar(ai))
+        ai = ((jl_tvar_t*)ai)->ub;
+    if (jl_is_typevar(bi))
+        bi = ((jl_tvar_t*)bi)->ub;
+    if (ai == bi)
+        return C3_EQ;
+    if (jl_has_free_typevars(ai) || jl_has_free_typevars(bi))
+        return C3_UNKNOWN;
+    if (!jl_is_datatype(ai) || !jl_is_datatype(bi) || jl_is_some_Type(ai) || jl_is_some_Type(bi))
+        return jl_types_equal(ai, bi) ? C3_EQ : C3_UNKNOWN;
+    jl_datatype_t *ad = (jl_datatype_t*)ai, *bd = (jl_datatype_t*)bi;
+    if (ad->name == bd->name)
+        return jl_types_equal(ai, bi) ? C3_EQ : C3_UNKNOWN;
+    if (!jl_is_datatype(ci) || jl_is_some_Type(ci))
+        return C3_UNKNOWN;
+    jl_datatype_t *cd = (jl_datatype_t*)ci;
+    if (cd->name->linearization == NULL)
+        return C3_UNKNOWN;
+    int ra = c3_rank(cd, ad->name), rb = c3_rank(cd, bd->name);
+    if (ra < 0 || rb < 0)
+        return C3_UNKNOWN;
+    return ra < rb ? C3_LT : C3_GT;
+}
+
+// the i-th element of an unwrapped tuple signature, reading through a trailing Vararg
+static jl_value_t *sig_element(jl_value_t *sig JL_PROPAGATES_ROOT, size_t i) JL_NOTSAFEPOINT
+{
+    size_t n = jl_nparams(sig);
+    if (n == 0)
+        return NULL;
+    if (i < n - 1)
+        return jl_tparam(sig, i);
+    jl_value_t *last = jl_tparam(sig, n - 1);
+    if (jl_is_vararg(last))
+        return jl_unwrap_vararg(last);
+    return i == n - 1 ? last : NULL;
+}
+
+// whether the tie-break can apply to a query: some element is a nominal type
+// with a linearization (it declares, or inherits from, several supertypes)
+static int c3_query_capable(jl_value_t *query) JL_NOTSAFEPOINT
+{
+    jl_value_t *unw = jl_unwrap_unionall(query);
+    size_t i, n = jl_nparams(unw);
+    for (i = 0; i < n; i++) {
+        jl_value_t *qi = jl_tparam(unw, i);
+        if (jl_is_vararg(qi))
+            return 0;
+        if (jl_is_datatype(qi) && ((jl_datatype_t*)qi)->name->linearization != NULL)
+            return 1;
+    }
+    return 0;
+}
+
+// 1 if the linearizations prefer `ma` over `mb` for `query` (both must fully
+// cover it), -1 for the reverse, 0 when undecided
+static int c3_compare_sigs(jl_value_t *query, jl_method_t *ma, jl_method_t *mb) JL_CANSAFEPOINT
+{
+    jl_value_t *qu = jl_unwrap_unionall(query);
+    jl_value_t *sa = jl_unwrap_unionall(ma->sig), *sb = jl_unwrap_unionall(mb->sig);
+    size_t i, nq = jl_nparams(qu);
+    int lt = 0, gt = 0;
+    for (i = 0; i < nq; i++) {
+        jl_value_t *qi = jl_tparam(qu, i);
+        if (jl_is_vararg(qi))
+            return 0;
+        jl_value_t *ai = sig_element(sa, i), *bi = sig_element(sb, i);
+        if (ai == NULL || bi == NULL)
+            return 0;
+        switch (c3_position(qi, ai, bi)) {
+        case C3_EQ: break;
+        case C3_LT: lt = 1; break;
+        case C3_GT: gt = 1; break;
+        default: return 0;
+        }
+        if (lt && gt)
+            return 0;
+    }
+    return lt ? 1 : (gt ? -1 : 0);
+}
+
+// `m` is selected over `m2` for a `query` both fully cover: by the recorded
+// static specificity, or, for a C3-capable query and an unordered pair, by
+// the linearizations of the query elements
+static int method_dominates(jl_method_t *m, jl_method_t *m2, jl_value_t *query, int c3query) JL_CANSAFEPOINT
+{
+    if (method_morespecific_via_interferences(m, m2))
+        return 1;
+    if (!c3query || method_morespecific_via_interferences(m2, m))
+        return 0;
+    return c3_compare_sigs(query, m, m2) > 0;
+}
+
+// whether `t` (a signature or an element of one) mentions a type declaring
+// several supertypes, at which methods unordered by specificity may still be
+// ordered by the C3 tie-break
+static int type_mentions_join(jl_value_t *t) JL_NOTSAFEPOINT
+{
+    if (jl_is_unionall(t))
+        t = jl_unwrap_unionall(t);
+    if (jl_is_typevar(t))
+        return type_mentions_join(((jl_tvar_t*)t)->ub);
+    if (jl_is_uniontype(t))
+        return type_mentions_join(((jl_uniontype_t*)t)->a) || type_mentions_join(((jl_uniontype_t*)t)->b);
+    if (jl_is_vararg(t))
+        return type_mentions_join(jl_unwrap_vararg(t));
+    if (!jl_is_datatype(t))
+        return 0;
+    jl_datatype_t *dt = (jl_datatype_t*)t;
+    if (dt->name->has_multiple_supers)
+        return 1;
+    if (dt->name == jl_tuple_typename) {
+        size_t i, n = jl_nparams(dt);
+        for (i = 0; i < n; i++)
+            if (type_mentions_join(jl_tparam(dt, i)))
+                return 1;
+    }
+    return 0;
+}
+
+
 void jl_method_table_activate(jl_typemap_entry_t *newentry)
 {
     JL_TIMING(ADD_METHOD, ADD_METHOD);
@@ -3493,6 +3655,519 @@ JL_DLLEXPORT void jl_method_table_insert(jl_methtable_t *mt, jl_method_t *method
     jl_atomic_store_release(&jl_world_counter, world);
     JL_UNLOCK(&world_counter_lock);
     JL_GC_POP();
+}
+
+// --- Defining a type with several supertypes is a dispatch event ---
+//
+// Two abstract types that are not ancestors of each other are disjoint until
+// a join `struct J <: (A, B)` is defined: methods and specializations that
+// mention `A` and `B` at the same argument position did not intersect, so no
+// interference was recorded between such methods, and compiled code
+// dispatched as if the other method could never apply. Defining the join
+// therefore updates the method table the way inserting a method does: it
+// records the interferences of every newly intersecting pair of methods
+// (clearing their "only match" bits), invalidates the callers of every
+// specialization whose set of applicable methods changed, drops the
+// missing-method edges and the widened cache entries that now intersect a
+// further method, and bumps the world.
+//
+// Only the typenames of the newly joinable pairs can take part: a signature
+// element that is (or contains, in a union or a typevar bound) one of them.
+// Every such mention is indexed by typename, then paired with the methods
+// mentioning the pair's other typename at the same position of the same
+// function, and only pairs whose intersection was empty before the join and
+// is not empty after it are acted on.
+
+enum { JOIN_METHOD, JOIN_MI, JOIN_MISSING, JOIN_CACHE };
+
+typedef struct {
+    jl_value_t *obj;      // the method, method instance, missing-edge signature or cache entry
+    jl_typename_t *fname; // typename of the function argument (NULL if not a nominal type)
+    jl_typename_t *tn;    // JOIN_MISSING: the key of its backedge table
+    size_t index;         // JOIN_MISSING: its slot in that table
+    uint16_t pos;         // argument position of the mention (0 is the function)
+    uint8_t va;           // the mention is inside a trailing Vararg (covers every position >= pos)
+    uint8_t kind;
+    uint8_t done;
+} join_mention_t;
+
+typedef struct {
+    jl_typename_t *tn;
+    arraylist_t mentions; // join_mention_t*
+} join_name_t;
+
+struct join_scan_env {
+    size_t nnames;
+    join_name_t *names;   // the typenames of the newly joinable pairs
+    size_t nmentions;
+    jl_array_t *roots;    // keeps every mentioned object reachable while the event runs
+    size_t max_world;     // the world before the join
+};
+
+static void join_add_mention(struct join_scan_env *env, size_t ni, join_mention_t *proto) JL_NOTSAFEPOINT
+{
+    join_mention_t *m = (join_mention_t*)malloc_s(sizeof(join_mention_t));
+    *m = *proto;
+    arraylist_push(&env->names[ni].mentions, m);
+    env->nmentions++;
+}
+
+// record `proto` under every new-pair typename that `t` mentions. A
+// specialization is recorded under every pair typename its element admits
+// (the element's typename is the pair typename or an ancestor of it): its
+// signature may have been widened from the call signatures it serves
+// (`k(::Any)` specialized at `Tuple{k, Any}` for calls at `Tuple{k, A}`),
+// and, as for a method definition, all of its callers are then invalidated.
+static void join_note_type(struct join_scan_env *env, jl_value_t *t, join_mention_t *proto) JL_NOTSAFEPOINT
+{
+    if (jl_is_unionall(t))
+        t = jl_unwrap_unionall(t);
+    if (jl_is_typevar(t)) {
+        join_note_type(env, ((jl_tvar_t*)t)->ub, proto);
+        return;
+    }
+    if (jl_is_uniontype(t)) {
+        join_note_type(env, ((jl_uniontype_t*)t)->a, proto);
+        join_note_type(env, ((jl_uniontype_t*)t)->b, proto);
+        return;
+    }
+    if (!jl_is_datatype(t))
+        return;
+    jl_typename_t *tn = ((jl_datatype_t*)t)->name;
+    for (size_t i = 0; i < env->nnames; i++) {
+        jl_typename_t *pn = env->names[i].tn;
+        if (pn == tn || (proto->kind == JOIN_MI && jl_typename_is_ancestor(pn, tn)))
+            join_add_mention(env, i, proto);
+    }
+}
+
+// record the mentions of the elements of the tuple type `sig`
+static void join_scan_sig(struct join_scan_env *env, jl_value_t *sig, jl_value_t *obj, int kind, jl_typename_t *tn, size_t index) JL_NOTSAFEPOINT
+{
+    jl_value_t *unw = jl_unwrap_unionall(sig);
+    if (!jl_is_datatype(unw) || ((jl_datatype_t*)unw)->name != jl_tuple_typename)
+        return;
+    size_t i, n = jl_nparams(unw);
+    join_mention_t proto = {obj, jl_nth_argument_datatypename(unw, 1), tn, index, 0, 0, (uint8_t)kind, 0};
+    for (i = 0; i < n && i < UINT16_MAX; i++) {
+        jl_value_t *t = jl_tparam(unw, i);
+        proto.pos = (uint16_t)i;
+        proto.va = 0;
+        if (jl_is_vararg(t)) {
+            t = jl_unwrap_vararg(t);
+            proto.va = 1;
+        }
+        join_note_type(env, t, &proto);
+    }
+}
+
+static void join_scan_mi(struct join_scan_env *env, jl_method_instance_t *mi) JL_CANSAFEPOINT
+{
+    jl_value_t *unw = jl_unwrap_unionall(mi->specTypes);
+    if (jl_is_datatype(unw) && ((jl_datatype_t*)unw)->isdispatchtuple)
+        return; // concrete: an existing type gains no ancestor from the join
+    size_t n0 = env->nmentions;
+    join_scan_sig(env, mi->specTypes, (jl_value_t*)mi, JOIN_MI, NULL, 0);
+    if (env->nmentions != n0)
+        jl_array_ptr_1d_push(env->roots, (jl_value_t*)mi);
+}
+
+static int join_scan_method(jl_typemap_entry_t *entry, void *closure) JL_CANSAFEPOINT
+{
+    struct join_scan_env *env = (struct join_scan_env*)closure;
+    if (jl_atomic_load_relaxed(&entry->min_world) > env->max_world ||
+        jl_atomic_load_relaxed(&entry->max_world) < env->max_world)
+        return 1; // not active before the join (deleted, or not yet activated from an image)
+    jl_method_t *m = entry->func.method;
+    size_t n0 = env->nmentions;
+    join_scan_sig(env, (jl_value_t*)m->sig, (jl_value_t*)m, JOIN_METHOD, NULL, 0);
+    if (env->nmentions != n0)
+        jl_array_ptr_1d_push(env->roots, (jl_value_t*)m);
+    // its specializations may mention a new-pair type that the method does not (`k(::Any)` at `Tuple{k, A}`)
+    jl_value_t *specializations = jl_atomic_load_relaxed(&m->specializations);
+    _Atomic(jl_method_instance_t*) *data;
+    size_t i, l;
+    if (jl_is_svec(specializations)) {
+        data = (_Atomic(jl_method_instance_t*)*)jl_svec_data(specializations);
+        l = jl_svec_len(specializations);
+    }
+    else {
+        data = (_Atomic(jl_method_instance_t*)*) &specializations;
+        l = 1;
+    }
+    for (i = 0; i < l; i++) {
+        jl_method_instance_t *mi = jl_atomic_load_relaxed(&data[i]);
+        if ((jl_value_t*)mi == jl_nothing)
+            continue;
+        join_scan_mi(env, mi);
+    }
+    jl_method_instance_t *unspec = jl_atomic_load_relaxed(&m->unspecialized);
+    if (unspec)
+        join_scan_mi(env, unspec);
+    return 1;
+}
+
+static void join_scan_missing(struct join_scan_env *env) JL_CANSAFEPOINT
+{
+    jl_genericmemory_t *allbackedges = jl_method_table->backedges;
+    for (size_t i = 0, n = allbackedges->length; i < n; i += 2) {
+        jl_value_t *tn = jl_genericmemory_ptr_ref(allbackedges, i);
+        jl_genericmemory_t *table = (jl_genericmemory_t*)jl_genericmemory_ptr_ref(allbackedges, i + 1);
+        if (tn == NULL || tn == jl_nothing || table == NULL)
+            continue;
+        _Atomic(jl_value_t*) *tab = (_Atomic(jl_value_t*)*)table->ptr;
+        for (size_t j = 0, na = table->length; j < na; j += 2) {
+            jl_value_t *sig = jl_atomic_load_relaxed(&tab[j]);
+            jl_value_t *callers = jl_atomic_load_relaxed(&tab[j + 1]);
+            if (callers == NULL || sig == NULL || sig == jl_nothing)
+                continue;
+            size_t n0 = env->nmentions;
+            join_scan_sig(env, sig, sig, JOIN_MISSING, (jl_typename_t*)tn, j);
+            if (env->nmentions != n0)
+                jl_array_ptr_1d_push(env->roots, sig);
+        }
+    }
+}
+
+static int join_scan_cache(jl_typemap_entry_t *entry, void *closure) JL_CANSAFEPOINT
+{
+    struct join_scan_env *env = (struct join_scan_env*)closure;
+    if (jl_atomic_load_relaxed(&entry->max_world) != ~(size_t)0)
+        return 1;
+    jl_value_t *sig = (jl_value_t*)entry->sig;
+    jl_value_t *unw = jl_unwrap_unionall(sig);
+    if (jl_is_datatype(unw) && ((jl_datatype_t*)unw)->isdispatchtuple)
+        return 1;
+    size_t n0 = env->nmentions;
+    join_scan_sig(env, sig, (jl_value_t*)entry, JOIN_CACHE, NULL, 0);
+    if (env->nmentions != n0)
+        jl_array_ptr_1d_push(env->roots, (jl_value_t*)entry);
+    return 1;
+}
+
+static int join_positions_overlap(join_mention_t *a, join_mention_t *b) JL_NOTSAFEPOINT
+{
+    if (a->pos == b->pos)
+        return 1;
+    if (a->va && b->pos >= a->pos)
+        return 1;
+    if (b->va && a->pos >= b->pos)
+        return 1;
+    return 0;
+}
+
+static jl_value_t *join_mention_sig(join_mention_t *m) JL_NOTSAFEPOINT JL_GLOBALLY_ROOTED
+{
+    switch (m->kind) {
+    case JOIN_METHOD: return (jl_value_t*)((jl_method_t*)m->obj)->sig;
+    case JOIN_MI: return ((jl_method_instance_t*)m->obj)->specTypes;
+    case JOIN_MISSING: return m->obj;
+    default: return (jl_value_t*)((jl_typemap_entry_t*)m->obj)->sig;
+    }
+}
+
+// the candidate pairs (mention of `a`, method mentioning `b`) at overlapping
+// positions of the same function; method-method pairs are collected once
+static void join_collect_candidates(struct join_scan_env *env, size_t ia, size_t ib, int methods_too, arraylist_t *candidates) JL_NOTSAFEPOINT
+{
+    arraylist_t *la = &env->names[ia].mentions, *lb = &env->names[ib].mentions;
+    for (size_t j = 0; j < lb->len; j++) {
+        join_mention_t *mb = (join_mention_t*)lb->items[j];
+        if (mb->kind != JOIN_METHOD)
+            continue;
+        for (size_t i = 0; i < la->len; i++) {
+            join_mention_t *ma = (join_mention_t*)la->items[i];
+            if (ma->obj == mb->obj)
+                continue;
+            if (ma->kind == JOIN_METHOD && !methods_too)
+                continue;
+            if (!join_positions_overlap(ma, mb))
+                continue;
+            if (ma->fname != NULL && mb->fname != NULL && ma->fname != mb->fname)
+                continue;
+            arraylist_push(candidates, ma);
+            arraylist_push(candidates, mb);
+        }
+    }
+}
+
+static void join_add_interference(jl_method_t *m, jl_method_t *other) JL_CANSAFEPOINT
+{
+    // `other` is not less specific than `m`: `m` is no longer the only match for its signature
+    jl_genericmemory_t *interferences = jl_atomic_load_relaxed(&m->interferences);
+    if (!has_key(interferences, (jl_value_t*)other)) {
+        ssize_t idx;
+        interferences = jl_idset_put_key(interferences, (jl_value_t*)other, &idx);
+        jl_gc_write_atomic(m, m->interferences, jl_genericmemory_t, interferences, release);
+    }
+    int dispatch = jl_atomic_load_relaxed(&m->dispatch_status);
+    jl_atomic_store_relaxed(&m->dispatch_status, dispatch & ~METHOD_SIG_LATEST_ONLY);
+}
+
+struct join_flush_env {
+    htable_t shadowed;
+    size_t max_world;
+};
+
+static int join_flush_mt_cache(jl_typemap_entry_t *oldentry, void *closure0) JL_NOTSAFEPOINT
+{
+    struct join_flush_env *env = (struct join_flush_env*)closure0;
+    if (jl_atomic_load_relaxed(&oldentry->max_world) == ~(size_t)0 &&
+        ptrhash_has(&env->shadowed, (void*)oldentry->func.linfo))
+        jl_atomic_store_relaxed(&oldentry->max_world, env->max_world);
+    return 1;
+}
+
+// Register the join typename `J` and update the method table for the pairs
+// of abstract types it newly joins; `max_world` is the last world before the
+// join. Returns whether any dispatch-relevant state changed (the caller then
+// publishes a new world). Called with `world_counter_lock` held.
+int jl_activate_joins_locked(jl_typename_t *J, size_t max_world)
+{
+    jl_svec_t *parents = J->parents;
+    if (parents == NULL || J->linearization == NULL)
+        return 0;
+    if (jl_method_table == NULL) {
+        jl_register_join_typename(J);
+        return 0;
+    }
+    // 1. the newly joinable pairs: ancestors of different parents that are
+    //    not related and have no join yet
+    size_t np = jl_svec_len(parents), i, j, k, l;
+    arraylist_t *ancestors = (arraylist_t*)malloc_s(np * sizeof(arraylist_t));
+    for (i = 0; i < np; i++) {
+        jl_datatype_t *p = (jl_datatype_t*)jl_unwrap_unionall(jl_svecref(parents, i));
+        jl_svec_t *lin = jl_typename_linearization(p->name);
+        arraylist_new(&ancestors[i], 0);
+        // copy out the typenames (they are rooted by their wrappers) before anything can allocate
+        for (k = 0; lin != NULL && k < jl_svec_len(lin); k++) {
+            jl_typename_t *tn = (jl_typename_t*)jl_svecref(lin, k);
+            if (tn != jl_any_type->name)
+                arraylist_push(&ancestors[i], tn);
+        }
+    }
+    arraylist_t pairs;
+    arraylist_new(&pairs, 0);
+    for (i = 0; i < np; i++) {
+        for (j = i + 1; j < np; j++) {
+            for (k = 0; k < ancestors[i].len; k++) {
+                jl_typename_t *a = (jl_typename_t*)ancestors[i].items[k];
+                for (l = 0; l < ancestors[j].len; l++) {
+                    jl_typename_t *b = (jl_typename_t*)ancestors[j].items[l];
+                    if (a == b || jl_typename_is_ancestor(a, b) || jl_typename_is_ancestor(b, a))
+                        continue;
+                    int seen = 0;
+                    for (size_t q = 0; q < pairs.len && !seen; q += 2)
+                        seen = (pairs.items[q] == a && pairs.items[q + 1] == b) ||
+                               (pairs.items[q] == b && pairs.items[q + 1] == a);
+                    if (seen)
+                        continue;
+                    if (jl_typename_joins(a, b) != NULL)
+                        continue; // already joined by an earlier definition
+                    arraylist_push(&pairs, a);
+                    arraylist_push(&pairs, b);
+                }
+            }
+        }
+    }
+    for (i = 0; i < np; i++)
+        arraylist_free(&ancestors[i]);
+    free(ancestors);
+    if (pairs.len == 0) {
+        arraylist_free(&pairs);
+        jl_register_join_typename(J);
+        return 0;
+    }
+    // 2. index every mention of the pair typenames: methods and their
+    //    specializations, missing-method edges, widened cache entries
+    struct join_scan_env env;
+    env.nnames = 0;
+    env.names = (join_name_t*)malloc_s(pairs.len * sizeof(join_name_t));
+    env.nmentions = 0;
+    env.roots = NULL;
+    env.max_world = max_world;
+    for (i = 0; i < pairs.len; i++) {
+        jl_typename_t *tn = (jl_typename_t*)pairs.items[i];
+        for (k = 0; k < env.nnames && env.names[k].tn != tn; k++) ;
+        if (k == env.nnames) {
+            env.names[k].tn = tn;
+            arraylist_new(&env.names[k].mentions, 0);
+            env.nnames++;
+        }
+    }
+    jl_array_t *oldmi = NULL;
+    jl_value_t *isect = NULL;
+    jl_value_t *loctag = NULL;
+    JL_GC_PUSH4(&env.roots, &oldmi, &isect, &loctag);
+    env.roots = jl_alloc_vec_any(0);
+    oldmi = jl_alloc_vec_any(0);
+    jl_methtable_t *mt = jl_method_table;
+    jl_methcache_t *mc = mt->cache;
+    JL_LOCK(&mc->writelock); // no edge or cache insertion while the tables are indexed
+    jl_typemap_visitor(jl_atomic_load_relaxed(&mt->defs), join_scan_method, &env);
+    join_scan_missing(&env);
+    jl_typemap_visitor(jl_atomic_load_relaxed(&mc->cache), join_scan_cache, &env);
+    // 3. the candidates whose intersection is empty before the join
+    arraylist_t candidates;
+    arraylist_new(&candidates, 0);
+    for (i = 0; i < pairs.len; i += 2) {
+        size_t ia, ib;
+        for (ia = 0; env.names[ia].tn != (jl_typename_t*)pairs.items[i]; ia++) ;
+        for (ib = 0; env.names[ib].tn != (jl_typename_t*)pairs.items[i + 1]; ib++) ;
+        join_collect_candidates(&env, ia, ib, 1, &candidates);
+        join_collect_candidates(&env, ib, ia, 0, &candidates);
+    }
+    //    (a specialization is kept regardless: its widened signature may
+    //    intersect the method already while the calls it serves did not)
+    size_t nkept = 0;
+    for (i = 0; i < candidates.len; i += 2) {
+        join_mention_t *x = (join_mention_t*)candidates.items[i];
+        join_mention_t *mb = (join_mention_t*)candidates.items[i + 1];
+        jl_value_t *xsig = join_mention_sig(x);
+        jl_value_t *msig = join_mention_sig(mb);
+        JL_GC_PROMISE_ROOTED(xsig); // reachable from env.roots
+        JL_GC_PROMISE_ROOTED(msig);
+        if (x->kind == JOIN_MI || jl_has_empty_intersection(xsig, msig)) {
+            candidates.items[nkept++] = x;
+            candidates.items[nkept++] = mb;
+        }
+    }
+    candidates.len = nkept;
+    // 4. the join exists from here on: intersections through it are not empty
+    jl_register_join_typename(J);
+    int changed = 0;
+    // 5. act on the pairs that now intersect: first the interferences and the
+    //    specializations (their callers), then the edges and cache entries
+    for (i = 0; i < candidates.len; i += 2) {
+        join_mention_t *x = (join_mention_t*)candidates.items[i];
+        join_mention_t *mb = (join_mention_t*)candidates.items[i + 1];
+        if (x->kind != JOIN_METHOD && x->kind != JOIN_MI)
+            continue;
+        if (x->done)
+            continue;
+        if (x->kind == JOIN_MI && ((jl_method_instance_t*)x->obj)->def.method == (jl_method_t*)mb->obj)
+            continue;
+        jl_value_t *xsig = join_mention_sig(x);
+        jl_method_t *m2 = (jl_method_t*)mb->obj;
+        JL_GC_PROMISE_ROOTED(xsig); // reachable from env.roots
+        JL_GC_PROMISE_ROOTED(m2);
+        isect = jl_type_intersection(xsig, (jl_value_t*)m2->sig);
+        if (isect == jl_bottom_type)
+            continue;
+        changed = 1;
+        if (x->kind == JOIN_METHOD) {
+            jl_method_t *m = (jl_method_t*)x->obj;
+            JL_GC_PROMISE_ROOTED(m);
+            if (!jl_type_morespecific((jl_value_t*)m->sig, (jl_value_t*)m2->sig))
+                join_add_interference(m, m2);
+            if (!jl_type_morespecific((jl_value_t*)m2->sig, (jl_value_t*)m->sig))
+                join_add_interference(m2, m);
+        }
+        else {
+            // the applicable methods of this specialization changed: its
+            // callers decided dispatch under the old set
+            jl_method_instance_t *mi = (jl_method_instance_t*)x->obj;
+            JL_GC_PROMISE_ROOTED(mi);
+            x->done = 1;
+            int invalidated = _invalidate_dispatch_backedges(mi, isect, m2, NULL, 0, 1, 0, max_world, NULL);
+            jl_atomic_store_relaxed(&mi->dispatch_status, 0);
+            jl_array_ptr_1d_push(oldmi, (jl_value_t*)mi);
+            if (_jl_debug_method_invalidation && invalidated) {
+                jl_array_ptr_1d_push(_jl_debug_method_invalidation, (jl_value_t*)mi);
+                loctag = jl_cstr_to_string("jl_datatype_activate_joins");
+                jl_array_ptr_1d_push(_jl_debug_method_invalidation, loctag);
+            }
+        }
+        isect = NULL;
+    }
+    for (i = 0; i < candidates.len; i += 2) {
+        join_mention_t *x = (join_mention_t*)candidates.items[i];
+        join_mention_t *mb = (join_mention_t*)candidates.items[i + 1];
+        if (x->kind != JOIN_MISSING && x->kind != JOIN_CACHE)
+            continue;
+        if (x->done)
+            continue;
+        jl_value_t *xsig = join_mention_sig(x);
+        jl_method_t *m2 = (jl_method_t*)mb->obj;
+        JL_GC_PROMISE_ROOTED(xsig); // reachable from env.roots
+        JL_GC_PROMISE_ROOTED(m2);
+        if (jl_has_empty_intersection(xsig, (jl_value_t*)m2->sig))
+            continue;
+        x->done = 1;
+        changed = 1;
+        if (x->kind == JOIN_CACHE) {
+            // a widened cache entry: a call with an argument of the join type
+            // would find it, but a further method applies now
+            jl_typemap_entry_t *entry = (jl_typemap_entry_t*)x->obj;
+            JL_GC_PROMISE_ROOTED(entry);
+            jl_atomic_store_relaxed(&entry->max_world, max_world);
+            continue;
+        }
+        // a missing-method edge: its callers saw an incomplete set of methods
+        jl_genericmemory_t *table = (jl_genericmemory_t*)jl_eqtable_get(mt->backedges, (jl_value_t*)x->tn, NULL);
+        if (table == NULL || x->index + 1 >= table->length)
+            continue;
+        _Atomic(jl_value_t*) *tab = (_Atomic(jl_value_t*)*)table->ptr;
+        if (jl_atomic_load_relaxed(&tab[x->index]) != xsig)
+            continue;
+        jl_value_t *callers = jl_atomic_load_relaxed(&tab[x->index + 1]);
+        if (callers == NULL)
+            continue;
+        JL_GC_PROMISE_ROOTED(callers); // reachable from the table until cleared below
+        size_t nc = jl_array_nrows(callers);
+        for (j = 0; j < nc; j++) {
+            jl_code_instance_t *backedge = (jl_code_instance_t*)jl_array_ptr_ref(callers, j);
+            JL_GC_PROMISE_ROOTED(backedge);
+            invalidate_code_instance(backedge, max_world, 0);
+            if (_jl_debug_method_invalidation)
+                jl_array_ptr_1d_push(_jl_debug_method_invalidation, xsig);
+        }
+        // remove this entry (cf. `jl_eqtable_pop`)
+        jl_gc_write_atomic(table, tab[x->index], jl_value_t, jl_nothing, relaxed);
+        jl_gc_write_atomic(table, tab[x->index + 1], jl_value_t, NULL, relaxed);
+    }
+    // 6. drop the cache entries of the specializations whose callers were invalidated
+    if (jl_array_nrows(oldmi)) {
+        struct join_flush_env flush;
+        htable_new(&flush.shadowed, jl_array_nrows(oldmi));
+        flush.max_world = max_world;
+        for (i = 0; i < jl_array_nrows(oldmi); i++)
+            ptrhash_put(&flush.shadowed, (void*)jl_array_ptr_ref(oldmi, i), (void*)1);
+        jl_typemap_visitor(jl_atomic_load_relaxed(&mc->cache), join_flush_mt_cache, &flush);
+        htable_free(&flush.shadowed);
+    }
+    JL_UNLOCK(&mc->writelock);
+    if (changed && _jl_debug_method_invalidation) {
+        jl_array_ptr_1d_push(_jl_debug_method_invalidation, J->wrapper);
+        loctag = jl_cstr_to_string("jl_datatype_activate_joins");
+        jl_array_ptr_1d_push(_jl_debug_method_invalidation, loctag);
+    }
+    JL_GC_POP();
+    arraylist_free(&candidates);
+    for (i = 0; i < env.nnames; i++) {
+        for (k = 0; k < env.names[i].mentions.len; k++)
+            free(env.names[i].mentions.items[k]);
+        arraylist_free(&env.names[i].mentions);
+    }
+    free(env.names);
+    arraylist_free(&pairs);
+    return changed;
+}
+
+// The definition of a type with several supertypes was kept: register its
+// join and update dispatch for the pairs of types it newly joins, in a new world.
+JL_DLLEXPORT void jl_datatype_activate_joins(jl_typename_t *J)
+{
+    JL_LOCK(&world_counter_lock);
+    if (!jl_atomic_load_relaxed(&allow_new_worlds)) {
+        jl_register_join_typename(J); // the type exists: keep intersections right
+        JL_UNLOCK(&world_counter_lock);
+        jl_error("Definitions of types with several supertypes have been disabled via a call to disable_new_worlds.");
+    }
+    size_t world = jl_atomic_load_relaxed(&jl_world_counter);
+    if (jl_activate_joins_locked(J, world))
+        jl_atomic_store_release(&jl_world_counter, world + 1);
+    JL_UNLOCK(&world_counter_lock);
 }
 
 static void JL_NORETURN jl_method_error_bare(jl_value_t *f, jl_value_t *args, size_t world) JL_CANSAFEPOINT
@@ -5560,6 +6235,9 @@ static jl_value_t *ml_matches(jl_methtable_t *mt, jl_methcache_t *mc,
         // among the fully-covering methods, since we can do this in O(n^2)
         // time, and the rest is O(n^3)
         //   - first find a candidate for the best of these method results
+        //     (for a query at a type with several supertypes, fully-covering
+        //     methods unordered by specificity may be ordered by the C3 tie-break)
+        int c3query = c3_query_capable((jl_value_t*)type);
         for (i = 0; i < len; i++) {
             jl_method_match_t *matc = (jl_method_match_t*)jl_array_ptr_ref(env.t, i);
             if (matc->fully_covers == FULLY_COVERS) {
@@ -5571,7 +6249,7 @@ static jl_value_t *ml_matches(jl_methtable_t *mt, jl_methcache_t *mc,
                     jl_method_match_t *matc2 = (jl_method_match_t*)jl_array_ptr_ref(env.t, j);
                     if (matc2->fully_covers == FULLY_COVERS) {
                         jl_method_t *m2 = matc2->method;
-                        if (!method_morespecific_via_interferences(m, m2))
+                        if (!method_dominates(m, m2, (jl_value_t*)type, c3query))
                             break;
                     }
                 }

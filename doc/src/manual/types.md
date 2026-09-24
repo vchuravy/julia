@@ -378,7 +378,8 @@ The rules are:
   * Two abstract types that are not subtypes of each other are no longer disjoint once a type
     declares both as supertypes: `typeintersect(Iterable, Printable)` is `Both` above, and a
     method `f(::Iterable)` and a method `f(::Printable)` are both applicable to a `Both`. The
-    linearization decides between such methods: see [Methods](@ref).
+    linearization decides between such methods: see
+    [Methods on several supertypes](@ref man-multiple-supertypes-dispatch).
 
 ## Primitive Types
 

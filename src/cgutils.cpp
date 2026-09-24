@@ -2188,8 +2188,15 @@ static std::pair<Value*, bool> emit_isa(jl_codectx_t &ctx, const jl_cgval_t &x, 
         known_isa = true;
     } else {
         intersected_type = jl_type_intersection(x.typ, type);
-        if (intersected_type == (jl_value_t*)jl_bottom_type)
-            known_isa = false;
+        if (intersected_type == (jl_value_t*)jl_bottom_type) {
+            // an empty intersection of two abstract types may be filled by a
+            // type declaring both as supertypes later, so only fold it when
+            // no type definition can change it
+            if (jl_disjointness_stable(x.typ, type))
+                known_isa = false;
+            else
+                intersected_type = type;
+        }
     }
     if (is_typeofbottom_typealias(intersected_type))
         intersected_type = (jl_value_t*)jl_typeofbottom_type; // swap abstract Type{Union{}} for concrete typeof(Union{})

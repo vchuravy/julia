@@ -511,3 +511,76 @@ let RU = Compiler.ReinferUtils
     @test b.partitions.min_world <= Base.get_require_world()
     @test !RU.binding_changed_since_require_world(b, Base.get_world_counter())
 end
+
+# Types with several supertypes
+# -----------------------------
+# Defining `struct J <: (A, B)` joins two previously disjoint abstract types.
+# Inference must not fold what a later join can undo (`isa`, `===`, `<:` on
+# two open abstract types), and the definition must invalidate code that
+# decided dispatch under the old disjointness.
+module JoinInvalidation
+abstract type A end
+abstract type B end
+abstract type C end
+abstract type D end
+k(::Any) = :any
+k(::B) = :b
+caller(x::A) = k(x)
+isb(x::A) = x isa B
+egal(x::A, y::B) = x === y
+sub(::Type{T}) where {T<:A} = T <: B
+assert_b(x::A) = (x::B; :b)
+struct AOnly <: A end
+end
+
+let interp = InvalidationTester()
+    M = JoinInvalidation
+    @test Base.infer_return_type(M.caller, (M.A,); interp) === Symbol
+    @test Base.infer_return_type(M.isb, (M.A,); interp) === Bool
+    @test Base.infer_return_type(M.egal, (M.A, M.B); interp) === Bool
+    @test Base.infer_return_type(M.sub, (Type{<:M.A},); interp) === Bool
+    @test Base.infer_return_type(M.assert_b, (M.A,); interp) === Symbol
+    @test M.caller(M.AOnly()) === :any
+    @test !M.isb(M.AOnly())
+    @test_throws TypeError M.assert_b(M.AOnly())
+    mi = Compiler.specialize_method(only(methods(M.caller)), Tuple{typeof(M.caller), M.A}, Core.svec())
+    ci = mi.cache
+    @test ci.owner === InvalidationTesterToken()
+    @test ci.max_world == typemax(UInt)
+    world_before = Base.get_world_counter()
+    @eval M struct J <: (A, B) end
+    @test Base.get_world_counter() > world_before
+    @test world_before <= ci.max_world < Base.get_world_counter()
+    @test M.caller(M.J()) === :b
+    @test M.isb(M.J())
+    @test M.egal(M.J(), M.J())
+    @test M.sub(M.J)
+    @test M.assert_b(M.J()) === :b
+    @test Base.infer_return_type(M.caller, (M.A,); interp) === Symbol
+    @test Base.infer_return_type(M.caller, (M.J,); interp) === Symbol
+end
+
+# stability of an empty intersection under later type definitions
+let M = JoinInvalidation
+    @test Compiler.isdisjoint_stable(Int, Float64)
+    @test Compiler.isdisjoint_stable(Int, M.C)
+    @test Compiler.isdisjoint_stable(Vector{Int}, M.C)
+    @test Compiler.isdisjoint_stable(Type{Int}, M.C)
+    @test Compiler.isdisjoint_stable(Type{M.C}, Type{M.D})
+    @test Compiler.isdisjoint_stable(Tuple{Int}, Tuple{Int, Int})
+    @test Compiler.isdisjoint_stable(Ref{Int}, Ref{Float64})
+    @test Compiler.isdisjoint_stable(Ref{M.C}, Ref{M.D})
+    @test Compiler.isdisjoint_stable(Tuple{M.C, Int}, Tuple{M.D, String})
+    @test Compiler.isdisjoint_stable(Union{M.C, Int}, Float64)
+    @test Compiler.isdisjoint_stable(M.C, Tuple)
+    @test !Compiler.isdisjoint_stable(M.C, M.D)
+    @test !Compiler.isdisjoint_stable(Tuple{M.C, Int}, Tuple{M.D, Int})
+    @test !Compiler.isdisjoint_stable(Union{M.C, Int}, M.D)
+    @test !Compiler.isdisjoint_stable(M.C, Function)
+    @test !Compiler.isdisjoint_stable(M.A, M.B)  # not disjoint any more
+    @test Compiler.typeintersect_bounded(M.C, M.D) === M.D
+    @test Compiler.typeintersect_bounded(Union{M.C, Int}, M.D) === M.D
+    @test Compiler.typeintersect_bounded(M.C, Union{M.D, Int}) === M.D
+    @test Compiler.typeintersect_bounded(Int, M.D) === Union{}
+    @test Compiler.tmeet(Union{M.C, Int}, M.D) === M.D
+end

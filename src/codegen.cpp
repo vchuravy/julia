@@ -4342,7 +4342,7 @@ static Value *emit_f_is(jl_codectx_t &ctx, const jl_cgval_t &arg1, const jl_cgva
         return ctx.builder.CreateICmpEQ(decay_derived(ctx, varg1), decay_derived(ctx, varg2));
     }
 
-    if (jl_type_intersection(rt1, rt2) == (jl_value_t*)jl_bottom_type) // types are disjoint (exhaustive test)
+    if (jl_provably_disjoint(rt1, rt2)) // types are disjoint (exhaustive test), and stay so under later type definitions
         return ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 0);
 
     // can compare any concrete immutable by bits, except for UnionAll

@@ -442,6 +442,18 @@ function showerror_ambiguous(io::IO, meths, f, args::Type)
         end
         println(io)
     end
+    # an argument of a type with several supertypes: the candidates are
+    # unordered by its linearization (they disagree between argument
+    # positions, or differ only in ways the tie-break does not consider)
+    if isa(args, DataType) && args.name === Tuple.name
+        for (i, t) in enumerate(args.parameters)
+            t isa DataType && _has_multiple_supers(t.name) || continue
+            print(io, "\nArgument ", i, " has type `", t, "`, which declares several supertypes; ")
+            print(io, "its linearization (", join(ancestors(t), ", "), ") does not order the candidates consistently. ")
+            println(io, "Reorder the supertypes of `", t.name.name, "`, or define a method for it.")
+            break
+        end
+    end
     nothing
 end
 

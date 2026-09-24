@@ -108,7 +108,7 @@ Note that currently `b` is restricted to being a type
 function tmeet end
 
 function tmeet(::JLTypeLattice, @nospecialize(a::AnyType), @nospecialize(b::AnyType))
-    ti = typeintersect(a, b)
+    ti = typeintersect_bounded(a, b)
     valid_as_lattice(ti, true) || return Bottom
     return ti
 end

@@ -394,7 +394,7 @@ end
     return egal_tfunc(widenlattice(𝕃), x, y)
 end
 @nospecs function egal_tfunc(::JLTypeLattice, x, y)
-    hasintersect(widenconst(x), widenconst(y)) || return Const(false)
+    isdisjoint_stable(widenconst(x), widenconst(y)) && return Const(false)
     return Bool
 end
 add_tfunc(===, 2, 2, egal_tfunc, 1)
@@ -947,7 +947,7 @@ end
             end
             v = widenconst(v)
             isdispatchelem(v) && return Const(false)
-            if !hasintersect(v, t)
+            if isdisjoint_stable(v, t)
                 # similar to `isnotbrokensubtype` check above, `typeintersect(v, t)`
                 # can't be trusted for kind types so we do an extra check here
                 if !iskindtype(v)
@@ -975,7 +975,7 @@ end
                 return Const(true)
             end
         else
-            if isexact_a || (b !== Bottom && !hasintersect(a, b))
+            if isexact_a || (b !== Bottom && isdisjoint_stable(a, b))
                 return Const(false)
             end
         end

@@ -372,6 +372,62 @@ exists, if transiently, until the more specific method is defined.
 In more complex cases, resolving method ambiguities involves a certain
 element of design; this topic is explored further [below](@ref man-method-design-ambiguities).
 
+### [Methods on several supertypes](@id man-multiple-supertypes-dispatch)
+
+A type may declare several abstract supertypes (see [Multiple supertypes](@ref man-multiple-supertypes)).
+Methods defined on two of them are applicable to the same value, and neither is more specific than
+the other, so their specificity alone would leave every such call ambiguous. Instead, a tie between
+methods that both cover the call is resolved by the linearization of the argument type, as in Dylan:
+the method whose signature names the supertype listed first in [`Base.ancestors`](@ref) wins.
+
+```jldoctest multisupersdispatch
+julia> abstract type HGrid end
+
+julia> abstract type VGrid end
+
+julia> orient(::HGrid) = :horizontal;
+
+julia> orient(::VGrid) = :vertical;
+
+julia> struct HV <: (HGrid, VGrid) end
+
+julia> struct VH <: (VGrid, HGrid) end
+
+julia> orient(HV()), orient(VH())
+(:horizontal, :vertical)
+
+julia> Base.ancestors(HV)
+(HGrid, VGrid, Any)
+```
+
+The rule is applied to every argument position: a method is selected when it is preferred at some
+position and never worse at another. When the positions disagree, or when a position cannot be
+decided (the candidates differ only in their type parameters, or the argument is a `Type`), the call
+stays ambiguous and raises a [`MethodError`](@ref) that names the argument and its linearization;
+reordering the supertypes, or defining a method for the type itself, resolves it:
+
+```jldoctest multisupersdispatch
+julia> merge2(::HGrid, ::VGrid) = 1;
+
+julia> merge2(::VGrid, ::HGrid) = 2;
+
+julia> merge2(HV(), VH())
+1
+
+julia> merge2(HV(), HV())
+ERROR: MethodError: merge2(::HV, ::HV) is ambiguous.
+[...]
+```
+
+Static specificity still decides whenever it can: a method on `HV` itself, or on a nearer supertype,
+is preferred over both. [`Base.isambiguous`](@ref) and [`Test.detect_ambiguities`](@ref) apply the same
+rule, so `orient` is not reported as ambiguous while `merge2` is.
+
+Defining a type with several supertypes changes which methods apply to values of its supertypes, so
+it counts as a change to the method table: code compiled before the definition that decided
+dispatch, or tested `isa`, `===` or `<:`, between the two supertypes is recompiled, exactly as after
+a method definition.
+
 ## Parametric Methods
 
 Method definitions can optionally have type parameters qualifying the signature:

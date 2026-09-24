@@ -113,6 +113,34 @@ end
 # return an upper-bound on type `a` with type `b` removed
 # and also any contents that are not valid type tags on any objects
 # such that `return <: a` && `Union{return, b} == Union{a, b}`
+# Whether `typeintersect(a, b) === Union{}` and no later type definition can
+# change that. A type declaring several supertypes (`struct J <: (A, B)`) joins
+# two previously disjoint abstract types, so an inferred fact that relies on
+# their disjointness (a folded `isa`, `===` or `<:`, a dead branch) may only be
+# recorded when no definition can undo it (see `jl_provably_disjoint`).
+isdisjoint_stable(@nospecialize(a), @nospecialize(b)) =
+    ccall(:jl_provably_disjoint, Cint, (Any, Any), a, b) != 0
+# the stability alone, for an intersection already known to be empty
+disjointness_stable(@nospecialize(a), @nospecialize(b)) =
+    ccall(:jl_disjointness_stable, Cint, (Any, Any), a, b) != 0
+
+# `typeintersect(a, b)`, or, when that is empty only until a later type joins
+# `a` and `b`, a sound upper bound of the intersection: the parts of `b` that
+# such a type could join
+function typeintersect_bounded(@nospecialize(a), @nospecialize(b))
+    ti = typeintersect(a, b)
+    ti === Bottom || return ti
+    return unstable_meet(a, b)
+end
+function unstable_meet(@nospecialize(a), @nospecialize(b))
+    if isa(b, Union)
+        return Union{unstable_meet(a, b.a), unstable_meet(a, b.b)}
+    elseif isa(a, Union)
+        return Union{unstable_meet(a.a, b), unstable_meet(a.b, b)}
+    end
+    return disjointness_stable(a, b) ? Bottom : b
+end
+
 function typesubtract(@nospecialize(a), @nospecialize(b), max_union_splitting::Int)
     if a <: b && isnotbrokensubtype(a, b)
         return Bottom

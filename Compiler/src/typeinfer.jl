@@ -2289,7 +2289,7 @@ verify_typeinf_trim(codeinfos::Vector{Any}, onlywarn::Bool) = Core._call_in_worl
 
 function _return_type_opaque_closure(@nospecialize(oc::Core.OpaqueClosure), t::DataType)
     ocargt, ocrt = typeof(oc).parameters
-    hasintersect(t, ocargt) || return Union{}
+    isdisjoint_stable(t, ocargt) && return Union{}
     return ocrt
 end
 
