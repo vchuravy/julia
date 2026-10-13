@@ -310,3 +310,19 @@ end
     end
     @test all(==(3), x)
 end
+
+pf_world_g() = 1
+function pf_world_h()
+    r = zeros(Int, 64)
+    Threads.parallel_for(i -> (r[i] = pf_world_g()), 1:64; nchunks = min(64, 8NT))
+    return r
+end
+
+@testset "parallel_for world age" begin
+    @test all(==(1), pf_world_h())
+    w = Base.get_world_counter()
+    @eval pf_world_g() = 2
+    # all chunks run in the caller's world, as the tasks of `@threads` do
+    @test all(==(1), Base.invoke_in_world(w, pf_world_h))
+    @test all(==(2), pf_world_h())
+end

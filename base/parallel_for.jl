@@ -15,11 +15,12 @@
 #   number of chunks, the dynamic scope) under a sequence lock, then writes the region's
 #   generation number into the work slot of each worker it needs (one cache line per
 #   worker). Spinning workers see the new generation, parked ones are `schedule`d.
-# - Every participant first claims its "home" chunk and then steals unclaimed chunks.
-#   The dispatcher always participates and claims chunk 1. A chunk is claimed with a CAS
-#   on a per-chunk cache line, so a chunk runs exactly once, and a worker that cannot run
-#   (its thread is busy with another task, or it is still waking up) does not delay the
-#   region: its chunk is taken by another participant.
+# - Every participant first claims its "home" chunk. The dispatcher always participates,
+#   claims chunk 1 and then steals every chunk that is still unclaimed; workers only take
+#   the chunks beyond the first `nworkers` (which have no home participant). A chunk is
+#   claimed with a CAS on a per-chunk cache line, so a chunk runs exactly once, and a
+#   worker that cannot run (its thread is busy with another task, or it is still waking
+#   up) does not delay the region by more than one chunk: the dispatcher takes its chunk.
 # - The dispatcher waits until every chunk has finished (spinning, then parking), and
 #   then throws a `CompositeException` of the captured exceptions, if any.
 #
@@ -72,6 +73,7 @@ mutable struct ParkedPool
     @atomic rng2::UInt64
     @atomic rng3::UInt64
     @atomic rng4::UInt64
+    @atomic world::UInt
 end
 
 # The code of a worker task; also used to recognize a worker (`current_task().code isa ...`)
@@ -181,7 +183,7 @@ function _pf_create_pool()
     pool = ParkedPool(n, tid_offset, maxchunks, spin_ns, Vector{Task}(undef, n), wslots, cslots,
                       Any[nothing for _ in 1:maxchunks],
                       0, 0, 0, C_NULL, nothing, 0, 0, nothing, nothing, 0, 0,
-                      UInt64(0), UInt64(0), UInt64(0), UInt64(0), UInt64(0))
+                      UInt64(0), UInt64(0), UInt64(0), UInt64(0), UInt64(0), UInt(0))
     # creating the worker tasks must not change the RNG state of the caller
     ct = current_task()
     rng = _pf_rng_get(ct)
@@ -287,14 +289,23 @@ macro _pf_enter_scope(scope, ex)
     Expr(:tryfinally, esc(ex), nothing, esc(scope))
 end
 
-# A worker runs a chunk through the function pointer, in the dispatcher's dynamic scope
+# A worker runs a chunk through the function pointer, in the dispatcher's dynamic scope and
+# world age. A `@cfunction` runs in the latest world, so it is only used when that is the
+# dispatcher's world (the common case); otherwise the chunk is run with `invoke_in_world`.
 struct _PFIndirect
     fptr::Ptr{Cvoid}
     env::Any
     scope::Any
+    world::UInt
 end
 @inline function (r::_PFIndirect)(c::Int)
-    @_pf_enter_scope r.scope ccall(r.fptr, Cvoid, (Any, Int), r.env, c)
+    @_pf_enter_scope r.scope begin
+        if r.world == Base.get_world_counter()
+            ccall(r.fptr, Cvoid, (Any, Int), r.env, c)
+        else
+            Base.invoke_in_world(r.world, _pf_cfun, r.env, c)
+        end
+    end
 end
 
 # Run chunk `c` on the current task with a fresh task-local storage and the chunk's RNG
@@ -358,13 +369,14 @@ function _pf_worker_participate(pool::ParkedPool, g::Int, k::Int)
     n = @atomic :monotonic pool.nchunks
     skip = @atomic :monotonic pool.skip
     scope = @atomic :monotonic pool.scope
+    world = @atomic :monotonic pool.world
     rng = (@atomic(:monotonic, pool.rng0), @atomic(:monotonic, pool.rng1),
            @atomic(:monotonic, pool.rng2), @atomic(:monotonic, pool.rng3),
            @atomic(:monotonic, pool.rng4))
     (@atomic :acquire pool.seq) == 2g || return
     home = k < skip ? k + 1 : k
     home > n && return
-    _pf_participate(pool, _PFIndirect(fptr, env, scope), g, n, home, pool.nworkers + 1, rng)
+    _pf_participate(pool, _PFIndirect(fptr, env, scope, world), g, n, home, pool.nworkers + 1, rng)
     nothing
 end
 
@@ -464,6 +476,7 @@ function _pf_region(pool::ParkedPool, fun::F, n::Int, ct::Task) where {F}
     @atomic :monotonic pool.rng2 = rng[3]
     @atomic :monotonic pool.rng3 = rng[4]
     @atomic :monotonic pool.rng4 = rng[5]
+    @atomic :monotonic pool.world = Base.tls_world_age()
     @atomic :release pool.seq = 2g
     # hand out the work
     for k in 1:pool.nworkers
