@@ -9,6 +9,24 @@ using Random
 
 const NT = Threads.threadpoolsize()
 
+# Before anything else: the first parallel loop starts the worker pool, which must not
+# change the random numbers of the caller.
+@testset "parallel_for RNG of the first loop" begin
+    r1 = zeros(100); r2 = zeros(100)
+    Random.seed!(99)
+    Threads.@threads :parked for i in 1:100
+        r1[i] = rand()
+    end
+    a1 = rand()
+    Random.seed!(99)
+    Threads.@threads :dynamic for i in 1:100
+        r2[i] = rand()
+    end
+    a2 = rand()
+    @test r1 == r2
+    @test a1 == a2
+end
+
 @testset "parallel_for basics (threads = $(NT),$(Threads.threadpoolsize(:interactive)))" begin
     for n in (0, 1, 2, 3, NT - 1, NT, NT + 1, 64, 1000, 10007)
         n < 0 && continue

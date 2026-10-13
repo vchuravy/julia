@@ -53,7 +53,6 @@ mutable struct ParkedPool
     const workers::Vector{Task}
     const wslots::AtomicMemory{Int}
     const cslots::AtomicMemory{Int}
-    const rng::Memory{UInt64}    # 5 words of forked RNG state per chunk
     const errs::Vector{Any}
     @atomic busy::Int
     @atomic seq::Int             # sequence lock for the descriptor: odd = being written
@@ -67,6 +66,12 @@ mutable struct ParkedPool
     @atomic dispatcher::Any
     @atomic waiting::Int
     @atomic nerrs::Int
+    # the dispatcher's RNG state at the start of the region
+    @atomic rng0::UInt64
+    @atomic rng1::UInt64
+    @atomic rng2::UInt64
+    @atomic rng3::UInt64
+    @atomic rng4::UInt64
 end
 
 # The code of a worker task; also used to recognize a worker (`current_task().code isa ...`)
@@ -123,11 +128,27 @@ end
             _pf_rng_mix(ct.rngState3, x, 0xb053a7d7aa238c61, 0x6677f9b93ab0c04d),
             x4)
 end
-@inline function _pf_rng_split!(dst::Memory{UInt64}, o::Int, ct::Task)
-    s = _pf_rng_split(ct)
-    @inbounds for j in 1:5
-        dst[o + j] = s[j]
+# The RNG state `jl_rng_split` gives to the `c`-th child of a task with RNG state `s`.
+# Splitting only advances the LCG in word 5 of the parent, so the `c`-th child can be
+# computed directly by whoever runs chunk `c`, off the dispatcher's critical path.
+@inline function _pf_rng_child(s::NTuple{5, UInt64}, c::Int)
+    x = s[5]
+    for _ in 2:c
+        x = x * 0xd1342543de82ef95 + 1
     end
+    return (_pf_rng_mix(s[1], x, 0x214c146c88e47cb7, 0xaef17502108ef2d9),
+            _pf_rng_mix(s[2], x, 0xa66d8cc21285aafa, 0xf34026eeb86766af),
+            _pf_rng_mix(s[3], x, 0x68c7ef2d7b1a54d4, 0x38fd70ad58dd9fbb),
+            _pf_rng_mix(s[4], x, 0xb053a7d7aa238c61, 0x6677f9b93ab0c04d),
+            x * 0xd1342543de82ef95 + 1)
+end
+# Advance the RNG of `ct` as `n` splits do
+@inline function _pf_rng_advance!(ct::Task, n::Int)
+    x = ct.rngState4
+    for _ in 1:n
+        x = x * 0xd1342543de82ef95 + 1
+    end
+    ct.rngState4 = x
     nothing
 end
 
@@ -137,9 +158,6 @@ end
 @inline function _pf_rng_set!(ct::Task, s::NTuple{5, UInt64})
     ct.rngState0, ct.rngState1, ct.rngState2, ct.rngState3, ct.rngState4 = s
     nothing
-end
-@inline function _pf_rng_set!(ct::Task, m::Memory{UInt64}, o::Int)
-    @inbounds _pf_rng_set!(ct, (m[o + 1], m[o + 2], m[o + 3], m[o + 4], m[o + 5]))
 end
 
 function _pf_create_pool()
@@ -161,14 +179,19 @@ function _pf_create_pool()
         Core.memoryrefset!(Core.memoryrefnew(Core.memoryrefnew(cslots), i, false), 0, :monotonic, false)
     end
     pool = ParkedPool(n, tid_offset, maxchunks, spin_ns, Vector{Task}(undef, n), wslots, cslots,
-                      Memory{UInt64}(undef, 5 * maxchunks), Any[nothing for _ in 1:maxchunks],
-                      0, 0, 0, C_NULL, nothing, 0, 0, nothing, nothing, 0, 0)
+                      Any[nothing for _ in 1:maxchunks],
+                      0, 0, 0, C_NULL, nothing, 0, 0, nothing, nothing, 0, 0,
+                      UInt64(0), UInt64(0), UInt64(0), UInt64(0), UInt64(0))
+    # creating the worker tasks must not change the RNG state of the caller
+    ct = current_task()
+    rng = _pf_rng_get(ct)
     for k in 1:n
         t = Task(_PFWorkerCode(pool, k))
         t.sticky = true
         ccall(:jl_set_task_tid, Cint, (Any, Cint), t, tid_offset + k - 1)
         pool.workers[k] = t
     end
+    _pf_rng_set!(ct, rng)
     for t in pool.workers
         schedule(t)
     end
@@ -277,11 +300,12 @@ end
 # Run chunk `c` on the current task with a fresh task-local storage and the chunk's RNG
 # state; capture exceptions. (Do not pass an argument of type `Any` here: together with
 # the type parameter `R` that makes the call dynamic.)
-@noinline function _pf_run_chunk(pool::ParkedPool, run::R, c::Int, ct::Task) where {R}
+@noinline function _pf_run_chunk(pool::ParkedPool, run::R, c::Int, ct::Task,
+                                 rng::NTuple{5, UInt64}) where {R}
     old_storage = ct.storage
     old_rng = _pf_rng_get(ct)
     ct.storage = nothing
-    _pf_rng_set!(ct, pool.rng, 5 * (c - 1))
+    _pf_rng_set!(ct, _pf_rng_child(rng, c))
     try
         run(c)
     catch e
@@ -294,21 +318,33 @@ end
     nothing
 end
 
-# Claim and run chunks of region `g`, starting with `home`
-@inline function _pf_participate(pool::ParkedPool, run::R, g::Int, n::Int, home::Int) where {R}
-    ct = current_task()
-    c = home
-    for _ in 1:n
-        claim = _pf_cref(pool, c, _PF_C_CLAIM)
-        x = _pf_load(claim, :monotonic)
-        if x < g && _pf_cas!(claim, x, g)
-            _pf_run_chunk(pool, run, c, ct)
-            _pf_store!(_pf_cref(pool, c, _PF_C_FIN), g, :sequentially_consistent)
-            if (@atomic pool.waiting) == 1 && (@atomicreplace pool.waiting 1 => 0).success
-                schedule((@atomic :acquire pool.dispatcher)::Task)
-            end
+# Try to claim chunk `c` of region `g`; run it if claimed
+@inline function _pf_try_chunk(pool::ParkedPool, run::R, g::Int, c::Int, ct::Task,
+                               rng::NTuple{5, UInt64}) where {R}
+    claim = _pf_cref(pool, c, _PF_C_CLAIM)
+    x = _pf_load(claim, :monotonic)
+    if x < g && _pf_cas!(claim, x, g)
+        _pf_run_chunk(pool, run, c, ct, rng)
+        _pf_store!(_pf_cref(pool, c, _PF_C_FIN), g, :sequentially_consistent)
+        if (@atomic pool.waiting) == 1 && (@atomicreplace pool.waiting 1 => 0).success
+            schedule((@atomic :acquire pool.dispatcher)::Task)
         end
-        c = c == n ? 1 : c + 1
+    end
+    nothing
+end
+
+# Claim and run chunk `home` of region `g`, then the unclaimed chunks among `steal:n`.
+# The dispatcher steals all chunks (so that a late or busy worker never delays a region by
+# more than one chunk); the workers only take the chunks beyond the first `nworkers`,
+# which have no home participant (scanning the chunks of the other workers would move
+# their cache lines around for nothing in the common case).
+@inline function _pf_participate(pool::ParkedPool, run::R, g::Int, n::Int, home::Int,
+                                 steal::Int, rng::NTuple{5, UInt64}) where {R}
+    ct = current_task()
+    _pf_try_chunk(pool, run, g, home, ct, rng)
+    for c in steal:n
+        c == home && continue
+        _pf_try_chunk(pool, run, g, c, ct, rng)
     end
     nothing
 end
@@ -322,10 +358,13 @@ function _pf_worker_participate(pool::ParkedPool, g::Int, k::Int)
     n = @atomic :monotonic pool.nchunks
     skip = @atomic :monotonic pool.skip
     scope = @atomic :monotonic pool.scope
+    rng = (@atomic(:monotonic, pool.rng0), @atomic(:monotonic, pool.rng1),
+           @atomic(:monotonic, pool.rng2), @atomic(:monotonic, pool.rng3),
+           @atomic(:monotonic, pool.rng4))
     (@atomic :acquire pool.seq) == 2g || return
     home = k < skip ? k + 1 : k
     home > n && return
-    _pf_participate(pool, _PFIndirect(fptr, env, scope), g, n, home)
+    _pf_participate(pool, _PFIndirect(fptr, env, scope), g, n, home, pool.nworkers + 1, rng)
     nothing
 end
 
@@ -371,7 +410,7 @@ end
     ct = current_task()
     errs = nothing
     for c in 1:n
-        rng = _pf_rng_split(ct)
+        rng = _pf_rng_split(ct)  # same as _pf_rng_child(state at start, c)
         old_storage = ct.storage
         old_rng = _pf_rng_get(ct)
         ct.storage = nothing
@@ -409,10 +448,8 @@ function _pf_region(pool::ParkedPool, fun::F, n::Int, ct::Task) where {F}
     p = threadid() - pool.tid_offset
     skip = 1 <= p <= pool.nworkers ? p : pool.nworkers
     scope = Core.current_scope()
-    # fork the RNG state of every chunk, as task creation does for `@threads`
-    for c in 1:n
-        _pf_rng_split!(pool.rng, 5 * (c - 1), ct)
-    end
+    # chunk `c` gets the RNG state of the `c`-th child task, as with `@threads`
+    rng = _pf_rng_get(ct)
     # publish the descriptor
     @atomic :release pool.seq = 2g - 1
     @atomic :monotonic pool.fptr = fptr
@@ -422,6 +459,11 @@ function _pf_region(pool::ParkedPool, fun::F, n::Int, ct::Task) where {F}
     @atomic :monotonic pool.scope = scope
     @atomic :monotonic pool.dispatcher = ct
     @atomic :monotonic pool.nerrs = 0
+    @atomic :monotonic pool.rng0 = rng[1]
+    @atomic :monotonic pool.rng1 = rng[2]
+    @atomic :monotonic pool.rng2 = rng[3]
+    @atomic :monotonic pool.rng3 = rng[4]
+    @atomic :monotonic pool.rng4 = rng[5]
     @atomic :release pool.seq = 2g
     # hand out the work
     for k in 1:pool.nworkers
@@ -444,7 +486,8 @@ function _pf_region(pool::ParkedPool, fun::F, n::Int, ct::Task) where {F}
         end
     end
     # run chunk 1, then steal
-    _pf_participate(pool, _PFDirect{F}(fun), g, n, 1)
+    _pf_rng_advance!(ct, n)
+    _pf_participate(pool, _PFDirect{F}(fun), g, n, 1, 2, rng)
     # wait for the chunks run by other participants
     _pf_wait(pool, g, n)
     @atomic :monotonic pool.env = nothing
