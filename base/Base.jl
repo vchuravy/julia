@@ -194,6 +194,9 @@ include("weakdict.jl")
 # ScopedValues
 include("scopedvalues.jl")
 
+# Parallel loops on parked worker tasks (uses ScopedValues)
+Core.eval(Threads, :(include("parallel_for.jl")))
+
 # Logging
 include("logging/logging.jl")
 using .CoreLogging

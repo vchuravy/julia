@@ -3,6 +3,7 @@
 ```@docs
 Base.Threads.@threads
 Base.Threads.foreach
+Base.Threads.parallel_for
 Base.Threads.@spawn
 Base.Threads.threadid
 Base.Threads.maxthreadid

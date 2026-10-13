@@ -434,6 +434,18 @@ let program = """
     end
 end
 
+# `Threads.parallel_for` and `@threads :parked` with several thread pool configurations
+let cmd = `$(Base.julia_cmd()) --depwarn=error --rr-detach --startup-file=no threads_parked.jl`
+    for threads_config in ("1", "1,1", "2,0", "4", "4,2", "8", "8,0")
+        new_env = copy(ENV)
+        new_env["JULIA_NUM_THREADS"] = threads_config
+        with_output_on_failure() do output
+            run(pipeline(setenv(cmd, new_env); stdout=output, stderr=output))
+        end
+        println("threads_parked.jl with JULIA_NUM_THREADS == $threads_config passed")
+    end
+end
+
 # Timing-sensitive tests can fail on CI due to occasional unexpected delays,
 # so this test is disabled.
 #=

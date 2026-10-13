@@ -255,6 +255,9 @@ end
 # `--compile=min`, so a top-level `@threads` would otherwise make the interpreter
 # unusable for everything around it.
 function _threading_run_expr(schedule)
+    if schedule === :parked
+        return :(parked_run(threadsfor_fun, threadpoolsize()))
+    end
     :(threading_run(threadsfor_fun, $(schedule === :static)))
 end
 
@@ -652,6 +655,21 @@ is not uniform/has a large spread.
 !!! compat "Julia 1.11"
     The `:greedy` option for the `schedule` argument is available as of Julia 1.11.
 
+### `:parked`
+
+`:parked` scheduler divides the iterations into [`Threads.threadpoolsize()`](@ref) contiguous
+chunks like `:dynamic`, but runs them on a pool of persistent worker tasks (one per thread
+of the `:default` pool) instead of creating a task per chunk, see
+[`Threads.parallel_for`](@ref). Idle workers spin briefly before they park, so back-to-back
+loops cost a fraction of a microsecond and do not allocate tasks. The calling task runs a
+chunk itself. Within the body, `current_task()` is the worker task (or the caller), but the
+dynamic scope, an empty task-local storage and the forked random number generator are as
+for `:dynamic`. A `:parked` loop inside the body of another one runs serially; a
+`:parked` loop started by another task while the pool is busy behaves as `:dynamic`.
+
+!!! compat "Julia 1.14"
+    The `:parked` option for the `schedule` argument is available as of Julia 1.14.
+
 ### `:static`
 
 `:static` scheduler creates one task per thread and divides the iterations equally among
@@ -787,7 +805,7 @@ macro threads(args...)
             # for now only allow quoted symbols
             sched = nothing
         end
-        if sched !== :static && sched !== :dynamic && sched !== :greedy
+        if sched !== :static && sched !== :dynamic && sched !== :greedy && sched !== :parked
             throw(ArgumentError("unsupported schedule argument in @threads"))
         end
     elseif na == 1
