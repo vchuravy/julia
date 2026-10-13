@@ -78,8 +78,9 @@ end
     x = zeros(64)
     f(x) = Threads.parallel_for(i -> (@inbounds x[i] += 1.0), eachindex(x))
     f(x); f(x)
-    # one `RefValue` holding the loop function
-    @test (@allocations f(x)) <= 1
+    # one `RefValue` holding the loop function (the count is process-wide, so take the
+    # minimum of a few tries against noise from other tasks or a busy machine)
+    @test minimum(_ -> (@allocations f(x)), 1:20) <= 1
 end
 
 @testset "parallel_for exceptions" begin
