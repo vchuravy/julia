@@ -78,9 +78,24 @@ end
     x = zeros(64)
     f(x) = Threads.parallel_for(i -> (@inbounds x[i] += 1.0), eachindex(x))
     f(x); f(x)
-    # one `RefValue` holding the loop function (the count is process-wide, so take the
-    # minimum of a few tries against noise from other tasks or a busy machine)
-    @test minimum(_ -> (@allocations f(x)), 1:20) <= 1
+    # the count is process-wide, so take the minimum of a few tries against noise from
+    # other tasks or a busy machine
+    @test minimum(_ -> (@allocations f(x)), 1:20) == 0
+end
+
+# The pool must not keep the variables captured by the loop function alive
+function pf_capture_weak()
+    a = zeros(64)
+    Threads.parallel_for(i -> (@inbounds a[i] = 1.0), eachindex(a))
+    return WeakRef(a)
+end
+@testset "parallel_for does not keep captured variables alive" begin
+    w = pf_capture_weak()
+    for _ in 1:5
+        GC.gc(true)
+        w.value === nothing && break
+    end
+    @test w.value === nothing
 end
 
 @testset "parallel_for exceptions" begin
@@ -97,8 +112,8 @@ end
         @test ex.exceptions[1] isa CapturedException
         @test ex.exceptions[1].ex == ErrorException("boom $n")
     end
-    # exceptions in several chunks, the other chunks still run to completion
-    # (one element per chunk; an exception ends its chunk, as for `@threads`)
+    # exceptions in several chunks: every chunk that started runs to completion, chunks
+    # claimed after an exception are skipped (one element per chunk)
     m = min(64, 8NT)
     x = zeros(Int, m)
     ex = try
@@ -110,11 +125,11 @@ end
     catch e
         e
     end
-    @test all(==(1), x)
     @test ex isa CompositeException
-    @test length(ex.exceptions) == m ÷ 2
+    @test 1 <= length(ex.exceptions) <= m ÷ 2
     @test all(e -> e.ex isa ArgumentError, ex.exceptions)
-    # the same for a nested (serial) loop
+    @test count(==(1), x[2:2:end]) == length(ex.exceptions)
+    # a nested (serial) loop stops at the first exception
     ex = try
         Threads.parallel_for(1:2; nchunks = 2) do _
             Threads.parallel_for(i -> iseven(i) && error("inner"), 1:4; nchunks = 4)
@@ -124,8 +139,22 @@ end
         e
     end
     @test ex isa CompositeException
-    @test length(ex.exceptions) == 2
-    @test all(e -> e.ex isa CompositeException && length(e.ex.exceptions) == 2, ex.exceptions)
+    @test 1 <= length(ex.exceptions) <= 2
+    @test all(e -> e.ex isa CompositeException && length(e.ex.exceptions) == 1, ex.exceptions)
+    # chunk 1 (run by the caller) throws before the other chunks can start: when the
+    # workers are slow to pick up their chunks, the caller skips them
+    ran = Threads.Atomic{Int}(0)
+    ex = try
+        Threads.parallel_for(1:m; nchunks = m) do i
+            i == 1 && error("first")
+            Threads.atomic_add!(ran, 1)
+        end
+        nothing
+    catch e
+        e
+    end
+    @test ex isa CompositeException && length(ex.exceptions) == 1
+    @test ran[] <= m - 1
     # the pool keeps working after an exception
     y = zeros(Int, 100)
     Threads.parallel_for(i -> (y[i] = i), 1:100)
@@ -326,4 +355,58 @@ end
     # all chunks run in the caller's world, as the tasks of `@threads` do
     @test all(==(1), Base.invoke_in_world(w, pf_world_h))
     @test all(==(2), pf_world_h())
+end
+
+@testset "parallel_phase" begin
+    x = zeros(Int, 64)
+    r = Threads.parallel_phase() do
+        for _ in 1:3
+            sleep(0.01)  # longer than the spin time
+            Threads.parallel_for(i -> (x[i] += 1), 1:64)
+        end
+        Threads.parallel_phase(() -> Threads.parallel_for(i -> (x[i] += 1), 1:64))
+        if NT > 1
+            # idle workers kept spinning (nothing else runs on their threads), except the
+            # one on our thread, which parks when we become runnable again
+            sleep(0.01)
+            pool = Threads._PF_POOL[]
+            mine = Threads.threadid() - pool.tid_offset
+            @test all(k -> k == mine ||
+                           Threads._pf_load(Threads._pf_wref(pool, k, Threads._PF_W_PARKED),
+                                            :monotonic) == 0, 1:pool.nworkers)
+        end
+        :done
+    end
+    @test r === :done
+    @test all(==(4), x)
+    @test Threads._PF_PHASE[] == 0
+    @test_throws ErrorException Threads.parallel_phase(() -> error("in phase"))
+    @test Threads._PF_PHASE[] == 0
+end
+
+@testset "parked_shutdown" begin
+    x = zeros(Int, 64)
+    Threads.parallel_for(i -> (x[i] += 1), 1:64)
+    pool = Threads._PF_POOL[]
+    Threads.parked_shutdown()
+    @test Threads._PF_POOL[] === nothing
+    if pool !== nothing
+        @test all(istaskdone, pool.workers)
+    end
+    Threads.parked_shutdown()  # no pool: no-op
+    Threads.parallel_for(i -> (x[i] += 1), 1:64)  # starts a new pool
+    @test all(==(2), x)
+    if NT > 1
+        @test Threads._PF_POOL[] !== nothing
+        ex = try
+            Threads.parallel_for(_ -> Threads.parked_shutdown(), 1:NT)
+            nothing
+        catch e
+            e
+        end
+        @test ex isa CompositeException
+        @test all(e -> e.ex isa ErrorException, ex.exceptions)
+    end
+    Threads.parallel_for(i -> (x[i] += 1), 1:64)
+    @test all(==(3), x)
 end

@@ -664,8 +664,9 @@ of the `:default` pool) instead of creating a task per chunk, see
 loops cost a fraction of a microsecond and do not allocate tasks. The calling task runs a
 chunk itself. Within the body, `current_task()` is the worker task (or the caller), but the
 dynamic scope, an empty task-local storage and the forked random number generator are as
-for `:dynamic`. A `:parked` loop inside the body of another one runs serially; a
-`:parked` loop started by another task while the pool is busy behaves as `:dynamic`.
+for `:dynamic`. Once a chunk has thrown, chunks that have not started yet are skipped. A
+`:parked` loop inside the body of another one runs serially; a `:parked` loop started by
+another task while the pool is busy behaves as `:dynamic`.
 
 !!! compat "Julia 1.14"
     The `:parked` option for the `schedule` argument is available as of Julia 1.14.

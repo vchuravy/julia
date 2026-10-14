@@ -4,6 +4,8 @@
 Base.Threads.@threads
 Base.Threads.foreach
 Base.Threads.parallel_for
+Base.Threads.parallel_phase
+Base.Threads.parked_shutdown
 Base.Threads.@spawn
 Base.Threads.threadid
 Base.Threads.maxthreadid

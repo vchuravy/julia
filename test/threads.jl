@@ -444,6 +444,16 @@ let cmd = `$(Base.julia_cmd()) --depwarn=error --rr-detach --startup-file=no thr
         end
         println("threads_parked.jl with JULIA_NUM_THREADS == $threads_config passed")
     end
+    # workers that never spin: every loop wakes parked workers
+    for threads_config in ("4", "8,0")
+        new_env = copy(ENV)
+        new_env["JULIA_NUM_THREADS"] = threads_config
+        new_env["JULIA_PARALLEL_SPIN_NS"] = "0"
+        with_output_on_failure() do output
+            run(pipeline(setenv(cmd, new_env); stdout=output, stderr=output))
+        end
+        println("threads_parked.jl with JULIA_NUM_THREADS == $threads_config and no spinning passed")
+    end
 end
 
 # Timing-sensitive tests can fail on CI due to occasional unexpected delays,
