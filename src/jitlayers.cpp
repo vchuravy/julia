@@ -291,6 +291,8 @@ jl_emitted_output_t jl_codegen_output_t::finish(std::unique_ptr<LLVMContext> ctx
     }
     for (auto &[call, target] : call_targets)
         info->call_targets[call] = intern(target.decl->getName());
+    // The address of a cfunction thunk escapes to C
+    info->never_unload = !cfuncs.empty();
     for (auto [val, gv] : global_targets) {
         info->global_targets[val] = intern(gv->getName());
     }
@@ -990,6 +992,77 @@ public:
         });
     }
 };
+
+// Records what each unloadable unit of code consists of and refers to.
+class JLUnloadPlugin : public ObjectLinkingLayer::Plugin {
+    JuliaOJIT &JIT;
+
+public:
+    JLUnloadPlugin(JuliaOJIT &JIT) JL_NOTSAFEPOINT : JIT(JIT) {}
+
+    Error notifyFailed(orc::MaterializationResponsibility &MR) override
+    {
+        return Error::success();
+    }
+    Error notifyRemovingResources(JITDylib &JD, orc::ResourceKey K) override
+    {
+        return Error::success();
+    }
+    void notifyTransferringResources(JITDylib &JD, orc::ResourceKey DstKey,
+                                     orc::ResourceKey SrcKey) override {}
+
+    Error notifyEmitted(orc::MaterializationResponsibility &MR) override
+    {
+        if (JITCodeUnit *U = JIT.unitForMR(MR))
+            JIT.setUnitEmitted(U);
+        return Error::success();
+    }
+
+    void modifyPassConfig(orc::MaterializationResponsibility &MR, jitlink::LinkGraph &,
+                          jitlink::PassConfiguration &Config) override
+    {
+        JITCodeUnit *U = JIT.unitForMR(MR);
+        if (!U) {
+            // This code is never unloaded (e.g. a cfunction, or the body of
+            // an opaque closure), so neither can anything it refers to.
+            Config.PreFixupPasses.push_back([this](jitlink::LinkGraph &G) {
+                for (auto *Sym : G.external_symbols())
+                    JIT.pinUnitAt(Sym->getAddress().getValue());
+                for (auto *Sym : G.absolute_symbols())
+                    JIT.pinUnitAt(Sym->getAddress().getValue());
+                return Error::success();
+            });
+            return;
+        }
+        Config.PostAllocationPasses.push_back([this, U](jitlink::LinkGraph &G) {
+            size_t GraphBytes = 0;
+            for (auto &Sec : G.sections()) {
+                if (Sec.blocks().empty())
+                    continue;
+                unpoisonLinkGraphBlocks(Sec);
+                // what JLMemoryUsagePlugin counts for this graph
+                for (auto B : Sec.blocks())
+                    GraphBytes += B->getSize();
+                if (Sec.getMemLifetime() == orc::MemLifetime::NoAlloc)
+                    continue;
+                jitlink::SectionRange R(Sec);
+                if (R.getSize())
+                    JIT.addUnitRange(U, R.getStart().getValue(), R.getSize());
+            }
+            JIT.addUnitRange(U, 0, GraphBytes);
+            return Error::success();
+        });
+        // External symbols have been resolved to their addresses by now. Any
+        // that point into another unit make this unit depend on that one.
+        Config.PreFixupPasses.push_back([this, U](jitlink::LinkGraph &G) {
+            for (auto *Sym : G.external_symbols())
+                JIT.addUnitDep(U, Sym->getAddress().getValue());
+            for (auto *Sym : G.absolute_symbols())
+                JIT.addUnitDep(U, Sym->getAddress().getValue());
+            return Error::success();
+        });
+    }
+};
 } // namespace anonymous
 
 class JLMaterializationUnit : public orc::MaterializationUnit {
@@ -997,7 +1070,8 @@ public:
     // Must hold LinkerMutex when calling Create and until the
     // MaterializationUnit has been added to the JITDylib.
     static JLMaterializationUnit Create(JuliaOJIT &JIT, ObjectLinkingLayer &OL,
-                                        jl_emitted_output_t Out) JL_NOTSAFEPOINT
+                                        jl_emitted_output_t Out,
+                                        SmallVectorImpl<jl_code_instance_t *> *Owned = nullptr) JL_NOTSAFEPOINT
     {
         Interface I;
         auto &Syms = I.SymbolFlags;
@@ -1015,8 +1089,11 @@ public:
             jl_callptr_t Expected = NULL;
             CISymbolPtr Unique{};
             if (jl_atomic_cmpswap_relaxed(&CI->invoke, &Expected,
-                                          jl_fptr_wait_for_compiled_addr))
+                                          jl_fptr_wait_for_compiled_addr)) {
                 Unique = JIT.makeUniqueCIName(CI, Funcs);
+                if (Owned)
+                    Owned->push_back(CI);
+            }
             if (Unique.invoke)
                 Syms[Unique.invoke] = JITSymbolFlags::Callable | JITSymbolFlags::Exported;
             if (Unique.specptr)
@@ -1046,6 +1123,8 @@ public:
     void materialize(std::unique_ptr<MaterializationResponsibility> R) JL_CANSAFEPOINT_ENTER_LEAVE override // NOLINT[julia-first-decl-annotations]
     {
         auto &ES = R->getExecutionSession();
+        if (Unit)
+            JIT.setUnitStarted(Unit);
 
         std::unique_ptr<MemoryBuffer> Obj;
         uint64_t start_time = jl_hrtime();
@@ -1128,6 +1207,10 @@ protected:
                                                          Out(std::move(Out))
     {
     }
+
+public:
+    // The unit of unloadable code this will produce, if any.
+    JITCodeUnit *Unit = nullptr;
 
 private:
     JuliaOJIT &JIT;
@@ -1885,6 +1968,12 @@ JuliaOJIT::JuliaOJIT()
     ObjectLayer.addPlugin(DebuginfoPlugin);
     ObjectLayer.addPlugin(std::make_unique<JLMemoryUsagePlugin>(&jit_bytes_size));
 
+    // Experimental: unload native code that is no longer reachable
+    if (const char *unload = getenv("JULIA_JIT_UNLOAD"))
+        UnloadEnabled = strcmp(unload, "1") == 0 && !jl_generating_output();
+    if (UnloadEnabled)
+        ObjectLayer.addPlugin(std::make_unique<JLUnloadPlugin>(*this));
+
     SetVector<void*> libhandles;
     // Make sure that libjulia-internal is loaded and placed first in the
     // DynamicLibrary order so that calls to runtime intrinsics are resolved
@@ -2095,11 +2184,272 @@ void JuliaOJIT::addOutput(jl_emitted_output_t O)
 #ifdef ENABLE_TIMINGS
     timing_print_module_names(JL_TIMING_DEFAULT_BLOCK, *O.module);
 #endif
+    // A convenient place to actually free code that a previous collection
+    // found to be dead: no JIT lock is held here.
+    if (UnloadEnabled)
+        releaseDeadCode();
     std::unique_lock Lock{LinkerMutex};
+    SmallVector<jl_code_instance_t *, 1> Owned;
+    bool NeverUnload = O.linker_info->never_unload;
     auto MU = std::make_unique<JLMaterializationUnit>(
-        JLMaterializationUnit::Create(*this, ObjectLayer, std::move(O)));
+        JLMaterializationUnit::Create(*this, ObjectLayer, std::move(O), &Owned));
+    orc::ResourceTrackerSP RT = JD.getDefaultResourceTracker();
+    if (NeverUnload)
+        Owned.clear();
+    if (JITCodeUnit *U = createUnit(Owned)) {
+        MU->Unit = U;
+        RT = U->RT;
+    }
     ExitOnError check{"Failed to add objectfile to JIT!"};
-    check(JD.define(MU, JD.getDefaultResourceTracker()));
+    check(JD.define(MU, RT));
+}
+
+JITCodeUnit *JuliaOJIT::createUnit(ArrayRef<jl_code_instance_t *> Owned)
+{
+    // Code that no CodeInstance owns (e.g. cfunctions) may have had its address
+    // taken by anything, so it stays forever.
+    if (!UnloadEnabled || Owned.empty())
+        return nullptr;
+    for (auto CI : Owned) {
+        // OpaqueClosure objects hold raw pointers to the code (and the
+        // CodeInstance is a global root anyway, see jl_register_jit_object)
+        jl_method_instance_t *MI = jl_get_ci_mi(CI);
+        if (jl_is_method(MI->def.value) && MI->def.method->is_for_opaque_closure)
+            return nullptr;
+    }
+    auto *U = new JITCodeUnit;
+    U->RT = JD.createResourceTracker();
+    U->CIs.append(Owned.begin(), Owned.end());
+    std::unique_lock Lock{UnitMutex};
+    Units.insert(U);
+    UnitsByKey[U->RT->getKeyUnsafe()] = U;
+    UnitsCreated++;
+    return U;
+}
+
+JITCodeUnit *JuliaOJIT::unitForMR(orc::MaterializationResponsibility &MR)
+{
+    if (!UnloadEnabled)
+        return nullptr;
+    JITCodeUnit *U = nullptr;
+    auto Err = MR.withResourceKeyDo([&](orc::ResourceKey K) JL_NOTSAFEPOINT {
+        std::unique_lock Lock{UnitMutex};
+        auto It = UnitsByKey.find(K);
+        if (It != UnitsByKey.end())
+            U = It->second;
+    });
+    consumeError(std::move(Err));
+    return U;
+}
+
+void JuliaOJIT::setUnitStarted(JITCodeUnit *U)
+{
+    std::unique_lock Lock{UnitMutex};
+    U->Started = true;
+}
+
+void JuliaOJIT::setUnitEmitted(JITCodeUnit *U)
+{
+    std::unique_lock Lock{UnitMutex};
+    U->Emitted = true;
+}
+
+void JuliaOJIT::addUnitRange(JITCodeUnit *U, uintptr_t Start, size_t Size)
+{
+    std::unique_lock Lock{UnitMutex};
+    if (Start == 0) {
+        // not memory: the size this unit was accounted with in jit_bytes_size
+        U->GraphBytes += Size;
+        return;
+    }
+    U->Ranges.push_back({Start, Size});
+    U->Bytes += Size;
+    UnitRanges[Start] = {Size, U};
+}
+
+// Must hold UnitMutex
+JITCodeUnit *JuliaOJIT::lookupUnit(uintptr_t Addr)
+{
+    auto It = UnitRanges.upper_bound(Addr);
+    if (It == UnitRanges.begin())
+        return nullptr;
+    --It;
+    if (Addr - It->first < It->second.first)
+        return It->second.second;
+    return nullptr;
+}
+
+void JuliaOJIT::addUnitDep(JITCodeUnit *U, uintptr_t Addr)
+{
+    std::unique_lock Lock{UnitMutex};
+    JITCodeUnit *Dep = lookupUnit(Addr);
+    if (Dep && Dep != U)
+        U->Deps.insert(Dep);
+}
+
+void JuliaOJIT::pinUnitAt(uintptr_t Addr)
+{
+    std::unique_lock Lock{UnitMutex};
+    if (JITCodeUnit *U = lookupUnit(Addr))
+        U->Pinned = true;
+}
+
+bool JuliaOJIT::codeGCBegin(uintptr_t *Lo, uintptr_t *Hi)
+{
+    if (!UnloadEnabled)
+        return false;
+    // The world is stopped, but threads in a GC-safe region (e.g. a thread in
+    // the middle of linking) keep running, so the locks are still needed. No
+    // thread holds them across a safepoint.
+    LinkerMutex.lock();
+    UnitMutex.lock();
+    CodeGCs++;
+    uintptr_t lo = ~(uintptr_t)0, hi = 0;
+    bool Any = false;
+    // Without unloading, a CodeInstance that the JIT knows stays in its
+    // MethodInstance's cache forever. Now it may be about to be swept: forget
+    // every pointer to it, whether its code can be unloaded or not. (Its
+    // address may be reused by another CodeInstance.)
+    CISymbols.remove_if([](const auto &KV) JL_NOTSAFEPOINT {
+        return !jl_gc_object_marked((jl_value_t*)KV.first);
+    });
+    jl_sweep_jit_cis();
+    for (JITCodeUnit *U : Units) {
+        size_t NCIs = U->CIs.size();
+        llvm::erase_if(U->CIs, [&](jl_code_instance_t *CI) JL_NOTSAFEPOINT {
+            return !jl_gc_object_marked((jl_value_t*)CI);
+        });
+        CIsDied += NCIs - U->CIs.size();
+        // A unit that is being linked right now is not safe to remove
+        U->Mark = U->Pinned || !U->CIs.empty() || (U->Started && !U->Emitted);
+        if (!U->Mark) {
+            Any = true;
+            for (auto &[Start, Size] : U->Ranges) {
+                lo = std::min(lo, Start);
+                hi = std::max(hi, Start + Size);
+            }
+        }
+    }
+    if (!Any) {
+        UnitMutex.unlock();
+        LinkerMutex.unlock();
+        return false;
+    }
+    InCodeGC = true;
+    *Lo = lo;
+    // A return address may point just past the end of the code
+    *Hi = hi + 1;
+    return true;
+}
+
+void JuliaOJIT::codeGCMarkAddr(uintptr_t Addr)
+{
+    assert(InCodeGC);
+    // Check Addr - 1 as well: the return address of a call that is the last
+    // instruction of a function is the address after the function.
+    for (uintptr_t A : {Addr, Addr - 1}) {
+        JITCodeUnit *U = lookupUnit(A);
+        if (U && !U->Mark) {
+            U->Mark = true;
+            UnitsKeptByStack++;
+        }
+    }
+}
+
+void JuliaOJIT::codeGCEnd()
+{
+    assert(InCodeGC);
+    // Live code keeps the code it refers to alive
+    GCWorklist.clear();
+    for (JITCodeUnit *U : Units)
+        if (U->Mark)
+            GCWorklist.push_back(U);
+    while (!GCWorklist.empty()) {
+        JITCodeUnit *U = GCWorklist.pop_back_val();
+        for (JITCodeUnit *Dep : U->Deps) {
+            if (!Dep->Mark) {
+                Dep->Mark = true;
+                UnitsKeptByDep++;
+                GCWorklist.push_back(Dep);
+            }
+        }
+    }
+    for (JITCodeUnit *U : Units) {
+        if (U->Mark) {
+            U->DeadCount = 0;
+        }
+        // A thread running in a GC-safe region may be executing code without
+        // having a pointer to it on its stack yet (the scan cannot see its
+        // registers), but only for a few instructions. Requiring two
+        // collections in a row to find the unit dead covers that.
+        else if (++U->DeadCount >= 2) {
+            GCWorklist.push_back(U);
+        }
+    }
+    for (JITCodeUnit *U : GCWorklist) {
+        Units.erase(U);
+        UnitsByKey.erase(U->RT->getKeyUnsafe());
+        for (auto &[Start, Size] : U->Ranges)
+            UnitRanges.erase(Start);
+        DeadUnits.push_back(U);
+    }
+    GCWorklist.clear();
+    InCodeGC = false;
+    UnitMutex.unlock();
+    LinkerMutex.unlock();
+}
+
+size_t JuliaOJIT::releaseDeadCode()
+{
+    SmallVector<JITCodeUnit *, 0> Dead;
+    {
+        std::unique_lock Lock{UnitMutex};
+        std::swap(Dead, DeadUnits);
+    }
+    size_t Bytes = 0, GraphBytes = 0;
+    for (JITCodeUnit *U : Dead) {
+        // Nothing may look this code up anymore once its memory can be reused
+        jl_unregister_jit_object(U->Ranges);
+        // Removes the symbols, runs the dealloc actions (EH frames) and hands
+        // the memory back to the memory manager
+        if (auto Err = U->RT->remove())
+            ES.reportError(std::move(Err));
+        delete[] U->GlobalPtrs;
+        Bytes += U->Bytes;
+        GraphBytes += U->GraphBytes;
+        delete U;
+    }
+    if (!Dead.empty()) {
+        jl_atomic_fetch_add_relaxed(&jit_bytes_size, -GraphBytes);
+        std::unique_lock Lock{UnitMutex};
+        UnitsFreed += Dead.size();
+        UnitBytesFreed += Bytes;
+    }
+    return Dead.size();
+}
+
+void JuliaOJIT::getUnloadStats(size_t *Stats, size_t N)
+{
+    size_t S[12] = {};
+    {
+        std::unique_lock Lock{UnitMutex};
+        S[0] = UnloadEnabled;
+        S[1] = UnitsCreated;
+        S[2] = Units.size();
+        S[3] = UnitsFreed;
+        S[4] = UnitBytesFreed;
+        S[5] = DeadUnits.size();
+        S[6] = CIsDied;
+        S[7] = UnitsKeptByStack;
+        S[8] = UnitsKeptByDep;
+        S[9] = CodeGCs;
+    }
+    size_t freed, reused, avail;
+    jl_jit_memmgr_stats(&freed, &reused, &avail);
+    S[10] = reused;
+    S[11] = avail;
+    for (size_t i = 0; i < N; i++)
+        Stats[i] = i < 12 ? S[i] : 0;
 }
 
 orc::JITDylib& JuliaOJIT::createJITDylib(StringRef NamePrefix)
@@ -2549,7 +2899,16 @@ bool JuliaOJIT::linkOutput(orc::MaterializationResponsibility &MR, MemoryBufferR
     }
     // Not cantFail, which only checks in LLVM assertion builds: on a name
     // collision, code would silently use another global.
-    if (auto Err = JD.define(orc::absoluteSymbols(std::move(GlobalSyms)))) {
+    // The slots belong to the unit of code that refers to them, if it can be
+    // unloaded.
+    orc::ResourceTrackerSP GlobalsRT = JD.getDefaultResourceTracker();
+    if (JITCodeUnit *U = unitForMR(MR)) {
+        std::unique_lock UnitLock{UnitMutex};
+        assert(!U->GlobalPtrs);
+        U->GlobalPtrs = Ptrs;
+        GlobalsRT = U->RT;
+    }
+    if (auto Err = JD.define(orc::absoluteSymbols(std::move(GlobalSyms)), GlobalsRT)) {
         logAllUnhandledErrors(std::move(Err), errs(), "Failed to define global symbols in JIT: ");
         abort();
     }
@@ -2895,4 +3254,41 @@ extern "C" JL_DLLEXPORT_CODEGEN
 void jl_jit_unregister_ci_impl(jl_code_instance_t *ci)
 {
     jl_ExecutionEngine->unregisterCI(ci);
+}
+
+// Returns 0 if code unloading is disabled, 1 if there is no candidate for
+// unloading, and 2 if [*lo, *hi) holds candidates. Only in the last case must
+// jl_jit_code_gc_end be called.
+extern "C" JL_DLLEXPORT_CODEGEN
+int jl_jit_code_gc_begin_impl(uintptr_t *lo, uintptr_t *hi)
+{
+    if (!jl_ExecutionEngine || !jl_ExecutionEngine->UnloadEnabled)
+        return 0;
+    return jl_ExecutionEngine->codeGCBegin(lo, hi) ? 2 : 1;
+}
+
+extern "C" JL_DLLEXPORT_CODEGEN
+void jl_jit_code_gc_mark_addr_impl(uintptr_t addr)
+{
+    jl_ExecutionEngine->codeGCMarkAddr(addr);
+}
+
+extern "C" JL_DLLEXPORT_CODEGEN
+void jl_jit_code_gc_end_impl(void)
+{
+    jl_ExecutionEngine->codeGCEnd();
+}
+
+// Free the native code that the garbage collector found to be dead. Returns
+// the number of units of code that were freed.
+extern "C" JL_DLLEXPORT_CODEGEN
+size_t jl_jit_release_dead_code_impl(void)
+{
+    return jl_ExecutionEngine->releaseDeadCode();
+}
+
+extern "C" JL_DLLEXPORT_CODEGEN
+void jl_jit_unload_stats_impl(size_t *stats, size_t n)
+{
+    jl_ExecutionEngine->getUnloadStats(stats, n);
 }

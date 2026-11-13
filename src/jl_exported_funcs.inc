@@ -575,6 +575,11 @@
     YY(jl_jit_abi_converter) \
     YY(jl_jit_register_ci) \
     YY(jl_jit_unregister_ci) \
+    YY(jl_jit_code_gc_begin) \
+    YY(jl_jit_code_gc_mark_addr) \
+    YY(jl_jit_code_gc_end) \
+    YY(jl_jit_release_dead_code) \
+    YY(jl_jit_unload_stats) \
     YY(JLJITGetLLVMOrcExecutionSession) \
     YY(JLJITGetJuliaOJIT) \
     YY(JLJITCreateJITDylib) \

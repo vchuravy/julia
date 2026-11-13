@@ -237,6 +237,32 @@ arraylist_t *jl_get_all_tasks_arraylist(void) JL_NOTSAFEPOINT
     return tasks;
 }
 
+// The oldest world that any existing task is currently running in. Tasks that
+// have not started yet are not accounted for (which is fine, see above).
+JL_DLLEXPORT size_t jl_min_live_world(void) JL_NOTSAFEPOINT
+{
+    size_t world = jl_atomic_load_acquire(&jl_world_counter);
+    jl_ptls_t *allstates = jl_atomic_load_relaxed(&jl_all_tls_states);
+    size_t nthreads = jl_atomic_load_acquire(&jl_n_threads);
+    for (size_t i = 0; i < nthreads; i++) {
+        jl_ptls_t ptls2 = allstates[i];
+        if (ptls2 == NULL)
+            continue;
+        jl_task_t *t = jl_atomic_load_relaxed(&ptls2->current_task);
+        // (root tasks that never ran Julia code are in world 1)
+        if (t != NULL && t->world_age > 1 && t->world_age < world)
+            world = t->world_age;
+        small_arraylist_t *live_tasks = &ptls2->gc_tls_common.heap.live_tasks;
+        size_t n = mtarraylist_length(live_tasks);
+        for (size_t j = 0; j < n; j++) {
+            t = (jl_task_t*)mtarraylist_get(live_tasks, j);
+            if (t != NULL && t->ctx.stkbuf != NULL && t->world_age > 1 && t->world_age < world)
+                world = t->world_age;
+        }
+    }
+    return world;
+}
+
 JL_DLLEXPORT jl_array_t *jl_live_tasks(void) JL_CANSAFEPOINT
 {
     size_t nthreads = jl_atomic_load_acquire(&jl_n_threads);

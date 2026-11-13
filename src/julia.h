@@ -560,6 +560,7 @@ typedef struct JL_GC_TRACKED_TYPE _jl_opaque_closure_t {
 #define JL_CI_FLAGS_FROM_IMAGE               0b0100
 #define JL_CI_FLAGS_NATIVE_CACHE_VALID       0b1000
 #define JL_CI_FLAGS_UNIQUE_BACKEDGES         0b10000 // no backedge appears twice in edges
+#define JL_CI_FLAGS_RECENTLY_USED            0b100000 // dispatched to since the last eviction pass, although its world range has ended (see jl_evict_stale_code)
 
 struct JL_GC_TRACKED_TYPE _jl_code_instance_t {
     JL_DATA_TYPE

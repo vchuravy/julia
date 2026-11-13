@@ -3264,6 +3264,21 @@ static void _method_table_invalidate(jl_methcache_t *mc, void *env0) JL_CANSAFEP
 // Invalidate everything compiled against `replaced`. `deleted` is set when the
 // method is being removed outright rather than replaced by one with the same
 // signature.
+static void truncate_dead_method_mi(jl_method_instance_t *mi, size_t method_max_world) JL_NOTSAFEPOINT;
+
+// Experimental (JULIA_JIT_UNLOAD=1): unload native code that is unreachable
+int jl_code_unloading_enabled(void) JL_NOTSAFEPOINT
+{
+    static _Atomic(int) enabled = -1;
+    int e = jl_atomic_load_relaxed(&enabled);
+    if (e == -1) {
+        const char *env = getenv("JULIA_JIT_UNLOAD");
+        e = env && strcmp(env, "1") == 0 && !jl_generating_output();
+        jl_atomic_store_relaxed(&enabled, e);
+    }
+    return e;
+}
+
 static void jl_method_table_invalidate(jl_method_t *replaced, size_t max_world, int deleted) JL_CANSAFEPOINT
 {
     assert(!replaced->is_for_opaque_closure);
@@ -3280,6 +3295,10 @@ static void jl_method_table_invalidate(jl_method_t *replaced, size_t max_world, 
         if ((jl_value_t*)mi != jl_nothing) {
             invalidated = 1;
             invalidate_backedges(mi, max_world, "jl_method_table_disable");
+            // Dispatch cannot reach this method after `max_world`, so its own
+            // code is stale from then on too (see jl_evict_stale_code)
+            if (jl_code_unloading_enabled())
+                truncate_dead_method_mi(mi, max_world);
         }
     }
 
@@ -3334,6 +3353,246 @@ static int erase_method_backedges(jl_typemap_entry_t *def, void *closure) JL_CAN
 static int erase_all_backedges(jl_methtable_t *mt, void *env) JL_CANSAFEPOINT
 {
     return jl_typemap_visitor(jl_atomic_load_relaxed(&mt->defs), erase_method_backedges, env);
+}
+
+// ---- eviction of stale CodeInstances ----
+//
+// A CodeInstance whose world range ended before `live_world` cannot be reached
+// by dispatch from any world >= `live_world`. Once the oldest world that is
+// still occupied has moved past it, the only things keeping it (and its native
+// code) alive are the caches: the MethodInstance's CodeInstance list, and the
+// backedge lists it was recorded in as a caller. Drop it from all of those, so
+// that the garbage collector can free it, and the JIT its native code (see
+// `JuliaOJIT::codeGCBegin`).
+//
+// This is always safe, whatever `live_world` is: code that is still running is
+// kept alive by the stack scan, and a call in a world that the evicted
+// CodeInstance covered simply infers and compiles again. To keep that from
+// happening over and over for a task that stays in an old world, a stale
+// CodeInstance that was dispatched to since the last pass is kept
+// (JL_CI_FLAGS_RECENTLY_USED).
+
+struct evict_env {
+    size_t live_world;
+    size_t ncis;
+    size_t nedges;
+    // First pass: end the world range of the CodeInstances of methods that
+    // can no longer be dispatched to. Second pass: evict.
+    int truncate_only;
+};
+
+// Deleting or replacing a method invalidates its callers, but not its own
+// CodeInstances (the code is still a correct implementation of that method).
+// End their world range as well, so that they become stale: dispatch cannot
+// reach them in a later world. Anything that still gets to the method there
+// (e.g. `invoke` with the Method itself) compiles it again.
+static void truncate_dead_method_mi(jl_method_instance_t *mi, size_t method_max_world) JL_NOTSAFEPOINT
+{
+    jl_code_instance_t *ci = jl_atomic_load_relaxed(&mi->cache);
+    for (; ci; ci = jl_atomic_load_relaxed(&ci->next)) {
+        if (jl_object_in_image((jl_value_t*)ci))
+            continue;
+        size_t min_world = jl_atomic_load_relaxed(&ci->min_world);
+        size_t max_world = jl_atomic_load_relaxed(&ci->max_world);
+        if (min_world <= max_world && max_world > method_max_world && min_world <= method_max_world)
+            jl_atomic_store_relaxed(&ci->max_world, method_max_world);
+    }
+}
+
+static int ci_is_stale(jl_value_t *v, size_t live_world) JL_NOTSAFEPOINT
+{
+    if (v == NULL || !jl_is_code_instance(v))
+        return 0;
+    jl_code_instance_t *ci = (jl_code_instance_t*)v;
+    size_t min_world = jl_atomic_load_relaxed(&ci->min_world);
+    size_t max_world = jl_atomic_load_relaxed(&ci->max_world);
+    // (min_world > max_world is used for results that are not valid yet)
+    if (min_world > max_world || max_world >= live_world)
+        return 0;
+    // The compiler itself runs in a fixed, old world. Keep what it may call:
+    // code valid in that world, for methods that existed in it.
+    if (min_world <= jl_typeinf_world && jl_typeinf_world <= max_world) {
+        jl_method_instance_t *mi = jl_get_ci_mi(ci);
+        if (!jl_is_method(mi->def.value) ||
+            jl_atomic_load_relaxed(&mi->def.method->primary_world) <= jl_typeinf_world)
+            return 0;
+    }
+    // image objects are never freed, so there is nothing to gain
+    if (jl_object_in_image(v))
+        return 0;
+    return 1;
+}
+
+// Remove the stale CodeInstances from a plain list of edges
+static void evict_stale_from_list(jl_array_t *list, struct evict_env *env) JL_NOTSAFEPOINT
+{
+    size_t i, n = jl_array_nrows(list), ins = 0;
+    for (i = 0; i < n; i++) {
+        jl_value_t *v = jl_array_ptr_ref(list, i);
+        if (ci_is_stale(v, env->live_world)) {
+            env->nedges++;
+            continue;
+        }
+        if (ins != i)
+            jl_array_ptr_set(list, ins, v);
+        ins++;
+    }
+    if (ins != n)
+        jl_array_del_end(list, n - ins);
+}
+
+static void evict_stale_mi(jl_method_instance_t *mi, struct evict_env *env) JL_NOTSAFEPOINT
+{
+    // n.b. lock-free readers may be walking this list. They can still follow
+    // the `next` pointer of an entry that was unlinked.
+    jl_code_instance_t *prev = NULL;
+    jl_code_instance_t *ci = jl_atomic_load_relaxed(&mi->cache);
+    while (ci) {
+        jl_code_instance_t *next = jl_atomic_load_relaxed(&ci->next);
+        int stale = ci_is_stale((jl_value_t*)ci, env->live_world);
+        if (stale && (jl_atomic_load_relaxed(&ci->flags) & JL_CI_FLAGS_RECENTLY_USED)) {
+            // Second chance: a task in an old world dispatched to this since
+            // the last pass. Keep it until it goes unused for a whole pass.
+            jl_atomic_fetch_and_relaxed(&ci->flags, ~JL_CI_FLAGS_RECENTLY_USED);
+            stale = 0;
+        }
+        if (stale) {
+            if (prev) {
+                jl_atomic_store_release(&prev->next, next);
+                jl_gc_wb(prev, (void*)&prev->next, next);
+            }
+            else {
+                jl_atomic_store_release(&mi->cache, next);
+                jl_gc_wb(mi, (void*)&mi->cache, next);
+            }
+            env->ncis++;
+        }
+        else {
+            prev = ci;
+        }
+        ci = next;
+    }
+    uint8_t flags = 0;
+    jl_array_t *backedges = jl_mi_get_backedges_mutate(mi, &flags);
+    if (backedges) {
+        size_t i = 0, l = jl_array_nrows(backedges);
+        while (i < l) {
+            jl_value_t *invokesig = NULL;
+            jl_code_instance_t *caller = NULL;
+            size_t start = i;
+            i = get_next_edge(backedges, i, &invokesig, &caller);
+            if (caller && ci_is_stale((jl_value_t*)caller, env->live_world)) {
+                clear_next_edge(backedges, start, invokesig, caller);
+                jl_atomic_fetch_or(&mi->flags, MI_FLAG_BACKEDGES_DIRTY);
+                env->nedges++;
+            }
+        }
+        jl_mi_done_backedges(mi, flags);
+    }
+}
+
+static int evict_stale_method(jl_typemap_entry_t *def, void *closure) JL_CANSAFEPOINT
+{
+    struct evict_env *env = (struct evict_env*)closure;
+    jl_method_t *method = def->func.method;
+    size_t method_max_world = jl_atomic_load_relaxed(&def->max_world);
+    if (env->truncate_only && method_max_world >= env->live_world)
+        return 1;
+    JL_LOCK(&method->writelock);
+    jl_value_t *specializations = jl_atomic_load_relaxed(&method->specializations);
+    size_t i = 0, l = jl_is_svec(specializations) ? jl_svec_len(specializations) : 1;
+    for (; i <= l; i++) {
+        jl_method_instance_t *mi;
+        if (i == l)
+            mi = jl_atomic_load_relaxed(&method->unspecialized);
+        else if (jl_is_svec(specializations))
+            mi = (jl_method_instance_t*)jl_svecref(specializations, i);
+        else
+            mi = (jl_method_instance_t*)specializations;
+        if (mi == NULL || (jl_value_t*)mi == jl_nothing)
+            continue;
+        if (env->truncate_only)
+            truncate_dead_method_mi(mi, method_max_world);
+        else
+            evict_stale_mi(mi, env);
+    }
+    JL_UNLOCK(&method->writelock);
+    return 1;
+}
+
+static int evict_stale_mtable(jl_methtable_t *mt, void *env) JL_CANSAFEPOINT
+{
+    return jl_typemap_visitor(jl_atomic_load_relaxed(&mt->defs), evict_stale_method, env);
+}
+
+static void evict_stale_bindings(jl_array_t *mod_array, struct evict_env *env) JL_CANSAFEPOINT
+{
+    arraylist_t workqueue;
+    arraylist_new(&workqueue, 0);
+    for (size_t i = 0; i < jl_array_nrows(mod_array); i++) {
+        jl_module_t *m = (jl_module_t*)jl_array_ptr_ref(mod_array, i);
+        if (m->parent == m)
+            arraylist_push(&workqueue, m);
+    }
+    while (workqueue.len > 0) {
+        jl_module_t *m = (jl_module_t*)arraylist_pop(&workqueue);
+        JL_GC_PROMISE_ROOTED(m);
+        jl_svec_t *table = jl_atomic_load_relaxed(&m->bindings);
+        for (size_t i = 0; i < jl_svec_len(table); i++) {
+            jl_binding_t *b = (jl_binding_t*)jl_svecref(table, i);
+            if ((void*)b == jl_nothing)
+                break;
+            JL_LOCK(&m->lock);
+            if (b->backedges)
+                evict_stale_from_list(b->backedges, env);
+            JL_UNLOCK(&m->lock);
+            jl_value_t *v = jl_get_latest_binding_value_if_const(b);
+            if (v && jl_is_module(v)) {
+                jl_module_t *child = (jl_module_t*)v;
+                if (child != m && child->parent == m && child->name == b->globalref->name)
+                    arraylist_push(&workqueue, child);
+            }
+        }
+    }
+    arraylist_free(&workqueue);
+}
+
+// Returns the number of CodeInstances that were dropped from the caches.
+JL_DLLEXPORT size_t jl_evict_stale_code(size_t live_world) JL_CANSAFEPOINT
+{
+    struct evict_env env = {live_world, 0, 0, 1};
+    jl_array_t *mod_array = jl_get_loaded_modules();
+    if (mod_array == NULL)
+        return 0; // cannot find the modules right now (e.g. called from a generator)
+    JL_GC_PUSH1(&mod_array);
+    // exclude concurrent invalidations, which walk the same lists
+    JL_LOCK(&world_counter_lock);
+    jl_foreach_reachable_mtable(evict_stale_mtable, mod_array, (void*)&env);
+    env.truncate_only = 0;
+    jl_foreach_reachable_mtable(evict_stale_mtable, mod_array, (void*)&env);
+
+    // callers of signatures that have no method (yet)
+    JL_LOCK(&jl_method_table->cache->writelock);
+    jl_genericmemory_t *allbackedges = jl_method_table->backedges;
+    for (size_t i = 0, n = allbackedges->length; i < n; i += 2) {
+        jl_value_t *tn = jl_genericmemory_ptr_ref(allbackedges, i);
+        jl_value_t *table = jl_genericmemory_ptr_ref(allbackedges, i + 1);
+        if (!tn || tn == jl_nothing || !table)
+            continue;
+        jl_genericmemory_t *sigs = (jl_genericmemory_t*)table;
+        for (size_t j = 0, m = sigs->length; j < m; j += 2) {
+            jl_value_t *callers = jl_genericmemory_ptr_ref(sigs, j + 1);
+            if (callers && jl_is_array(callers))
+                evict_stale_from_list((jl_array_t*)callers, &env);
+        }
+    }
+    JL_UNLOCK(&jl_method_table->cache->writelock);
+
+    // users of global bindings
+    evict_stale_bindings(mod_array, &env);
+    JL_UNLOCK(&world_counter_lock);
+    JL_GC_POP();
+    return env.ncis;
 }
 
 JL_DLLEXPORT void jl_disable_new_worlds(void) JL_CANSAFEPOINT
@@ -4312,10 +4571,16 @@ STATIC_INLINE jl_callptr_t jl_method_compiled_callptr(jl_method_instance_t *mi, 
     for (; codeinst; codeinst = jl_atomic_load_relaxed(&codeinst->next)) {
         if (codeinst->owner != jl_nothing)
             continue;
-        if (jl_atomic_load_relaxed(&codeinst->min_world) <= world && world <= jl_atomic_load_relaxed(&codeinst->max_world)) {
+        size_t max_world = jl_atomic_load_relaxed(&codeinst->max_world);
+        if (jl_atomic_load_relaxed(&codeinst->min_world) <= world && world <= max_world) {
             jl_callptr_t invoke = jl_atomic_load_acquire(&codeinst->invoke);
             if (!invoke)
                 continue;
+            // Something is still running in a world that has otherwise ended.
+            // Tell jl_evict_stale_code that this code is worth keeping.
+            if (__unlikely(max_world != ~(size_t)0) &&
+                !(jl_atomic_load_relaxed(&codeinst->flags) & JL_CI_FLAGS_RECENTLY_USED))
+                jl_atomic_fetch_or_relaxed(&codeinst->flags, JL_CI_FLAGS_RECENTLY_USED);
             *codeinst_out = codeinst;
             return invoke;
         }

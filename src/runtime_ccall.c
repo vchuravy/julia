@@ -466,6 +466,11 @@ void *jl_get_abi_converter(jl_task_t *ct, void *data)
         f = jl_jit_abi_converter(ct, from_abi, codeinst);
     }
 
+    // The thunk keeps a raw pointer to this CodeInstance and to its code, and
+    // the pointer to the thunk may be anywhere. Without code unloading the
+    // MethodInstance cache keeps both alive forever; with it, nothing would.
+    if (codeinst != NULL && jl_code_unloading_enabled())
+        jl_as_global_root((jl_value_t*)codeinst, 1);
     cfuncdata->plast_codeinst = &cfuncdata->last_codeinst;
     cfuncdata->last_codeinst = codeinst;
     jl_atomic_store_release(&cfuncdata->fptr, f);

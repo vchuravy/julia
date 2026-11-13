@@ -142,6 +142,10 @@ public:
     void registerJITObject(const llvm::object::ObjectFile &Object,
                            std::function<uint64_t(const llvm::StringRef &)> getLoadAddress,
                            const jl_linker_info_t &Info) JL_NOTSAFEPOINT;
+    void unregisterCodeInstances(llvm::ArrayRef<std::pair<uintptr_t, size_t>> Ranges,
+                                 llvm::ArrayRef<jl_code_instance_t *> CIs) JL_NOTSAFEPOINT;
+    void sweepCodeInstances() JL_NOTSAFEPOINT;
+    void unregisterJITObject(llvm::ArrayRef<std::pair<uintptr_t, size_t>> Ranges) JL_NOTSAFEPOINT;
     objectmap_t& getObjectMap() JL_NOTSAFEPOINT;
     void add_image_info(image_info_t info) JL_NOTSAFEPOINT;
     bool get_image_info(uint64_t base, image_info_t *info) const JL_NOTSAFEPOINT;

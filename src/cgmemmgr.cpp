@@ -15,6 +15,7 @@
 #include <llvm/ExecutionEngine/JITLink/JITLinkMemoryManager.h>
 #include <llvm/ExecutionEngine/Orc/MapperJITLinkMemoryManager.h>
 #include <llvm/ExecutionEngine/SectionMemoryManager.h>
+#include <map>
 #include "llvm-codegen-shared.h"
 
 #include "julia.h"
@@ -569,6 +570,23 @@ public:
     {
         completed.clear();
     }
+    // Whether memory that has already been finalized (and therefore has its
+    // final page protections) can be written to again through `alloc_reuse`.
+    virtual bool can_reuse() const JL_NOTSAFEPOINT { return false; }
+    // Hand out previously freed memory at `rt_ptr` again. The content is
+    // written to a temporary buffer and copied over by `flush`.
+    Allocation alloc_reuse(void *rt_ptr, size_t size, size_t align,
+                           SmallVectorImpl<Allocation> &allocations) JL_NOTSAFEPOINT
+    {
+        assert(can_reuse());
+        SplitPtrBlock dummy;
+        void *wr_ptr = get_wr_ptr(dummy, rt_ptr, size, align);
+        Allocation a{wr_ptr, rt_ptr, size, false};
+        allocations.push_back(a);
+        return a;
+    }
+    // Overwrite freed memory so that a stale jump into it traps.
+    virtual void poison(void *rt_ptr, size_t size) JL_NOTSAFEPOINT {}
     Allocation alloc(size_t size, size_t align,
                      SmallVectorImpl<Allocation> &allocations) JL_NOTSAFEPOINT
     {
@@ -746,6 +764,20 @@ public:
         assert(get_self_mem_fd() != -1);
     }
     virtual ~SelfMemAllocator() JL_NOTSAFEPOINT override = default;
+    bool can_reuse() const override JL_NOTSAFEPOINT { return true; }
+    void poison(void *rt_ptr, size_t size) override JL_NOTSAFEPOINT
+    {
+        // 0xcc is `int3` on x86; on other architectures it is at least not
+        // the code that used to be there.
+        char buf[256];
+        memset(buf, 0xcc, sizeof(buf));
+        while (size > 0) {
+            size_t n = std::min(size, sizeof(buf));
+            write_self_mem(rt_ptr, buf, n);
+            rt_ptr = (char*)rt_ptr + n;
+            size -= n;
+        }
+    }
     void flush(ArrayRef<Allocation> allocations) override JL_NOTSAFEPOINT
     {
         for (auto &alloc : allocations) {
@@ -800,6 +832,69 @@ get_preferred_allocators() JL_NOTSAFEPOINT
     return {};
 }
 
+// Address-ordered, coalescing list of memory that was handed back by
+// `JLJITLinkMemoryManager::deallocate`.
+class FreeList {
+    std::map<uintptr_t, size_t> ranges;
+    size_t total{0};
+public:
+    size_t bytes() const JL_NOTSAFEPOINT { return total; }
+    void add(void *ptr, size_t size) JL_NOTSAFEPOINT
+    {
+        if (size == 0)
+            return;
+        uintptr_t start = (uintptr_t)ptr;
+        total += size;
+        auto next = ranges.lower_bound(start);
+        if (next != ranges.begin()) {
+            auto prev = std::prev(next);
+            assert(prev->first + prev->second <= start);
+            if (prev->first + prev->second == start) {
+                start = prev->first;
+                size += prev->second;
+                ranges.erase(prev);
+            }
+        }
+        if (next != ranges.end()) {
+            assert(start + size <= next->first);
+            if (start + size == next->first) {
+                size += next->second;
+                ranges.erase(next);
+            }
+        }
+        ranges[start] = size;
+    }
+    // First fit. Returns nullptr if no range is large enough.
+    void *take(size_t size, size_t align) JL_NOTSAFEPOINT
+    {
+        if (size == 0)
+            return nullptr;
+        for (auto it = ranges.begin(); it != ranges.end(); ++it) {
+            uintptr_t start = it->first;
+            uintptr_t end = start + it->second;
+            uintptr_t p = LLT_ALIGN(start, align);
+            if (p >= end || end - p < size)
+                continue;
+            ranges.erase(it);
+            if (p > start)
+                ranges[start] = p - start;
+            if (p + size < end)
+                ranges[p + size] = end - (p + size);
+            total -= size;
+            return (void*)p;
+        }
+        return nullptr;
+    }
+};
+
+// What `JLJITLinkMemoryManager` remembers about a finalized allocation, so
+// that it can be handed back later. A `FinalizedAlloc` is a pointer to this.
+struct JLFinalizedAllocInfo {
+    typedef SmallVector<std::pair<void*, size_t>, 2> RangeList;
+    RangeList RW, RO, Exe;
+    std::vector<orc::shared::WrapperFunctionCall> DeallocActions;
+};
+
 // The ROAllocator blocks are shared between all of the allocations that are in
 // flight at the same time, and their page protections can only be applied once
 // none of them is writing to those blocks anymore. `InFlight` counts the
@@ -817,6 +912,9 @@ get_preferred_allocators() JL_NOTSAFEPOINT
 // finalized. Deferring it to the end of the batch would deadlock against the
 // LinkGraph's own allocation, which is not finalized until the linker thread
 // gets to run again.
+class JLJITLinkMemoryManager;
+static JLJITLinkMemoryManager *TheJLMemMgr;
+
 class JLJITLinkMemoryManager : public jitlink::JITLinkMemoryManager {
     using OnFinalizedFunction =
         jitlink::JITLinkMemoryManager::InFlightAlloc::OnFinalizedFunction;
@@ -833,6 +931,10 @@ class JLJITLinkMemoryManager : public jitlink::JITLinkMemoryManager {
     std::unique_ptr<ROAllocator> ExeAlloc;
     SmallVector<PendingFinalize> FinalizedCallbacks;
     uint32_t InFlight{0};
+    // Memory released by `deallocate`, available for reuse.
+    FreeList RWFree, ROFree, ExeFree;
+    size_t FreedBytes{0};
+    size_t ReusedBytes{0};
 
 public:
     class InFlightAlloc;
@@ -840,9 +942,11 @@ public:
     static std::unique_ptr<JITLinkMemoryManager> Create() JL_NOTSAFEPOINT
     {
         auto [ROAlloc, ExeAlloc] = get_preferred_allocators();
-        if (ROAlloc && ExeAlloc)
-            return std::unique_ptr<JLJITLinkMemoryManager>(
-                new JLJITLinkMemoryManager(std::move(ROAlloc), std::move(ExeAlloc)));
+        if (ROAlloc && ExeAlloc) {
+            auto *MM = new JLJITLinkMemoryManager(std::move(ROAlloc), std::move(ExeAlloc));
+            TheJLMemMgr = MM;
+            return std::unique_ptr<JLJITLinkMemoryManager>(MM);
+        }
 
         return cantFail(
             orc::MapperJITLinkMemoryManager::CreateWithMapper<orc::InProcessMemoryMapper>(
@@ -855,8 +959,41 @@ public:
     void deallocate(std::vector<FinalizedAlloc> Allocs,
                     OnDeallocatedFunction OnDeallocated) override
     {
-        // This shouldn't be reachable, but we will get a better error message
-        // from JITLink if we leak this allocation and fail elsewhere.
+        Error Err = Error::success();
+        for (auto &FA : Allocs) {
+            auto *Info = FA.release().toPtr<JLFinalizedAllocInfo *>();
+            if (!Info)
+                continue;
+            // e.g. EH frame deregistration
+            Err = joinErrors(std::move(Err),
+                             orc::shared::runDeallocActions(Info->DeallocActions));
+            {
+                std::unique_lock Lock{Mutex};
+                for (auto &[Ptr, Size] : Info->RW) {
+                    RWFree.add(Ptr, Size);
+                    FreedBytes += Size;
+                }
+                for (auto &[Ptr, Size] : Info->RO) {
+                    ROFree.add(Ptr, Size);
+                    FreedBytes += Size;
+                }
+                for (auto &[Ptr, Size] : Info->Exe) {
+                    ExeAlloc->poison(Ptr, Size);
+                    ExeFree.add(Ptr, Size);
+                    FreedBytes += Size;
+                }
+            }
+            delete Info;
+        }
+        OnDeallocated(std::move(Err));
+    }
+
+    void getStats(size_t *freed, size_t *reused, size_t *avail)
+    {
+        std::unique_lock Lock{Mutex};
+        *freed = FreedBytes;
+        *reused = ReusedBytes;
+        *avail = RWFree.bytes() + ROFree.bytes() + ExeFree.bytes();
     }
 
 protected:
@@ -939,15 +1076,17 @@ class JLJITLinkMemoryManager::InFlightAlloc
   : public jitlink::JITLinkMemoryManager::InFlightAlloc {
     JLJITLinkMemoryManager &MM;
     jitlink::LinkGraph &G;
+    SmallVector<Allocation, 4> RWAllocs;
     SmallVector<Allocation, 4> ROAllocs;
     SmallVector<Allocation, 4> ExeAllocs;
     bool Completed{false};
 
 public:
     InFlightAlloc(JLJITLinkMemoryManager &MM, jitlink::LinkGraph &G,
+                  SmallVector<Allocation, 4> RWAllocs,
                   SmallVector<Allocation, 4> ROAllocs,
                   SmallVector<Allocation, 4> ExeAllocs) JL_NOTSAFEPOINT
-        : MM(MM), G(G), ROAllocs(std::move(ROAllocs)),
+        : MM(MM), G(G), RWAllocs(std::move(RWAllocs)), ROAllocs(std::move(ROAllocs)),
           ExeAllocs(std::move(ExeAllocs)) {}
 
     // LLVM does not guarantee that every InFlightAlloc is either finalized or
@@ -973,16 +1112,25 @@ public:
         assert(!Completed);
         Completed = true;
         auto *GP = &G;
+        auto Info = std::make_unique<JLFinalizedAllocInfo>();
+        for (auto &A : RWAllocs)
+            Info->RW.push_back({A.rt_addr, A.sz});
+        for (auto &A : ROAllocs)
+            Info->RO.push_back({A.rt_addr, A.sz});
+        for (auto &A : ExeAllocs)
+            Info->Exe.push_back({A.rt_addr, A.sz});
         MM.finalize(std::move(ROAllocs), std::move(ExeAllocs),
-                    [GP, OnFinalized =
+                    [GP, Info = std::move(Info), OnFinalized =
                              std::move(OnFinalized)](Expected<FinalizedAlloc> FA) mutable {
             if (!FA)
                 return OnFinalized(FA.takeError());
-            // Need to handle dealloc actions when we GC code
+            // The dealloc actions run when this allocation is handed back to
+            // `JLJITLinkMemoryManager::deallocate`.
             auto E = orc::shared::runFinalizeActions(GP->allocActions());
             if (!E)
                 return OnFinalized(E.takeError());
-            OnFinalized(std::move(FA));
+            Info->DeallocActions = std::move(*E);
+            OnFinalized(FinalizedAlloc(orc::ExecutorAddr::fromPtr(Info.release())));
         });
     }
 };
@@ -994,6 +1142,7 @@ void JLJITLinkMemoryManager::allocate(const jitlink::JITLinkDylib *JD,
                                       OnAllocatedFunction OnAllocated)
 {
     jitlink::BasicLayout BL{G};
+    SmallVector<Allocation, 4> RWAllocs;
     SmallVector<Allocation, 4> ROAllocs;
     SmallVector<Allocation, 4> ExeAllocs;
 
@@ -1008,14 +1157,35 @@ void JLJITLinkMemoryManager::allocate(const jitlink::JITLinkDylib *JD,
             uint64_t Alignment = Seg.Alignment.value();
             uint64_t Size = Seg.ContentSize + Seg.ZeroFillSize;
             Allocation Alloc;
-            if (Prot == (MemProt::Read | MemProt::Write))
-                Alloc = RWAlloc.alloc(Size, Alignment);
-            else if (Prot == MemProt::Read)
-                Alloc = ROAlloc->alloc(Size, Alignment, ROAllocs);
-            else if (Prot == (MemProt::Read | MemProt::Exec))
-                Alloc = ExeAlloc->alloc(Size, Alignment, ExeAllocs);
+            // Prefer memory that was freed by `deallocate`. It is not zeroed
+            // (unlike fresh pages), and JITLink relies on that for padding
+            // and zero-fill, so clear the working memory here.
+            void *Reused = nullptr;
+            if (Prot == (MemProt::Read | MemProt::Write)) {
+                if ((Reused = RWFree.take(Size, Alignment)))
+                    Alloc = {Reused, Reused, Size, false};
+                else
+                    Alloc = RWAlloc.alloc(Size, Alignment);
+                RWAllocs.push_back(Alloc);
+            }
+            else if (Prot == MemProt::Read) {
+                if (ROAlloc->can_reuse() && (Reused = ROFree.take(Size, Alignment)))
+                    Alloc = ROAlloc->alloc_reuse(Reused, Size, Alignment, ROAllocs);
+                else
+                    Alloc = ROAlloc->alloc(Size, Alignment, ROAllocs);
+            }
+            else if (Prot == (MemProt::Read | MemProt::Exec)) {
+                if (ExeAlloc->can_reuse() && (Reused = ExeFree.take(Size, Alignment)))
+                    Alloc = ExeAlloc->alloc_reuse(Reused, Size, Alignment, ExeAllocs);
+                else
+                    Alloc = ExeAlloc->alloc(Size, Alignment, ExeAllocs);
+            }
             else
                 abort();
+            if (Reused) {
+                memset(Alloc.wr_addr, 0, Size);
+                ReusedBytes += Size;
+            }
 
             Seg.Addr = orc::ExecutorAddr::fromPtr(Alloc.rt_addr);
             Seg.WorkingMem = (char *)Alloc.wr_addr;
@@ -1027,7 +1197,8 @@ void JLJITLinkMemoryManager::allocate(const jitlink::JITLinkDylib *JD,
         ++InFlight;
     }
 
-    OnAllocated(std::make_unique<InFlightAlloc>(*this, G, std::move(ROAllocs),
+    OnAllocated(std::make_unique<InFlightAlloc>(*this, G, std::move(RWAllocs),
+                                                std::move(ROAllocs),
                                                 std::move(ExeAllocs)));
 }
 }
@@ -1035,4 +1206,11 @@ void JLJITLinkMemoryManager::allocate(const jitlink::JITLinkDylib *JD,
 std::unique_ptr<jitlink::JITLinkMemoryManager> createJITLinkMemoryManager() JL_NOTSAFEPOINT
 {
     return JLJITLinkMemoryManager::Create();
+}
+
+void jl_jit_memmgr_stats(size_t *freed, size_t *reused, size_t *avail)
+{
+    *freed = *reused = *avail = 0;
+    if (TheJLMemMgr)
+        TheJLMemMgr->getStats(freed, reused, avail);
 }

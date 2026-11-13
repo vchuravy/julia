@@ -47,6 +47,15 @@
 // 8M signal stack, same as default stack size (though we barely use this)
 static const size_t sig_stack_size = 8 * 1024 * 1024;
 
+void jl_signal_stack_bounds(jl_ptls_t ptls, char **lo, char **hi) JL_NOTSAFEPOINT
+{
+    *lo = *hi = NULL;
+    if (ptls->signal_stack == NULL)
+        return;
+    *lo = (char*)ptls->signal_stack;
+    *hi = *lo + (ptls->signal_stack_size ? ptls->signal_stack_size : sig_stack_size);
+}
+
 #include "julia_assert.h"
 
 // helper function for returning the unw_context_t inside a ucontext_t

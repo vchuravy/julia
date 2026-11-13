@@ -1683,6 +1683,22 @@ JL_DLLEXPORT size_t jl_try_record_thread_backtrace(jl_ptls_t ptls2, jl_bt_elemen
     return bt_size;
 }
 
+// The stack pointer a suspended task will resume with, or 0 if it cannot be
+// determined (the caller must then assume the whole stack buffer is in use).
+uintptr_t jl_task_saved_sp(jl_task_t *t) JL_NOTSAFEPOINT
+{
+#if defined(JL_TASK_SWITCH_ASM) && defined(_OS_LINUX_) && defined(_CPU_X86_64_) && defined(__GLIBC__)
+    if (!t->ctx.copy_stack && t->ctx.started && t->ctx.ctx != NULL) {
+        bt_context_t c;
+        memset(&c, 0, sizeof(c));
+        jl_jmp_buf *mctx = &t->ctx.ctx->uc_mcontext;
+        if (jl_simulate_longjmp(*mctx, &c, 1))
+            return (uintptr_t)((ucontext_t*)&c)->uc_mcontext.gregs[REG_RSP];
+    }
+#endif
+    return 0;
+}
+
 static size_t rec_backtrace_task(jl_task_t *t, bt_context_t *c, int use_ctx,  jl_bt_element_t *bt_data, size_t max_bt_size, int all_tasks_profiler) JL_NOTSAFEPOINT
 {
     if (!use_ctx && !t->ctx.copy_stack && t->ctx.started && t->ctx.ctx != NULL) {

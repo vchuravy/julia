@@ -2563,6 +2563,14 @@ JL_DLLIMPORT int jl_getFunctionInfo(jl_frame_t **frames, uintptr_t pointer, int 
 JL_DLLIMPORT uint64_t jl_getUnwindInfo(uint64_t dwBase) JL_NOTSAFEPOINT;
 JL_DLLIMPORT void jl_jit_register_ci(jl_code_instance_t *ci) JL_NOTSAFEPOINT;
 JL_DLLIMPORT void jl_jit_unregister_ci(jl_code_instance_t *ci) JL_NOTSAFEPOINT;
+// JIT code unloading (see the comment above `gc_unload_code` in gc-stock.c)
+JL_DLLIMPORT int jl_jit_code_gc_begin(uintptr_t *lo, uintptr_t *hi) JL_NOTSAFEPOINT;
+JL_DLLIMPORT void jl_jit_code_gc_mark_addr(uintptr_t addr) JL_NOTSAFEPOINT;
+JL_DLLIMPORT void jl_jit_code_gc_end(void) JL_NOTSAFEPOINT;
+JL_DLLIMPORT size_t jl_jit_release_dead_code(void);
+JL_DLLIMPORT void jl_jit_unload_stats(size_t *stats, size_t n) JL_NOTSAFEPOINT;
+JL_DLLEXPORT int jl_gc_object_marked(jl_value_t *v) JL_NOTSAFEPOINT;
+int jl_code_unloading_enabled(void) JL_NOTSAFEPOINT;
 
 #ifdef __cplusplus
 }

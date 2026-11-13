@@ -3616,6 +3616,163 @@ static void _report_gc_finished(uint64_t pause, uint64_t freed, int full, int re
 }
 
 // Only one thread should be running in this function
+// --- JIT code unloading ---
+//
+// Once marking is complete, the JIT is told which CodeInstances are dead (it
+// asks through `jl_gc_object_marked`), and proposes the native code it would
+// like to free. Code may still be executing even though nothing references its
+// CodeInstance anymore, so every stack (and the register state of threads that
+// were interrupted for this collection) is conservatively scanned for
+// pointers into that code. See `JuliaOJIT::codeGCBegin` in jitlayers.cpp.
+
+JL_DLLEXPORT int jl_gc_object_marked(jl_value_t *v) JL_NOTSAFEPOINT
+{
+    return gc_marked(jl_astaggedvalue(v)->bits.gc);
+}
+
+static struct {
+    uint64_t nscans;
+    uint64_t scan_bytes;
+    uint64_t scan_ns;
+} gc_code_stats;
+
+JL_DLLEXPORT void jl_gc_code_scan_stats(uint64_t *nscans, uint64_t *bytes, uint64_t *ns) JL_NOTSAFEPOINT
+{
+    *nscans = gc_code_stats.nscans;
+    *bytes = gc_code_stats.scan_bytes;
+    *ns = gc_code_stats.scan_ns;
+}
+
+// Scan [low, high) from the top down, and stop at the first inaccessible page:
+// stacks grow down, so anything below that has never been used.
+JL_NO_ASAN static void gc_code_scan_range(char *low, char *high, uintptr_t lo, uintptr_t hi) JL_NOTSAFEPOINT
+{
+    if (low == NULL || high <= low)
+        return;
+    jl_jmp_buf *old_buf = jl_get_safe_restore();
+    jl_jmp_buf buf;
+    if (jl_setjmp(buf, 0)) {
+        jl_set_safe_restore(old_buf);
+        return;
+    }
+    jl_set_safe_restore(&buf);
+    low = (char*)LLT_ALIGN((uintptr_t)low, sizeof(void*));
+    high = (char*)((uintptr_t)high & ~(uintptr_t)(sizeof(void*) - 1));
+    gc_code_stats.scan_bytes += high - low;
+    for (uintptr_t *p = ((uintptr_t*)high) - 1; p >= (uintptr_t*)low; p--) {
+        uintptr_t v = *p;
+        if (v >= lo && v < hi)
+            jl_jit_code_gc_mark_addr(v);
+    }
+    jl_set_safe_restore(old_buf);
+}
+
+#if defined(_OS_LINUX_)
+uintptr_t jl_task_saved_sp(jl_task_t *t) JL_NOTSAFEPOINT;
+void jl_signal_stack_bounds(jl_ptls_t ptls, char **lo, char **hi) JL_NOTSAFEPOINT;
+
+static void gc_code_scan_task(jl_task_t *t, int running, uintptr_t lo, uintptr_t hi) JL_NOTSAFEPOINT
+{
+    if (t == NULL)
+        return;
+    char *active_start, *active_end, *total_start, *total_end;
+    jl_active_task_stack(t, &active_start, &active_end, &total_start, &total_end);
+    if (active_start == NULL)
+        return;
+    if (!running && !t->ctx.copy_stack) {
+        // A suspended task only uses its stack above the saved stack pointer.
+        // (128 bytes below it is the red zone.)
+        uintptr_t sp = jl_task_saved_sp(t);
+        if (sp > (uintptr_t)active_start + 128 && sp <= (uintptr_t)active_end)
+            active_start = (char*)(sp - 128);
+    }
+    gc_code_scan_range(active_start, active_end, lo, hi);
+}
+
+static NOINLINE void gc_code_scan_all(uintptr_t lo, uintptr_t hi) JL_NOTSAFEPOINT
+{
+    jl_task_t *ct = jl_current_task;
+    for (int i = 0; i < gc_n_threads; i++) {
+        jl_ptls_t ptls2 = gc_all_tls_states[i];
+        if (ptls2 == NULL)
+            continue;
+        // Threads interrupted at a safepoint are parked inside their signal
+        // handler: the interrupted pc and registers live in the signal frame
+        // at the top of the signal stack.
+        char *sig_lo = NULL, *sig_hi = NULL;
+        jl_signal_stack_bounds(ptls2, &sig_lo, &sig_hi);
+        if (sig_hi && sig_hi - sig_lo > (1 << 18))
+            sig_lo = sig_hi - (1 << 18);
+        gc_code_scan_range(sig_lo, sig_hi, lo, hi);
+        // Tasks that are (or may be about to start) running on this thread
+        jl_task_t *running[4] = {
+            jl_atomic_load_relaxed(&ptls2->current_task), ptls2->root_task,
+            ptls2->next_task, ptls2->previous_task };
+        for (int j = 0; j < 4; j++)
+            gc_code_scan_task(running[j], 1, lo, hi);
+        // Suspended tasks
+        small_arraylist_t *live_tasks = &ptls2->gc_tls_common.heap.live_tasks;
+        size_t n = mtarraylist_length(live_tasks);
+        for (size_t j = 0; j < n; j++) {
+            jl_task_t *t = (jl_task_t*)mtarraylist_get(live_tasks, j);
+            if (t == NULL || t == running[0] || t == running[1] || t == running[2] || t == running[3])
+                continue;
+            int is_running = 0;
+            for (int k = 0; k < gc_n_threads && !is_running; k++) {
+                jl_ptls_t ptls3 = gc_all_tls_states[k];
+                is_running = ptls3 && jl_atomic_load_relaxed(&ptls3->current_task) == t;
+            }
+            gc_code_scan_task(t, is_running, lo, hi);
+        }
+    }
+    (void)ct;
+}
+#endif
+
+// What is left to do for code unloading once the world is running again:
+// 1 = free the code that was found dead,
+// 2 = also look for stale CodeInstances (after a full collection, since that
+//     is the only kind that can then find them dead)
+static _Atomic(int) gc_code_unload_pending;
+static _Atomic(int) gc_code_unload_running;
+JL_DLLEXPORT size_t jl_evict_stale_code(size_t live_world) JL_CANSAFEPOINT;
+
+static void gc_code_unload_finish(void) JL_CANSAFEPOINT
+{
+    int expected = 0;
+    // n.b. evicting allocates, and may get here again
+    if (!jl_atomic_cmpswap(&gc_code_unload_running, &expected, 1))
+        return;
+    int pending = jl_atomic_exchange(&gc_code_unload_pending, 0);
+    if (pending)
+        jl_jit_release_dead_code();
+    if (pending > 1)
+        jl_evict_stale_code(jl_atomic_load_acquire(&jl_world_counter));
+    jl_atomic_store_release(&gc_code_unload_running, 0);
+}
+
+static void gc_unload_code(int full) JL_NOTSAFEPOINT
+{
+#if defined(_OS_LINUX_)
+    uintptr_t lo = 0, hi = 0;
+    int enabled = jl_jit_code_gc_begin(&lo, &hi);
+    if (!enabled)
+        return;
+    if (jl_atomic_load_relaxed(&gc_code_unload_pending) < 1 + full)
+        jl_atomic_store_relaxed(&gc_code_unload_pending, 1 + full);
+    if (enabled < 2) // nothing to scan for
+        return;
+    uint64_t t0 = jl_hrtime();
+    // Spill the callee-saved registers of this thread into this frame, which
+    // lies above the frame address `gc_code_scan_all` starts scanning from.
+    __builtin_unwind_init();
+    gc_code_scan_all(lo, hi);
+    jl_jit_code_gc_end();
+    gc_code_stats.nscans++;
+    gc_code_stats.scan_ns += jl_hrtime() - t0;
+#endif
+}
+
 static int _jl_gc_collect(jl_ptls_t ptls, jl_gc_collection_t collection) JL_NOTSAFEPOINT
 {
     combine_thread_gc_counts(&gc_num, 1);
@@ -3738,6 +3895,9 @@ static int _jl_gc_collect(jl_ptls_t ptls, jl_gc_collection_t collection) JL_NOTS
 
     // Flush everything in mark cache
     gc_sync_all_caches(ptls);
+
+    // Find native code that died in this collection
+    gc_unload_code(prev_sweep_full);
 
 
     if (GC_VERIFY_ENABLED)
@@ -4227,6 +4387,11 @@ JL_DLLEXPORT void jl_gc_collect(jl_gc_collection_t collection)
         JL_TIMING(GC, GC_Finalizers);
         run_finalizers(ct, 0);
     }
+    // Like finalizers, this takes locks and so can only happen while this
+    // thread holds none.
+    if (gc_code_unload_pending && !ptls->finalizers_inhibited && ptls->locks.len == 0 &&
+            ptls->engine_nqueued == 0)
+        gc_code_unload_finish();
     JL_PROBE_GC_FINALIZER();
 
     gc_invoke_callbacks(jl_gc_cb_post_gc_t,

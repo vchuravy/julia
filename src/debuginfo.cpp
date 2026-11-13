@@ -420,6 +420,80 @@ void JITDebugInfoRegistry::registerJITObject(
         delete ObjectCopy;
 }
 
+// Forget the CodeInstances (all of them if `CIs` is empty) that own functions
+// in the given address ranges. Must be done before those objects are freed.
+void JITDebugInfoRegistry::unregisterCodeInstances(
+    ArrayRef<std::pair<uintptr_t, size_t>> Ranges, ArrayRef<jl_code_instance_t *> CIs)
+{
+    jl_profile_atomic([&]() JL_NOTSAFEPOINT {
+        for (auto &[Start, Size] : Ranges) {
+            if (Size == 0)
+                continue;
+            // n.b. the map is sorted by decreasing address
+            auto it = cimap.lower_bound(Start + Size - 1);
+            while (it != cimap.end() && it->first >= Start) {
+                if (CIs.empty() || is_contained(CIs, it->second.second))
+                    it = cimap.erase(it);
+                else
+                    ++it;
+            }
+        }
+    });
+}
+
+// Forget every CodeInstance that the garbage collector did not mark, and is
+// about to free. Only for use at the end of the mark phase.
+void JITDebugInfoRegistry::sweepCodeInstances()
+{
+    jl_profile_atomic([&]() JL_NOTSAFEPOINT {
+        for (auto it = cimap.begin(); it != cimap.end();) {
+            if (!jl_gc_object_marked((jl_value_t*)it->second.second))
+                it = cimap.erase(it);
+            else
+                ++it;
+        }
+    });
+}
+
+void jl_sweep_jit_cis(void)
+{
+    getJITDebugRegistry().sweepCodeInstances();
+}
+
+// Forget everything about the code in the given address ranges.
+void JITDebugInfoRegistry::unregisterJITObject(ArrayRef<std::pair<uintptr_t, size_t>> Ranges)
+{
+    unregisterCodeInstances(Ranges, {});
+    SmallPtrSet<LazyObjectInfo *, 2> Objects;
+    jl_profile_atomic([&]() JL_NOTSAFEPOINT {
+        for (auto &[Start, Size] : Ranges) {
+            if (Size == 0)
+                continue;
+            auto it = objectmap.lower_bound(Start + Size - 1);
+            while (it != objectmap.end() && it->first >= Start) {
+                Objects.insert(it->second.object);
+                it = objectmap.erase(it);
+            }
+        }
+    });
+    for (auto *Object : Objects) {
+        // undo the accounting of registerJITObject
+        jl_jit_add_bytes(-(size_t)Object->data.size());
+        delete Object;
+    }
+}
+
+void jl_unregister_jit_cis(ArrayRef<std::pair<uintptr_t, size_t>> Ranges,
+                           ArrayRef<jl_code_instance_t *> CIs)
+{
+    getJITDebugRegistry().unregisterCodeInstances(Ranges, CIs);
+}
+
+void jl_unregister_jit_object(ArrayRef<std::pair<uintptr_t, size_t>> Ranges)
+{
+    getJITDebugRegistry().unregisterJITObject(Ranges);
+}
+
 void jl_register_jit_object(const object::ObjectFile &Object,
                             std::function<uint64_t(const StringRef &)> getLoadAddress,
                             const jl_linker_info_t &Info)
@@ -1580,6 +1654,15 @@ static DW_EH_PE parseCIE(const uint8_t *Addr, const uint8_t *End) JL_NOTSAFEPOIN
     return DW_EH_PE_absptr;
 }
 
+// The entries registered with our unwinder, keyed by the address of the
+// .eh_frame section, so that they can be cancelled when the code is unloaded.
+// Protected by the profile lock.
+static std::map<uint8_t*, unw_dyn_info_t*> &getDynUnwindInfos() JL_NOTSAFEPOINT
+{
+    static std::map<uint8_t*, unw_dyn_info_t*> infos;
+    return infos;
+}
+
 void register_eh_frames(uint8_t *Addr, size_t Size)
 {
     // System unwinder
@@ -1713,17 +1796,27 @@ void register_eh_frames(uint8_t *Addr, size_t Size)
 
     jl_profile_atomic([&]() JL_NOTSAFEPOINT {
         _U_dyn_register(di);
+        getDynUnwindInfos()[Addr] = di;
     });
 }
 
 void deregister_eh_frames(uint8_t *Addr, size_t Size)
 {
+    unw_dyn_info_t *di = nullptr;
     jl_profile_atomic([&]() JL_NOTSAFEPOINT {
         __deregister_frame(Addr);
+        auto &infos = getDynUnwindInfos();
+        auto it = infos.find(Addr);
+        if (it != infos.end()) {
+            di = it->second;
+            infos.erase(it);
+            _U_dyn_cancel(di);
+        }
     });
-    // Deregistering with our unwinder (_U_dyn_cancel) requires a lookup table
-    // to find the allocated entry above (or looking into libunwind's internal
-    // data structures).
+    if (di) {
+        delete[] (unw_table_entry*)di->u.rti.table_data;
+        delete di;
+    }
 }
 
 #else

@@ -352,6 +352,9 @@ struct jl_linker_info_t {
         call_targets;
     DenseMap<void *, orc::SymbolStringPtr> global_targets;
     DenseMap<_Atomic(uint64_t) *, orc::SymbolStringPtr> coverage_counters;
+    // This code contains something whose address escapes (a cfunction thunk),
+    // so it can never be unloaded.
+    bool never_unload = false;
 };
 
 struct jl_emitted_output_t {
@@ -586,6 +589,29 @@ using CISymbolMap = DenseMap<jl_code_instance_t *, CISymbolPtr>;
 class JLMaterializationUnit;
 class JLTrampolineMaterializationUnit;
 
+// A unit of native code that is loaded, and can be unloaded, as a whole: the
+// output of one JLMaterializationUnit. See `JuliaOJIT::codeGCBegin`.
+struct JITCodeUnit {
+    orc::ResourceTrackerSP RT;
+    // CodeInstances whose invoke/specptr point into this unit, and that were
+    // alive at the last collection. Not rooted.
+    SmallVector<jl_code_instance_t *, 1> CIs;
+    // All the memory JITLink allocated for this unit, as (start, size)
+    SmallVector<std::pair<uintptr_t, size_t>, 4> Ranges;
+    // Units this one refers to directly (e.g. statically resolved calls)
+    SmallPtrSet<JITCodeUnit *, 4> Deps;
+    // Slots for the addresses of runtime globals referenced by this unit
+    void **GlobalPtrs = nullptr;
+    size_t Bytes = 0;      // allocated memory
+    size_t GraphBytes = 0; // as accounted in jit_bytes_size (includes debug info)
+    bool Pinned = false;  // referred to by code that is never unloaded
+    bool Started = false; // materialization began
+    bool Emitted = false; // materialization finished
+    bool Mark = false;
+    // The number of consecutive collections that found this unit unreachable
+    uint8_t DeadCount = 0;
+};
+
 struct JITObjectInfo {
     std::unique_ptr<WritableMemoryBuffer> BackingBuffer;
     std::unique_ptr<object::ObjectFile> Object;
@@ -790,6 +816,35 @@ public:
     // same address from being linked to old symbol.
     void unregisterCI(jl_code_instance_t *CI) JL_NOTSAFEPOINT;
 
+    // --- Code unloading ---
+    // (experimental, enabled with JULIA_JIT_UNLOAD=1)
+    //
+    // Native code is kept alive by (1) a live CodeInstance pointing to it,
+    // (2) being executed, i.e. a stack or register holding a pointer into it,
+    // or (3) other live native code referring to it. The garbage collector
+    // drives this: after marking, with the world stopped, it calls
+    // codeGCBegin, which drops the CodeInstances that were not marked and
+    // returns the address range of the code that would be freed. The GC then
+    // scans all stacks and reports pointers into that range through
+    // codeGCMarkAddr, and codeGCEnd propagates liveness along the dependency
+    // edges and queues what is left. Nothing is actually freed with the world
+    // stopped; releaseDeadCode does that later.
+    bool UnloadEnabled = false;
+    bool codeGCBegin(uintptr_t *Lo, uintptr_t *Hi) JL_NOTSAFEPOINT;
+    void codeGCMarkAddr(uintptr_t Addr) JL_NOTSAFEPOINT;
+    void codeGCEnd() JL_NOTSAFEPOINT;
+    size_t releaseDeadCode();
+    void getUnloadStats(size_t *Stats, size_t N) JL_NOTSAFEPOINT;
+    // For the JITLink passes that record what a unit consists of / refers to
+    JITCodeUnit *unitForMR(orc::MaterializationResponsibility &MR) JL_NOTSAFEPOINT;
+    void addUnitRange(JITCodeUnit *U, uintptr_t Start, size_t Size) JL_NOTSAFEPOINT;
+    void addUnitDep(JITCodeUnit *U, uintptr_t Addr) JL_NOTSAFEPOINT;
+    void pinUnitAt(uintptr_t Addr) JL_NOTSAFEPOINT;
+    void setUnitEmitted(JITCodeUnit *U) JL_NOTSAFEPOINT;
+    void setUnitStarted(JITCodeUnit *U) JL_NOTSAFEPOINT;
+    // Must hold LinkerMutex. Returns null if the code must never be unloaded.
+    JITCodeUnit *createUnit(ArrayRef<jl_code_instance_t *> Owned) JL_NOTSAFEPOINT;
+
     orc::ThreadSafeContext makeContext() JL_NOTSAFEPOINT;
     const DataLayout& getDataLayout() const JL_NOTSAFEPOINT;
 
@@ -908,6 +963,19 @@ private:
     CISymbolMap CISymbols;
     jl_name_counter_t Names;
 
+    // UnitMutex protects everything below. Lock order: LinkerMutex, UnitMutex.
+    std::mutex UnitMutex;
+    JITCodeUnit *lookupUnit(uintptr_t Addr) JL_NOTSAFEPOINT;
+    DenseSet<JITCodeUnit *> Units;
+    DenseMap<orc::ResourceKey, JITCodeUnit *> UnitsByKey;
+    // start -> (size, unit), for all the memory of all units
+    std::map<uintptr_t, std::pair<size_t, JITCodeUnit *>> UnitRanges;
+    SmallVector<JITCodeUnit *, 0> DeadUnits;
+    SmallVector<JITCodeUnit *, 0> GCWorklist;
+    bool InCodeGC = false;
+    size_t UnitsCreated = 0, UnitsFreed = 0, UnitBytesFreed = 0, UnitsKeptByStack = 0,
+           UnitsKeptByDep = 0, CIsDied = 0, CodeGCs = 0;
+
     std::unique_ptr<DLSymOptimizer> DLSymOpt;
 
     //Compilation streams
@@ -983,6 +1051,11 @@ CodeGenOptLevel CodeGenOptLevelFor(int optlevel) JL_NOTSAFEPOINT;
 
 void jl_jit_add_bytes(size_t bytes) JL_NOTSAFEPOINT;
 
+void jl_unregister_jit_cis(ArrayRef<std::pair<uintptr_t, size_t>> Ranges,
+                           ArrayRef<jl_code_instance_t *> CIs) JL_NOTSAFEPOINT;
+void jl_sweep_jit_cis(void) JL_NOTSAFEPOINT;
+void jl_unregister_jit_object(ArrayRef<std::pair<uintptr_t, size_t>> Ranges) JL_NOTSAFEPOINT;
+void jl_jit_memmgr_stats(size_t *freed, size_t *reused, size_t *avail) JL_NOTSAFEPOINT;
 void jl_register_jit_object(const object::ObjectFile &Object,
                             std::function<uint64_t(const StringRef &)> getLoadAddress,
                             const jl_linker_info_t &Info) JL_CANSAFEPOINT_ENTER_LEAVE;

@@ -141,6 +141,29 @@ JL_DLLEXPORT void jl_jit_unregister_ci_fallback(jl_code_instance_t *ci)
 {
 }
 
+JL_DLLEXPORT int jl_jit_code_gc_begin_fallback(uintptr_t *lo, uintptr_t *hi)
+{
+    return 0;
+}
+
+JL_DLLEXPORT void jl_jit_code_gc_mark_addr_fallback(uintptr_t addr)
+{
+}
+
+JL_DLLEXPORT void jl_jit_code_gc_end_fallback(void)
+{
+}
+
+JL_DLLEXPORT size_t jl_jit_release_dead_code_fallback(void)
+{
+    return 0;
+}
+
+JL_DLLEXPORT void jl_jit_unload_stats_fallback(size_t *stats, size_t n)
+{
+    memset(stats, 0, n * sizeof(size_t));
+}
+
 JL_DLLEXPORT void *jl_create_native_fallback(LLVMOrcThreadSafeModuleRef llvmmod, int trim, int cache, size_t world, jl_array_t *mod_array, jl_array_t *worklist, int all, jl_array_t *module_init_order, jl_array_t *ext_foreign_cis) UNAVAILABLE
 JL_DLLEXPORT void *jl_emit_native_fallback(jl_array_t *codeinfos, jl_array_t *ci_order, LLVMOrcThreadSafeModuleRef llvmmod, const jl_cgparams_t *cgparams, int _external_linkage) UNAVAILABLE
 
